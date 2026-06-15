@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import httpx
 
-from musicpilot.ports.metadata import TrackMetadata
+from musicpilot.ports.metadata import MediaCandidate, TrackMetadata
 
 
 class MusicBrainzProvider:
@@ -48,6 +48,45 @@ class MusicBrainzProvider:
             extra={"musicbrainz_recording_id": item.get("id", "")},
         )
 
+    async def search(self, query: str, *, limit: int = 10) -> tuple[MediaCandidate, ...]:
+        response = await self._client.get(
+            "/recording",
+            params={
+                "query": query,
+                "fmt": "json",
+                "limit": max(1, min(limit, 50)),
+                "inc": "artist-credits+releases",
+            },
+        )
+        response.raise_for_status()
+        candidates: list[MediaCandidate] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in response.json().get("recordings", []):
+            title = str(item.get("title") or query)
+            artist_credit = item.get("artist-credit") or []
+            artist_name = str(artist_credit[0].get("name")) if artist_credit else None
+            releases = item.get("releases") or [{}]
+            for release in releases[:3]:
+                album = release.get("title")
+                key = (title.lower(), str(artist_name or "").lower(), str(album or "").lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(
+                    MediaCandidate(
+                        title=title,
+                        artist=artist_name,
+                        album=str(album) if album else None,
+                        release_date=release.get("date"),
+                        cover_url=_cover_url(str(release.get("id"))) if release.get("id") else None,
+                        source=self.name,
+                        external_id=str(item.get("id") or ""),
+                    )
+                )
+                if len(candidates) >= limit:
+                    return tuple(candidates)
+        return tuple(candidates)
+
 
 def _parse_year(date_value: str | None) -> int | None:
     if not date_value:
@@ -56,3 +95,7 @@ def _parse_year(date_value: str | None) -> int | None:
         return int(date_value[:4])
     except ValueError:
         return None
+
+
+def _cover_url(release_id: str) -> str:
+    return f"https://coverartarchive.org/release/{release_id}/front-250"

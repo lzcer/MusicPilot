@@ -29,13 +29,33 @@ class TorrentRecord(TimestampMixin, Base):
     __tablename__ = "torrent_records"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    torrent_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    torrent_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        unique=True,
+        index=True,
+        nullable=True,
+    )
     name: Mapped[str] = mapped_column(String(512))
     source: Mapped[str] = mapped_column(String(128), default="")
     download_url: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(64), default="queued")
     save_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     progress: Mapped[float] = mapped_column(Float, default=0.0)
+    downloader_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    media_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    resource_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    selected_site_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    download_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    library_refreshed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
@@ -75,3 +95,55 @@ class IndexerSite(TimestampMixin, Base):
     cookie: Mapped[str | None] = mapped_column(Text, nullable=True)
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
     max_concurrency: Mapped[int] = mapped_column(Integer, default=2)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class DownloaderConfig(TimestampMixin, Base):
+    __tablename__ = "downloaders"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid4().hex)
+    name: Mapped[str] = mapped_column(String(128))
+    type: Mapped[str] = mapped_column(String(64), default="qbittorrent")
+    base_url: Mapped[str] = mapped_column(Text)
+    username: Mapped[str] = mapped_column(String(256), default="")
+    password: Mapped[str] = mapped_column(Text, default="")
+    download_path: Mapped[str] = mapped_column(Text, default="")
+    listen_mode: Mapped[str] = mapped_column(String(64), default="polling")
+    is_default: Mapped[bool] = mapped_column(Boolean, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class MediaServerConfig(TimestampMixin, Base):
+    __tablename__ = "media_servers"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid4().hex)
+    name: Mapped[str] = mapped_column(String(128))
+    type: Mapped[str] = mapped_column(String(64), default="navidrome")
+    base_url: Mapped[str] = mapped_column(Text)
+    api_key: Mapped[str] = mapped_column(Text, default="")
+    username: Mapped[str] = mapped_column(String(256), default="")
+    password: Mapped[str] = mapped_column(Text, default="")
+    is_default: Mapped[bool] = mapped_column(Boolean, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class NotifierChannel(TimestampMixin, Base):
+    __tablename__ = "notifier_channels"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid4().hex)
+    name: Mapped[str] = mapped_column(String(128))
+    type: Mapped[str] = mapped_column(String(64), default="telegram")
+    bot_token: Mapped[str] = mapped_column(Text, default="")
+    webhook_url: Mapped[str] = mapped_column(Text, default="")
+    chat_ids: Mapped[str] = mapped_column(Text, default="")
+    use_proxy: Mapped[bool] = mapped_column(Boolean, default=False)
+    enable_download_notify: Mapped[bool] = mapped_column(Boolean, default=True)
+    enable_library_notify: Mapped[bool] = mapped_column(Boolean, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class SystemSetting(TimestampMixin, Base):
+    __tablename__ = "system_settings"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)

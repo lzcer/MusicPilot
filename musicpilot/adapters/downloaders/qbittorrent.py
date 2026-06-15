@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -27,6 +28,8 @@ class QBittorrentClient:
         self.download_path = download_path
         self._client = client or httpx.AsyncClient(base_url=self.base_url, timeout=20)
         self._owns_client = client is None
+        self._authenticated = False
+        self._login_lock = asyncio.Lock()
 
     @property
     def name(self) -> str:
@@ -37,38 +40,68 @@ class QBittorrentClient:
             await self._client.aclose()
 
     async def login(self) -> None:
-        response = await self._client.post(
-            "/api/v2/auth/login",
-            data={"username": self.username, "password": self.password},
-        )
-        response.raise_for_status()
-        body = response.text.strip().lower()
-        if body not in {"ok.", "ok"}:
-            raise QBittorrentAuthError(
-                f"qBittorrent authentication failed: {response.text[:120]}"
+        async with self._login_lock:
+            response = await self._client.post(
+                "/api/v2/auth/login",
+                data={"username": self.username, "password": self.password},
             )
+            response.raise_for_status()
+            body = response.text.strip().lower()
+            if body not in {"ok.", "ok"}:
+                self._authenticated = False
+                raise QBittorrentAuthError(
+                    f"qBittorrent authentication failed: {response.text[:120]}"
+                )
+            self._authenticated = True
+
+    async def _ensure_login(self) -> None:
+        if not self._authenticated:
+            await self.login()
+
+    async def _request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+        await self._ensure_login()
+        response = await self._client.request(method, url, **kwargs)
+        if response.status_code not in {401, 403}:
+            return response
+        self._authenticated = False
+        await self.login()
+        return await self._client.request(method, url, **kwargs)
 
     async def test_connection(self) -> None:
-        await self.login()
-        response = await self._client.get("/api/v2/torrents/info")
+        response = await self._request("GET", "/api/v2/torrents/info")
         response.raise_for_status()
 
     async def add_torrent(self, torrent_url: str, *, category: str) -> str:
-        await self.login()
+        before = {str(item.get("hash", "")) for item in await self._list_info()}
         data = {"urls": torrent_url, "category": category, "tags": "MusicPilot"}
         save_path = getattr(self, "download_path", "")
         if save_path:
             data["savepath"] = save_path
-        response = await self._client.post(
+        response = await self._request(
+            "POST",
             "/api/v2/torrents/add",
             data=data,
         )
         response.raise_for_status()
+        for _ in range(5):
+            after = await self._list_info()
+            new_items = [
+                item for item in after if str(item.get("hash", "")) not in before
+            ]
+            if len(new_items) == 1:
+                return str(new_items[0].get("hash", ""))
+            if len(new_items) > 1:
+                newest = max(new_items, key=lambda item: int(item.get("added_on") or 0))
+                return str(newest.get("hash", ""))
+            await asyncio.sleep(1)
         return ""
 
     async def get_status(self, torrent_hash: str) -> DownloadStatus:
-        await self.login()
-        response = await self._client.get("/api/v2/torrents/info", params={"hashes": torrent_hash})
+        response = await self._request(
+            "GET",
+            "/api/v2/torrents/info",
+            params={"hashes": torrent_hash},
+        )
         response.raise_for_status()
         items = response.json()
         if not items:
@@ -86,10 +119,12 @@ class QBittorrentClient:
         )
 
     async def list_statuses(self) -> tuple[DownloadStatus, ...]:
-        await self.login()
-        response = await self._client.get("/api/v2/torrents/info")
+        return tuple(_status_from_item(item) for item in await self._list_info())
+
+    async def _list_info(self) -> list[dict[str, object]]:
+        response = await self._request("GET", "/api/v2/torrents/info")
         response.raise_for_status()
-        return tuple(_status_from_item(item) for item in response.json())
+        return list(response.json())
 
 
 def _status_from_item(item: dict[str, object]) -> DownloadStatus:

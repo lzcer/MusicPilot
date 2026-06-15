@@ -28,12 +28,52 @@ type SearchResult = {
   promotion?: string | null
 }
 
+type MediaCandidate = {
+  title: string
+  artist?: string | null
+  album?: string | null
+  albums?: string[]
+  release_date?: string | null
+  cover_url?: string | null
+  source: string
+  external_id: string
+}
+
+type MetadataSiteSearchResponse = {
+  raw_count: number
+  filtered_count: number
+  results: SearchResult[]
+}
+
+type MetadataSiteSearchStreamPayload = {
+  media?: MediaCandidate
+  keywords?: string[]
+  total_sites?: number
+  completed_sites?: number
+  active_keywords?: string[]
+  raw_count?: number
+  filtered_count?: number
+  done?: boolean
+  results?: SearchResult[]
+}
+
+type MetadataSiteDonePayload = {
+  site: string
+  raw_count: number
+  filtered_count: number
+  results: SearchResult[]
+  errors?: string[]
+}
+
 type DownloadTask = {
-  torrent_hash: string
+  id?: number | null
+  torrent_hash?: string | null
   name: string
   state: string
   progress: number
   save_path?: string | null
+  source?: string
+  last_error?: string | null
 }
 
 type MediaFile = {
@@ -65,15 +105,32 @@ type DownloaderConfig = {
   base_url: string
   username: string
   download_path: string
+  listen_mode: string
   is_default: boolean
+  enabled: boolean
+}
+
+type MediaServerConfig = {
+  id?: string | null
+  name: string
+  type: string
+  base_url: string
+  api_key: string
+  username: string
+  is_default: boolean
+  enabled: boolean
 }
 
 type NotifierConfig = {
   id?: string | null
   name: string
   type: string
+  webhook_url: string
   chat_ids: string
   use_proxy: boolean
+  enable_download_notify: boolean
+  enable_library_notify: boolean
+  enabled: boolean
 }
 
 type SystemSettings = {
@@ -105,13 +162,22 @@ const settingsTab = ref('downloaders')
 const drawer = ref(true)
 
 const searchDialog = ref(false)
-const searchLoading = ref(false)
+const metadataSearchLoading = ref(false)
+const torrentSearchLoading = ref(false)
 const searchText = ref('')
-const activeSearchSource = ref('')
 const searchResults = ref<SearchResult[]>([])
+const metadataCandidates = ref<MediaCandidate[]>([])
+const selectedMedia = ref<MediaCandidate | null>(null)
+const siteConfirmDialog = ref(false)
+const noMetadataDialog = ref(false)
+const selectedSiteIds = ref<string[]>([])
+const searchStats = ref({ raw_count: 0, filtered_count: 0 })
+const searchProgress = ref({ completed_sites: 0, total_sites: 0, active_keywords: [] as string[] })
+const hasSearchedTorrents = ref(false)
 const searchPage = ref(1)
 const searchPageSize = ref(20)
 const pendingDownload = ref<SearchResult | null>(null)
+const downloadSubmitting = ref(false)
 
 const logs = ref<LogEntry[]>([])
 const logsLoading = ref(false)
@@ -119,22 +185,28 @@ const logPaused = ref(false)
 const logLevel = ref('ALL')
 const logQuery = ref('')
 let logTimer: number | undefined
+let downloadTimer: number | undefined
+let metadataSearchStream: EventSource | undefined
 
 const downloads = ref<DownloadTask[]>([])
 const mediaFiles = ref<MediaFile[]>([])
 const sites = ref<Site[]>([])
 const downloaders = ref<DownloaderConfig[]>([])
+const mediaServers = ref<MediaServerConfig[]>([])
 const notifiers = ref<NotifierConfig[]>([])
 
 const siteDialog = ref(false)
 const downloaderDialog = ref(false)
+const mediaServerDialog = ref(false)
 const notifierDialog = ref(false)
 const siteTesting = ref(false)
 const downloaderTesting = ref(false)
+const mediaServerTesting = ref(false)
 const notifierTesting = ref(false)
 const systemSaving = ref(false)
 const editingSiteId = ref<string | null>(null)
 const editingDownloaderId = ref<string | null>(null)
+const editingMediaServerId = ref<string | null>(null)
 const editingNotifierId = ref<string | null>(null)
 
 const snackbar = ref({ show: false, color: 'success', text: '' })
@@ -155,7 +227,21 @@ const downloaderForm = ref({
   username: '',
   password: '',
   download_path: '',
-  is_default: true
+  listen_mode: 'polling',
+  is_default: true,
+  enabled: true
+})
+
+const mediaServerForm = ref({
+  id: null as string | null,
+  name: 'Navidrome',
+  type: 'navidrome',
+  base_url: '',
+  api_key: '',
+  username: '',
+  password: '',
+  is_default: true,
+  enabled: true
 })
 
 const notifierForm = ref({
@@ -163,8 +249,12 @@ const notifierForm = ref({
   name: 'Telegram Bot',
   type: 'telegram',
   bot_token: '',
+  webhook_url: '',
   chat_ids: '',
-  use_proxy: false
+  use_proxy: false,
+  enable_download_notify: true,
+  enable_library_notify: true,
+  enabled: true
 })
 
 const systemForm = ref<SystemSettings>({
@@ -186,6 +276,16 @@ const navItems = [
 ]
 
 const pageTitle = computed(() => navItems.find((item) => item.value === activePage.value)?.title ?? 'MusicPilot')
+
+const searchLoading = computed(() => metadataSearchLoading.value || torrentSearchLoading.value)
+
+const torrentSearchProgressText = computed(() => {
+  const siteText = `站点 ${searchProgress.value.completed_sites}/${searchProgress.value.total_sites}`
+  const active = searchProgress.value.active_keywords.length
+    ? searchProgress.value.active_keywords.join(' / ')
+    : '等待结果'
+  return `${siteText} 搜索中：${active} 结果：${searchStats.value.raw_count} 过滤：${searchStats.value.filtered_count}`
+})
 
 const pagedSearchResults = computed(() => {
   const start = (searchPage.value - 1) * searchPageSize.value
@@ -240,10 +340,17 @@ async function login() {
       method: 'POST',
       body: JSON.stringify(loginForm.value)
     })
-    loggedIn.value = true
-    await loadInitialData()
   } catch {
     notify('用户名或密码错误', 'error')
+    loginLoading.value = false
+    return
+  }
+
+  loggedIn.value = true
+  try {
+    await loadInitialData()
+  } catch (error) {
+    notify(error instanceof Error ? `数据加载失败：${error.message}` : '数据加载失败', 'error')
   } finally {
     loginLoading.value = false
   }
@@ -253,6 +360,7 @@ async function loadInitialData() {
   await Promise.all([
     loadSites(),
     loadDownloaders(),
+    loadMediaServers(),
     loadNotifiers(),
     loadSystemSettings(),
     loadMedia(),
@@ -260,16 +368,43 @@ async function loadInitialData() {
     loadLogs()
   ])
   startLogPolling()
+  startDownloadPolling()
+  subscribeMetadataSiteSearch()
 }
 
-function runSearch() {
+async function runSearch() {
   if (!searchText.value.trim()) return
   searchDialog.value = false
-  searchLoading.value = true
-  activeSearchSource.value = ''
+  metadataSearchLoading.value = true
+  selectedMedia.value = null
   searchResults.value = []
+  metadataCandidates.value = []
+  hasSearchedTorrents.value = false
+  searchStats.value = { raw_count: 0, filtered_count: 0 }
   searchPage.value = 1
+  try {
+    const params = new URLSearchParams({ query: searchText.value.trim(), limit: '12' })
+    const response = await api<{ candidates: MediaCandidate[] }>(`/api/metadata/search?${params.toString()}`)
+    metadataCandidates.value = response.candidates
+    if (!metadataCandidates.value.length) {
+      noMetadataDialog.value = true
+    }
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '媒体信息搜索失败', 'error')
+  } finally {
+    metadataSearchLoading.value = false
+  }
+}
 
+function runDirectSearch() {
+  if (!searchText.value.trim()) return
+  noMetadataDialog.value = false
+  metadataCandidates.value = []
+  selectedMedia.value = null
+  searchResults.value = []
+  hasSearchedTorrents.value = true
+  searchPage.value = 1
+  torrentSearchLoading.value = true
   const params = new URLSearchParams({ query: searchText.value.trim(), limit: '100' })
   const stream = new EventSource(`/api/search/stream?${params.toString()}`, {
     withCredentials: true
@@ -277,21 +412,154 @@ function runSearch() {
 
   stream.addEventListener('result', (event) => {
     const result = JSON.parse((event as MessageEvent).data) as SearchResult
-    activeSearchSource.value = result.source
     searchResults.value.push(result)
   })
 
   stream.addEventListener('error', () => {
     stream.close()
-    searchLoading.value = false
-    activeSearchSource.value = ''
+    torrentSearchLoading.value = false
   })
 
   stream.addEventListener('done', () => {
     stream.close()
-    searchLoading.value = false
-    activeSearchSource.value = ''
+    torrentSearchLoading.value = false
   })
+}
+
+function openSiteConfirm(candidate: MediaCandidate) {
+  selectedMedia.value = rawMediaCandidate(candidate)
+  selectedSiteIds.value = sites.value.map((site) => site.id).filter(Boolean) as string[]
+  siteConfirmDialog.value = true
+}
+
+async function runMetadataSiteSearch() {
+  if (!selectedMedia.value) return
+  siteConfirmDialog.value = false
+  torrentSearchLoading.value = true
+  metadataCandidates.value = []
+  searchResults.value = []
+  hasSearchedTorrents.value = true
+  searchPage.value = 1
+  searchStats.value = { raw_count: 0, filtered_count: 0 }
+  searchProgress.value = { completed_sites: 0, total_sites: selectedSiteIds.value.length, active_keywords: [] }
+  try {
+    const snapshot = await api<MetadataSiteSearchStreamPayload>('/api/search/by-metadata/stream/start', {
+      method: 'POST',
+      body: JSON.stringify({
+        media: rawMediaCandidate(selectedMedia.value),
+        site_ids: selectedSiteIds.value,
+        limit: 100
+      })
+    })
+    applyMetadataSearchSnapshot(snapshot)
+    subscribeMetadataSiteSearch()
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '站点搜索失败', 'error')
+    torrentSearchLoading.value = false
+  }
+}
+
+function subscribeMetadataSiteSearch() {
+  metadataSearchStream?.close()
+  metadataSearchStream = new EventSource('/api/search/by-metadata/stream/current', {
+    withCredentials: true
+  })
+
+  metadataSearchStream.addEventListener('snapshot', (event) => {
+    const payload = JSON.parse((event as MessageEvent).data) as MetadataSiteSearchStreamPayload
+    applyMetadataSearchSnapshot(payload)
+  })
+
+  metadataSearchStream.addEventListener('progress', (event) => {
+    const payload = JSON.parse((event as MessageEvent).data) as MetadataSiteSearchStreamPayload
+    applyMetadataSearchSnapshot(payload)
+  })
+
+  metadataSearchStream.addEventListener('site_done', (event) => {
+    const payload = JSON.parse((event as MessageEvent).data) as MetadataSiteDonePayload
+    mergeSearchResults(payload.results)
+    searchStats.value = {
+      raw_count: searchStats.value.raw_count + payload.raw_count,
+      filtered_count: searchStats.value.filtered_count + payload.filtered_count
+    }
+  })
+
+  metadataSearchStream.addEventListener('site_error', (event) => {
+    const payload = JSON.parse((event as MessageEvent).data) as { site: string; message: string }
+    notify(`${payload.site} 搜索失败：${payload.message}`, 'warning')
+  })
+
+  metadataSearchStream.addEventListener('done', (event) => {
+    const payload = JSON.parse((event as MessageEvent).data) as MetadataSiteSearchStreamPayload
+    applyMetadataSearchSnapshot(payload)
+    torrentSearchLoading.value = false
+    metadataSearchStream?.close()
+    metadataSearchStream = undefined
+    if (!searchResults.value.length && (payload.raw_count ?? 0) > 0) {
+      notify('艺人过滤后没有匹配资源', 'warning')
+    }
+  })
+
+  metadataSearchStream.addEventListener('error', () => {
+    torrentSearchLoading.value = false
+    metadataSearchStream?.close()
+    metadataSearchStream = undefined
+  })
+}
+
+function applyMetadataSearchSnapshot(payload: MetadataSiteSearchStreamPayload) {
+  searchStats.value = {
+    raw_count: payload.raw_count ?? 0,
+    filtered_count: payload.filtered_count ?? 0
+  }
+  searchProgress.value = {
+    completed_sites: payload.completed_sites ?? 0,
+    total_sites: payload.total_sites ?? 0,
+    active_keywords: payload.active_keywords ?? []
+  }
+  if (payload.media) {
+    selectedMedia.value = payload.media
+  }
+  if (payload.results) {
+    searchResults.value = payload.results
+  }
+  hasSearchedTorrents.value =
+    hasSearchedTorrents.value ||
+    Boolean(payload.results?.length) ||
+    Boolean(payload.total_sites)
+  torrentSearchLoading.value = !(payload.done ?? false)
+}
+
+function mergeSearchResults(results: SearchResult[]) {
+  const byUrl = new Map(searchResults.value.map((item) => [item.download_url, item]))
+  for (const result of results) {
+    byUrl.set(result.download_url, result)
+  }
+  searchResults.value = Array.from(byUrl.values()).sort((a, b) => b.seeders - a.seeders)
+}
+
+function rawMediaCandidate(candidate: MediaCandidate) {
+  return {
+    title: candidate.title,
+    artist: candidate.artist ?? null,
+    album: candidate.album ?? null,
+    albums: candidate.albums ?? albumList(candidate),
+    release_date: candidate.release_date ?? null,
+    cover_url: candidate.cover_url ?? null,
+    source: candidate.source,
+    external_id: candidate.external_id
+  }
+}
+
+function mediaSummary(candidate: MediaCandidate) {
+  const count = albumList(candidate).length
+  return `${candidate.artist || '-'} - ${candidate.title}${count ? ` / ${count} 个专辑` : ''}`
+}
+
+function albumList(candidate: MediaCandidate | null) {
+  if (!candidate) return []
+  const values = candidate.albums?.length ? candidate.albums : candidate.album ? [candidate.album] : []
+  return Array.from(new Set(values.filter(Boolean)))
 }
 
 function viewResult(row: SearchResult) {
@@ -307,17 +575,28 @@ function openDownloadConfirm(result: SearchResult) {
 }
 
 async function confirmDownload() {
-  if (!pendingDownload.value) return
-  await addDownload(pendingDownload.value)
-  pendingDownload.value = null
+  if (!pendingDownload.value || downloadSubmitting.value) return
+  downloadSubmitting.value = true
+  try {
+    await addDownload(pendingDownload.value)
+    pendingDownload.value = null
+  } finally {
+    downloadSubmitting.value = false
+  }
 }
 
 async function addDownload(result: SearchResult) {
   await api('/api/downloads', {
     method: 'POST',
-    body: JSON.stringify(result)
+    body: JSON.stringify({
+      ...result,
+      resource: result,
+      media_metadata: selectedMedia.value,
+      selected_site_ids: selectedSiteIds.value
+    })
   })
   notify('已发送到默认下载器')
+  await loadDownloads()
 }
 
 async function loadDownloads() {
@@ -346,6 +625,15 @@ function startLogPolling() {
   window.clearInterval(logTimer)
   logTimer = window.setInterval(() => {
     void loadLogs()
+  }, 5000)
+}
+
+function startDownloadPolling() {
+  window.clearInterval(downloadTimer)
+  downloadTimer = window.setInterval(() => {
+    void loadDownloads().catch(() => {
+      // Keep polling quiet; visible errors are handled by manual refresh and page load.
+    })
   }, 5000)
 }
 
@@ -425,7 +713,9 @@ function openNewDownloaderDialog() {
     username: '',
     password: '',
     download_path: '',
-    is_default: true
+    listen_mode: 'polling',
+    is_default: true,
+    enabled: true
   }
   downloaderDialog.value = true
 }
@@ -440,7 +730,9 @@ function editDownloader(downloader: DownloaderConfig) {
     username: downloader.username,
     password: '',
     download_path: downloader.download_path ?? '',
-    is_default: downloader.is_default
+    listen_mode: downloader.listen_mode ?? 'polling',
+    is_default: downloader.is_default,
+    enabled: downloader.enabled
   }
   downloaderDialog.value = true
 }
@@ -482,6 +774,77 @@ async function saveDownloader() {
   notify('下载器已保存')
 }
 
+async function loadMediaServers() {
+  mediaServers.value = await api<MediaServerConfig[]>('/api/settings/media-servers')
+}
+
+function openNewMediaServerDialog() {
+  editingMediaServerId.value = null
+  mediaServerForm.value = {
+    id: null,
+    name: 'Navidrome',
+    type: 'navidrome',
+    base_url: '',
+    api_key: '',
+    username: '',
+    password: '',
+    is_default: true,
+    enabled: true
+  }
+  mediaServerDialog.value = true
+}
+
+function editMediaServer(server: MediaServerConfig) {
+  editingMediaServerId.value = server.id ?? null
+  mediaServerForm.value = {
+    id: server.id ?? null,
+    name: server.name,
+    type: server.type,
+    base_url: server.base_url,
+    api_key: server.api_key,
+    username: server.username,
+    password: '',
+    is_default: server.is_default,
+    enabled: server.enabled
+  }
+  mediaServerDialog.value = true
+}
+
+async function testMediaServer() {
+  mediaServerTesting.value = true
+  try {
+    const result = await api<TestResponse>('/api/settings/media-servers/test', {
+      method: 'POST',
+      body: JSON.stringify(mediaServerForm.value)
+    })
+    notify(result.message, result.ok ? 'success' : 'error')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '媒体服务器测试失败', 'error')
+  } finally {
+    mediaServerTesting.value = false
+  }
+}
+
+async function saveMediaServer() {
+  const editing = Boolean(editingMediaServerId.value)
+  const server = await api<MediaServerConfig>(
+    editing
+      ? `/api/settings/media-servers/${editingMediaServerId.value}`
+      : '/api/settings/media-servers',
+    {
+      method: editing ? 'PUT' : 'POST',
+      body: JSON.stringify(mediaServerForm.value)
+    }
+  )
+  if (editing) {
+    mediaServers.value = mediaServers.value.map((item) => (item.id === server.id ? server : item))
+  } else {
+    mediaServers.value.push(server)
+  }
+  mediaServerDialog.value = false
+  notify('媒体服务器已保存')
+}
+
 async function loadNotifiers() {
   notifiers.value = await api<NotifierConfig[]>('/api/settings/notifiers')
 }
@@ -493,8 +856,12 @@ function openNewNotifierDialog() {
     name: 'Telegram Bot',
     type: 'telegram',
     bot_token: '',
+    webhook_url: '',
     chat_ids: '',
-    use_proxy: false
+    use_proxy: false,
+    enable_download_notify: true,
+    enable_library_notify: true,
+    enabled: true
   }
   notifierDialog.value = true
 }
@@ -506,8 +873,12 @@ function editNotifier(notifier: NotifierConfig) {
     name: notifier.name,
     type: notifier.type,
     bot_token: '',
+    webhook_url: notifier.webhook_url,
     chat_ids: notifier.chat_ids,
-    use_proxy: notifier.use_proxy
+    use_proxy: notifier.use_proxy,
+    enable_download_notify: notifier.enable_download_notify,
+    enable_library_notify: notifier.enable_library_notify,
+    enabled: notifier.enabled
   }
   notifierDialog.value = true
 }
@@ -553,7 +924,7 @@ async function saveSystemSettings() {
   systemSaving.value = true
   try {
     systemForm.value = await api<SystemSettings>('/api/settings/system', {
-      method: 'PUT',
+      method: 'POST',
       body: JSON.stringify(systemForm.value)
     })
     notify('系统设置已保存')
@@ -594,15 +965,22 @@ function logColor(level: string) {
 onMounted(async () => {
   try {
     await api('/api/sites')
-    loggedIn.value = true
-    await loadInitialData()
   } catch {
     loggedIn.value = false
+    return
+  }
+  loggedIn.value = true
+  try {
+    await loadInitialData()
+  } catch (error) {
+    notify(error instanceof Error ? `数据加载失败：${error.message}` : '数据加载失败', 'error')
   }
 })
 
 onUnmounted(() => {
   window.clearInterval(logTimer)
+  window.clearInterval(downloadTimer)
+  metadataSearchStream?.close()
 })
 </script>
 
@@ -664,14 +1042,68 @@ onUnmounted(() => {
               <v-btn color="primary" prepend-icon="mdi-magnify" @click="searchDialog = true">
                 搜索
               </v-btn>
-              <v-chip v-if="searchLoading" color="info" variant="tonal">
-                正在返回：{{ activeSearchSource || '站点' }}
+              <v-chip v-if="metadataSearchLoading" class="loading-chip" color="info" variant="tonal">
+                <v-progress-circular indeterminate size="16" width="2" />
+                搜索媒体信息
+              </v-chip>
+              <v-chip v-if="torrentSearchLoading" class="loading-chip" color="info" variant="tonal">
+                <v-progress-circular indeterminate size="16" width="2" />
+                {{ torrentSearchProgressText }}
+              </v-chip>
+              <div v-if="selectedMedia" class="selected-media-summary">
+                {{ mediaSummary(selectedMedia) }}
+              </div>
+              <v-chip v-if="searchStats.raw_count" color="secondary" variant="tonal">
+                原始 {{ searchStats.raw_count }} / 过滤 {{ searchStats.filtered_count }}
               </v-chip>
             </div>
 
+            <div v-if="metadataSearchLoading" class="loading-panel">
+              <v-progress-circular indeterminate color="primary" size="34" width="3" />
+              <span>正在搜索媒体信息</span>
+            </div>
+
+            <div v-if="metadataCandidates.length && !metadataSearchLoading" class="result-card-grid media-card-grid">
+              <article
+                v-for="candidate in metadataCandidates"
+                :key="`${candidate.source}-${candidate.external_id}-${candidate.title}-${candidate.artist}`"
+                class="media-card"
+                @click="openSiteConfirm(candidate)"
+              >
+                <img
+                  v-if="candidate.cover_url"
+                  :src="candidate.cover_url"
+                  alt=""
+                  class="media-cover"
+                  loading="lazy"
+                />
+                <div class="media-card-body">
+                  <h3>{{ candidate.title }}</h3>
+                  <p>{{ candidate.artist || '未知艺人' }}</p>
+                  <div class="media-album-list">
+                    <div
+                      v-for="album in albumList(candidate)"
+                      :key="album"
+                      class="media-album"
+                    >
+                      {{ album }}
+                    </div>
+                    <div v-if="!albumList(candidate).length" class="media-album">未知专辑</div>
+                  </div>
+                  <div class="media-card-tags">
+                    <v-chip size="small" variant="tonal">{{ candidate.release_date || '-' }}</v-chip>
+                    <v-chip size="small" variant="tonal">{{ albumList(candidate).length }} 个专辑</v-chip>
+                  </div>
+                </div>
+              </article>
+            </div>
+
             <v-card class="search-panel">
-              <div v-if="!pagedSearchResults.length" class="empty-cell">暂无搜索结果</div>
-              <div v-else class="result-card-grid">
+              <div v-if="torrentSearchLoading && !pagedSearchResults.length" class="loading-panel">
+                <v-progress-circular indeterminate color="primary" size="34" width="3" />
+                <span>正在搜索种子资源</span>
+              </div>
+              <div v-else-if="pagedSearchResults.length" class="result-card-grid">
                 <article
                   v-for="row in pagedSearchResults"
                   :key="row.download_url"
@@ -714,7 +1146,8 @@ onUnmounted(() => {
                   </div>
                 </article>
               </div>
-              <div class="pagination-row">
+              <div v-else-if="hasSearchedTorrents" class="empty-cell">暂无搜索结果</div>
+              <div v-if="searchResults.length" class="pagination-row">
                 <v-select
                   v-model="searchPageSize"
                   :items="[10, 20, 50, 100]"
@@ -747,7 +1180,7 @@ onUnmounted(() => {
                 </thead>
                 <tbody>
                   <tr v-if="!downloads.length"><td colspan="4" class="empty-cell">暂无下载任务</td></tr>
-                  <tr v-for="row in downloads" :key="row.torrent_hash">
+                  <tr v-for="row in downloads" :key="row.id || row.torrent_hash || row.name">
                     <td>{{ row.name }}</td>
                     <td><v-chip size="small" variant="tonal">{{ row.state }}</v-chip></td>
                     <td><v-progress-linear :model-value="progressPercent(row.progress)" height="8" rounded /></td>
@@ -842,6 +1275,7 @@ onUnmounted(() => {
           <section v-if="activePage === 'settings'" class="page-stack">
             <v-tabs v-model="settingsTab" color="primary">
               <v-tab value="downloaders">下载器</v-tab>
+              <v-tab value="mediaServers">媒体服务器</v-tab>
               <v-tab value="notifiers">通知</v-tab>
               <v-tab value="system">系统设置</v-tab>
             </v-tabs>
@@ -863,6 +1297,29 @@ onUnmounted(() => {
                       <div class="muted">{{ downloader.base_url }}</div>
                       <div class="muted">{{ downloader.download_path || '未设置下载目录' }}</div>
                       <v-chip v-if="downloader.is_default" color="success" size="small" variant="tonal">默认</v-chip>
+                      <v-chip v-if="!downloader.enabled" color="warning" size="small" variant="tonal">停用</v-chip>
+                    </v-card-text>
+                  </v-card>
+                </div>
+              </v-window-item>
+
+              <v-window-item value="mediaServers">
+                <div class="toolbar-row">
+                  <v-btn color="primary" prepend-icon="mdi-plus" @click="openNewMediaServerDialog">新增媒体服务器</v-btn>
+                </div>
+                <div class="card-grid">
+                  <v-card
+                    v-for="server in mediaServers"
+                    :key="server.id || server.base_url"
+                    class="config-card"
+                    @click="editMediaServer(server)"
+                  >
+                    <v-card-title>{{ server.name }}</v-card-title>
+                    <v-card-text>
+                      <div class="muted">{{ server.base_url }}</div>
+                      <v-chip size="small" variant="tonal">{{ server.type }}</v-chip>
+                      <v-chip v-if="server.is_default" color="success" size="small" variant="tonal">默认</v-chip>
+                      <v-chip v-if="!server.enabled" color="warning" size="small" variant="tonal">停用</v-chip>
                     </v-card-text>
                   </v-card>
                 </div>
@@ -883,6 +1340,7 @@ onUnmounted(() => {
                     <v-card-text>
                       <v-chip size="small" variant="tonal">{{ notifier.type }}</v-chip>
                       <v-chip v-if="notifier.use_proxy" color="warning" size="small" variant="tonal">代理</v-chip>
+                      <v-chip v-if="!notifier.enabled" color="warning" size="small" variant="tonal">停用</v-chip>
                       <div class="muted">{{ notifier.chat_ids || '未指定会话' }}</div>
                     </v-card-text>
                   </v-card>
@@ -925,10 +1383,56 @@ onUnmounted(() => {
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="noMetadataDialog" max-width="460">
+      <v-card title="未找到媒体信息">
+        <v-card-text>未找到媒体信息，是否直接使用站点搜索？</v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="noMetadataDialog = false">取消</v-btn>
+          <v-btn color="primary" @click="runDirectSearch">直接搜索</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="siteConfirmDialog" max-width="620">
+      <v-card title="确认搜索站点">
+        <v-card-text class="dialog-stack">
+          <div v-if="selectedMedia" class="site-confirm-media">
+            <div class="site-confirm-label">媒体信息</div>
+            <div class="site-confirm-title">{{ selectedMedia.title }}</div>
+            <div class="site-confirm-line">{{ selectedMedia.artist || '未知艺人' }}</div>
+            <div class="site-confirm-label site-confirm-album-label">专辑列表</div>
+            <div v-if="albumList(selectedMedia).length" class="site-confirm-albums">
+              <div v-for="album in albumList(selectedMedia)" :key="album" class="site-confirm-line">
+                {{ album }}
+              </div>
+            </div>
+            <div v-else class="site-confirm-line">未知专辑</div>
+          </div>
+          <v-checkbox
+            v-for="site in sites"
+            :key="site.id || site.name"
+            v-model="selectedSiteIds"
+            :label="site.name"
+            :value="site.id"
+            density="compact"
+            hide-details
+          />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="siteConfirmDialog = false">取消</v-btn>
+          <v-btn color="primary" :disabled="!selectedSiteIds.length" @click="runMetadataSiteSearch">
+            执行搜索
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-dialog
       :model-value="Boolean(pendingDownload)"
       max-width="560"
-      @update:model-value="(value) => { if (!value) pendingDownload = null }"
+      @update:model-value="(value: boolean) => { if (!value) pendingDownload = null }"
     >
       <v-card class="download-confirm-card">
         <v-card-title class="download-confirm-title">
@@ -958,14 +1462,24 @@ onUnmounted(() => {
           <div class="confirm-row muted">
             <v-icon icon="mdi-clock-outline" size="28" />
             <span>{{ pendingDownload.published_at || '发布时间未知' }}</span>
-            <v-chip v-if="pendingDownload.promotion" color="success" size="small" variant="flat">
+          </div>
+          <div v-if="pendingDownload.promotion" class="confirm-row confirm-promotion-row">
+            <v-icon icon="mdi-tag-outline" size="28" />
+            <v-chip color="success" size="large" variant="flat" class="confirm-promotion-chip">
               {{ pendingDownload.promotion }}
             </v-chip>
           </div>
         </v-card-text>
         <v-card-actions class="download-confirm-actions">
-          <v-btn variant="text" @click="pendingDownload = null">取消</v-btn>
-          <v-btn color="primary" prepend-icon="mdi-download" size="large" @click="confirmDownload">
+          <v-btn variant="text" :disabled="downloadSubmitting" @click="pendingDownload = null">取消</v-btn>
+          <v-btn
+            color="primary"
+            prepend-icon="mdi-download"
+            size="large"
+            :loading="downloadSubmitting"
+            :disabled="downloadSubmitting"
+            @click="confirmDownload"
+          >
             开始下载
           </v-btn>
         </v-card-actions>
@@ -1004,13 +1518,48 @@ onUnmounted(() => {
             :placeholder="editingDownloaderId ? '留空则保持原密码' : ''"
           />
           <v-text-field v-model="downloaderForm.download_path" label="下载目录" placeholder="/downloads/music" />
+          <v-select
+            v-model="downloaderForm.listen_mode"
+            :items="[
+              { title: '轮询', value: 'polling' },
+              { title: 'qB 回调（预留）', value: 'qb_callback' }
+            ]"
+            label="监听模式"
+          />
           <v-switch v-model="downloaderForm.is_default" color="primary" label="设为默认" hide-details />
+          <v-switch v-model="downloaderForm.enabled" color="primary" label="启用" hide-details />
         </v-card-text>
         <v-card-actions>
           <v-spacer />
           <v-btn variant="text" @click="downloaderDialog = false">取消</v-btn>
           <v-btn :loading="downloaderTesting" variant="tonal" @click="testDownloader">测试</v-btn>
           <v-btn color="primary" @click="saveDownloader">保存</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="mediaServerDialog" max-width="560">
+      <v-card :title="editingMediaServerId ? '编辑媒体服务器' : '新增媒体服务器'">
+        <v-card-text class="dialog-stack">
+          <v-select v-model="mediaServerForm.type" :items="['navidrome']" label="类型" />
+          <v-text-field v-model="mediaServerForm.name" label="名称" />
+          <v-text-field v-model="mediaServerForm.base_url" label="地址" />
+          <v-text-field v-model="mediaServerForm.api_key" label="API Token" />
+          <v-text-field v-model="mediaServerForm.username" label="用户名" />
+          <v-text-field
+            v-model="mediaServerForm.password"
+            label="密码"
+            type="password"
+            :placeholder="editingMediaServerId ? '留空则保持原密码' : ''"
+          />
+          <v-switch v-model="mediaServerForm.is_default" color="primary" label="设为默认" hide-details />
+          <v-switch v-model="mediaServerForm.enabled" color="primary" label="启用" hide-details />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="mediaServerDialog = false">取消</v-btn>
+          <v-btn :loading="mediaServerTesting" variant="tonal" @click="testMediaServer">测试</v-btn>
+          <v-btn color="primary" @click="saveMediaServer">保存</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -1025,8 +1574,12 @@ onUnmounted(() => {
             label="Bot Token"
             :placeholder="editingNotifierId ? '留空则保持原 Token' : ''"
           />
+          <v-text-field v-model="notifierForm.webhook_url" label="Webhook URL" />
           <v-text-field v-model="notifierForm.chat_ids" label="Chat IDs" />
           <v-switch v-model="notifierForm.use_proxy" color="primary" label="使用系统代理" hide-details />
+          <v-switch v-model="notifierForm.enable_download_notify" color="primary" label="下载通知" hide-details />
+          <v-switch v-model="notifierForm.enable_library_notify" color="primary" label="媒体库刷新通知" hide-details />
+          <v-switch v-model="notifierForm.enabled" color="primary" label="启用" hide-details />
         </v-card-text>
         <v-card-actions>
           <v-spacer />
@@ -1042,4 +1595,3 @@ onUnmounted(() => {
     </v-snackbar>
   </v-app>
 </template>
-

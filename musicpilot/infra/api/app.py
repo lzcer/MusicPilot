@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import logging
+import re
+import unicodedata
 from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from secrets import compare_digest
+from typing import Any
 from urllib.parse import quote
+from uuid import uuid4
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from opencc import OpenCC
 from sqlalchemy.exc import IntegrityError
 
 from musicpilot.adapters.bots import TelegramBotAdapter, TelegramHttpNotifier
@@ -26,9 +33,8 @@ from musicpilot.adapters.indexers.nexusphp import (
     NexusPHPSiteConfig,
 )
 from musicpilot.adapters.metadata import MusicBrainzProvider, MutagenTagWriter
-from musicpilot.adapters.notifiers import NavidromeNotifier
 from musicpilot.core.event_bus import EventBus
-from musicpilot.core.events import DownloadCompletedEvent, DownloadEvent, SearchEvent, SearchResult
+from musicpilot.core.events import NotifyEvent, SearchEvent, SearchResult
 from musicpilot.core.metadata import MetadataCascade
 from musicpilot.core.pipeline import MusicPipeline
 from musicpilot.core.processor import MediaProcessor
@@ -43,7 +49,13 @@ from musicpilot.infra.api.schemas import (
     LogEntryResponse,
     LoginRequest,
     LoginResponse,
+    MediaCandidateResponse,
     MediaFileResponse,
+    MediaServerCreateRequest,
+    MediaServerResponse,
+    MetadataSearchResponse,
+    MetadataSiteSearchRequest,
+    MetadataSiteSearchResponse,
     NexusPHPParserRequest,
     NotifierCreateRequest,
     NotifierResponse,
@@ -62,10 +74,121 @@ from musicpilot.infra.api.schemas import (
 )
 from musicpilot.infra.auth import issue_session, require_session
 from musicpilot.infra.config import Settings
-from musicpilot.infra.config_store import ConfigStore
 from musicpilot.infra.db import Database, SqlAlchemyMediaRepository
-from musicpilot.infra.db.models import IndexerSite
+from musicpilot.infra.db.models import (
+    DownloaderConfig,
+    IndexerSite,
+    MediaServerConfig,
+    NotifierChannel,
+    TorrentRecord,
+)
 from musicpilot.infra.scheduler import SubscriptionScheduler
+from musicpilot.ports.metadata import MediaCandidate
+
+_OPENCC_T2S = OpenCC("t2s")
+DOWNLOAD_POLL_INTERVAL_SECONDS = 5
+
+
+class MetadataSiteSearchTask:
+    def __init__(
+        self,
+        *,
+        media: MediaCandidateResponse,
+        keywords: list[str],
+        total_sites: int,
+    ) -> None:
+        self.media = media
+        self.keywords = keywords
+        self.total_sites = total_sites
+        self.completed_sites = 0
+        self.raw_count = 0
+        self.filtered_count = 0
+        self.done = False
+        self.errors: list[dict[str, str]] = []
+        self.results: list[dict[str, Any]] = []
+        self._active_keywords: dict[str, int] = {}
+        self._subscribers: set[asyncio.Queue[tuple[str, dict[str, Any]]]] = set()
+        self._lock = asyncio.Lock()
+
+    async def subscribe(self) -> asyncio.Queue[tuple[str, dict[str, Any]]]:
+        queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
+        async with self._lock:
+            self._subscribers.add(queue)
+        return queue
+
+    async def unsubscribe(self, queue: asyncio.Queue[tuple[str, dict[str, Any]]]) -> None:
+        async with self._lock:
+            self._subscribers.discard(queue)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "media": self.media.model_dump(),
+            "keywords": self.keywords,
+            "total_sites": self.total_sites,
+            "completed_sites": self.completed_sites,
+            "active_keywords": sorted(self._active_keywords),
+            "raw_count": self.raw_count,
+            "filtered_count": self.filtered_count,
+            "done": self.done,
+            "errors": self.errors,
+            "results": self.results,
+        }
+
+    async def keyword_started(self, keyword: str) -> None:
+        async with self._lock:
+            self._active_keywords[keyword] = self._active_keywords.get(keyword, 0) + 1
+        await self.publish("progress", self.snapshot())
+
+    async def keyword_finished(self, keyword: str) -> None:
+        async with self._lock:
+            count = self._active_keywords.get(keyword, 0)
+            if count <= 1:
+                self._active_keywords.pop(keyword, None)
+            else:
+                self._active_keywords[keyword] = count - 1
+        await self.publish("progress", self.snapshot())
+
+    async def site_done(
+        self,
+        *,
+        site: str,
+        raw_count: int,
+        filtered_count: int,
+        results: list[SearchResultResponse],
+        errors: list[str],
+    ) -> None:
+        async with self._lock:
+            self.completed_sites += 1
+            self.raw_count += raw_count
+            self.filtered_count += filtered_count
+            site_payload = {
+                "site": site,
+                "raw_count": raw_count,
+                "filtered_count": filtered_count,
+                "results": [item.model_dump() for item in results],
+                "errors": errors,
+            }
+            self.results.extend(site_payload["results"])
+        await self.publish("site_done", site_payload)
+        await self.publish("progress", self.snapshot())
+
+    async def site_error(self, *, site: str, message: str) -> None:
+        async with self._lock:
+            self.completed_sites += 1
+            self.errors.append({"site": site, "message": message})
+        await self.publish("site_error", {"site": site, "message": message})
+        await self.publish("progress", self.snapshot())
+
+    async def finish(self) -> None:
+        async with self._lock:
+            self.done = True
+        await self.publish("done", self.snapshot())
+
+    async def publish(self, event: str, payload: dict[str, Any]) -> None:
+        async with self._lock:
+            subscribers = tuple(self._subscribers)
+        for queue in subscribers:
+            queue.put_nowait((event, payload))
 
 
 class AppState:
@@ -75,7 +198,6 @@ class AppState:
         self.log_handler = AppLogHandler(self.logs)
         self.event_bus = EventBus()
         self.database = Database(settings.database_url)
-        self.config_store = ConfigStore(runtime_path=settings.runtime_config)
         self.parser_catalog = load_parser_catalog(settings.indexer_parser_config)
         self.indexers = ()
         self.repository = SqlAlchemyMediaRepository(self.database)
@@ -84,14 +206,13 @@ class AppState:
             interval_minutes=settings.subscription_check_interval_minutes,
             enabled=settings.subscriptions_enabled,
         )
-        self.downloader = self._build_downloader(settings, self.config_store)
+        self.downloader: QBittorrentClient | None = None
         self.metadata = MetadataCascade(
             [MusicBrainzProvider(user_agent=settings.musicbrainz_user_agent)]
         )
-        self.notifiers = self._build_notifiers(settings)
-        self.configured_notifiers = self._build_configured_notifiers()
+        self.configured_notifiers: tuple[TelegramHttpNotifier, ...] = ()
         self.bots = self._build_bots(settings)
-        self.notification_sinks = (*self.notifiers, *self.configured_notifiers, *self.bots)
+        self.notification_sinks = (*self.configured_notifiers, *self.bots)
         self.media_processor = MediaProcessor(
             library_root=settings.music_library_path,
             metadata=self.metadata,
@@ -103,9 +224,12 @@ class AppState:
             event_bus=self.event_bus,
             indexers=self.indexers,
             downloader=self.downloader,
-            media_processor=self.media_processor,
+            media_processor=None,
             notifiers=self.notification_sinks,
         )
+        self.download_polling_task: asyncio.Task[None] | None = None
+        self.metadata_site_search_task: MetadataSiteSearchTask | None = None
+        self.metadata_site_search_worker: asyncio.Task[None] | None = None
 
     async def reload_indexers(self) -> None:
         self.reload_parser_catalog()
@@ -113,56 +237,65 @@ class AppState:
         self.indexers = build_nexusphp_indexers(sites, self.parser_catalog)
         self.pipeline.indexers = self.indexers
 
+    async def migrate_legacy_runtime_config(self) -> None:
+        path = self.settings.runtime_config
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            self.add_log("settings", f"Legacy runtime config migration skipped: {exc}", "WARNING")
+            return
+        if not isinstance(payload, dict):
+            return
+
+        if not await self.repository.list_downloaders():
+            for item in payload.get("downloaders", []):
+                if isinstance(item, dict):
+                    await self.repository.upsert_downloader(
+                        payload=_legacy_downloader_payload(item),
+                    )
+
+        if not await self.repository.list_notifiers():
+            for item in payload.get("notifiers", []):
+                if isinstance(item, dict):
+                    await self.repository.upsert_notifier(payload=_legacy_notifier_payload(item))
+
     def reload_parser_catalog(self) -> None:
         self.parser_catalog = load_parser_catalog(self.settings.indexer_parser_config)
 
-    def reload_downloader(self) -> None:
-        self.downloader = self._build_downloader(self.settings, self.config_store)
+    async def reload_downloader(self) -> None:
+        if self.downloader is not None:
+            await self.downloader.close()
+        self.downloader = await self._build_downloader()
         self.pipeline.downloader = self.downloader
         self.media_processor.downloader = self.downloader
 
-    def reload_notifiers(self) -> None:
-        self.configured_notifiers = self._build_configured_notifiers()
-        self.notification_sinks = (*self.notifiers, *self.configured_notifiers, *self.bots)
+    async def reload_notifiers(self) -> None:
+        self.configured_notifiers = await self._build_configured_notifiers()
+        self.notification_sinks = (*self.configured_notifiers, *self.bots)
         self.pipeline.notifiers = self.notification_sinks
 
-    @staticmethod
-    def _build_downloader(
-        settings: Settings,
-        config_store: ConfigStore,
-    ) -> QBittorrentClient | None:
-        configured = config_store.default_downloader()
+    async def _build_downloader(self) -> QBittorrentClient | None:
+        configured = await self.repository.default_downloader()
         if configured is not None:
             return QBittorrentClient(
-                str(configured["base_url"]),
-                username=str(configured["username"]),
-                password=str(configured["password"]),
-                download_path=str(configured.get("download_path", "")),
+                configured.base_url,
+                username=configured.username,
+                password=configured.password,
+                download_path=configured.download_path,
             )
         if not (
-            settings.qbittorrent_base_url
-            and settings.qbittorrent_username
-            and settings.qbittorrent_password
+            self.settings.qbittorrent_base_url
+            and self.settings.qbittorrent_username
+            and self.settings.qbittorrent_password
         ):
             return None
         return QBittorrentClient(
-            settings.qbittorrent_base_url,
-            username=settings.qbittorrent_username,
-            password=settings.qbittorrent_password,
-            download_path=str(settings.download_staging_path),
-        )
-
-    @staticmethod
-    def _build_notifiers(settings: Settings) -> tuple[NavidromeNotifier, ...]:
-        if not settings.navidrome_base_url:
-            return ()
-        return (
-            NavidromeNotifier(
-                settings.navidrome_base_url,
-                username=settings.navidrome_username,
-                password=settings.navidrome_password,
-                token=settings.navidrome_token,
-            ),
+            self.settings.qbittorrent_base_url,
+            username=self.settings.qbittorrent_username,
+            password=self.settings.qbittorrent_password,
+            download_path=str(self.settings.download_staging_path),
         )
 
     def _build_bots(self, settings: Settings) -> tuple[TelegramBotAdapter, ...]:
@@ -181,28 +314,43 @@ class AppState:
             ),
         )
 
-    def _build_configured_notifiers(self) -> tuple[TelegramHttpNotifier, ...]:
-        system_settings = self.config_store.get_system_settings()
+    async def _build_configured_notifiers(self) -> tuple[TelegramHttpNotifier, ...]:
+        system_settings = await self.repository.get_system_settings()
         notifiers: list[TelegramHttpNotifier] = []
-        for item in self.config_store.list_notifiers():
-            if item.get("type", "telegram") != "telegram":
+        for item in await self.repository.list_notifiers():
+            if not item.enabled or item.type != "telegram":
                 continue
-            token = str(item.get("bot_token", "")).strip()
+            token = item.bot_token.strip()
             if not token:
                 continue
             chat_ids = tuple(
                 int(chat_id.strip())
-                for chat_id in str(item.get("chat_ids", "")).split(",")
+                for chat_id in item.chat_ids.split(",")
                 if chat_id.strip().isdigit()
             )
             notifiers.append(
                 TelegramHttpNotifier(
                     token=token,
                     chat_ids=chat_ids,
-                    proxy=_proxy_url(system_settings) if item.get("use_proxy") else None,
+                    proxy=_proxy_url(system_settings) if item.use_proxy else None,
                 )
             )
         return tuple(notifiers)
+
+    def start_download_polling(self) -> None:
+        if self.download_polling_task is not None and not self.download_polling_task.done():
+            return
+        self.download_polling_task = asyncio.create_task(
+            _poll_download_tasks(self),
+            name="musicpilot-download-polling",
+        )
+
+    async def stop_download_polling(self) -> None:
+        if self.download_polling_task is None:
+            return
+        self.download_polling_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.download_polling_task
 
     def add_log(self, category: str, message: str, level: str = "INFO") -> None:
         self.logs.appendleft(
@@ -248,14 +396,24 @@ def create_app() -> FastAPI:
         root_logger.addHandler(state.log_handler)
         state.add_log("system", "MusicPilot started")
         await state.database.create_all()
+        await state.database.migrate_phase_one_schema()
+        await state.migrate_legacy_runtime_config()
         await state.reload_indexers()
+        await state.reload_downloader()
+        await state.reload_notifiers()
         state.pipeline.start()
+        state.start_download_polling()
         state.scheduler.start()
         for bot in state.bots:
             await bot.start()
         yield
         state.add_log("system", "MusicPilot stopping")
         root_logger.removeHandler(state.log_handler)
+        await state.stop_download_polling()
+        if state.metadata_site_search_worker is not None:
+            state.metadata_site_search_worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await state.metadata_site_search_worker
         for bot in state.bots:
             await bot.stop()
         state.scheduler.stop()
@@ -312,6 +470,122 @@ def create_app() -> FastAPI:
             ],
         )
 
+    @app.get("/api/metadata/search", response_model=MetadataSearchResponse)
+    async def metadata_search(query: str, limit: int = 10) -> MetadataSearchResponse:
+        candidates: list[MediaCandidate] = []
+        for provider in state.metadata.providers:
+            search = getattr(provider, "search", None)
+            if search is None:
+                continue
+            try:
+                provider_candidates = await search(query, limit=min(max(limit * 5, limit), 50))
+            except Exception as exc:  # noqa: BLE001
+                state.add_log("metadata", f"Metadata provider failed: {exc}", "WARNING")
+                continue
+            candidates.extend(provider_candidates)
+            if len(candidates) >= limit:
+                break
+        aggregated = _aggregate_media_candidates(candidates, limit=limit)
+        state.add_log(
+            "metadata",
+            f"Metadata search completed: {query}, {len(aggregated)} candidate group(s)",
+        )
+        return MetadataSearchResponse(query=query, candidates=aggregated)
+
+    @app.post("/api/search/by-metadata", response_model=MetadataSiteSearchResponse)
+    async def search_by_metadata(
+        payload: MetadataSiteSearchRequest,
+    ) -> MetadataSiteSearchResponse:
+        selected_ids = set(payload.site_ids)
+        indexers = [
+            indexer
+            for indexer in state.indexers
+            if not selected_ids or str(getattr(indexer.config, "site_id", "")) in selected_ids
+        ]
+        keywords = _metadata_search_keywords(payload.media)
+        raw_results: list[SearchResult] = []
+        for keyword in keywords:
+            groups = await asyncio.gather(
+                *(_search_indexer(indexer, keyword, payload.limit) for indexer in indexers),
+                return_exceptions=True,
+            )
+            for group in groups:
+                if isinstance(group, Exception):
+                    state.add_log("search", f"Metadata site search failed: {group}", "ERROR")
+                    continue
+                raw_results.extend(group[1])
+        merged = _dedupe_results(raw_results)
+        filtered = _filter_by_artist(merged, payload.media.artist)
+        ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[: payload.limit]
+        state.add_log(
+            "search",
+            f"Metadata site search completed: raw={len(merged)}, filtered={len(filtered)}",
+        )
+        return MetadataSiteSearchResponse(
+            raw_count=len(merged),
+            filtered_count=len(filtered),
+            results=[_search_result_response(item) for item in ranked],
+        )
+
+    @app.post("/api/search/by-metadata/stream/start")
+    async def start_metadata_site_search_stream(
+        payload: MetadataSiteSearchRequest,
+    ) -> dict[str, Any]:
+        current = state.metadata_site_search_task
+        worker = state.metadata_site_search_worker
+        if current is not None and not current.done and worker is not None and not worker.done():
+            raise HTTPException(status_code=409, detail="已有种子搜索任务正在执行。")
+
+        selected_ids = set(payload.site_ids)
+        indexers = [
+            indexer
+            for indexer in state.indexers
+            if not selected_ids or str(getattr(indexer.config, "site_id", "")) in selected_ids
+        ]
+        keywords = _metadata_search_keywords(payload.media)
+        task = MetadataSiteSearchTask(
+            media=payload.media,
+            keywords=keywords,
+            total_sites=len(indexers),
+        )
+        state.metadata_site_search_task = task
+        state.metadata_site_search_worker = asyncio.create_task(
+            _run_metadata_site_search_stream(state, task, indexers, payload.limit),
+            name="musicpilot-metadata-site-search",
+        )
+        state.add_log(
+            "search",
+            f"Streaming metadata site search started: sites={len(indexers)}, "
+            f"keywords={len(keywords)}",
+        )
+        return task.snapshot()
+
+    @app.get("/api/search/by-metadata/stream/current")
+    async def current_metadata_site_search_stream() -> StreamingResponse:
+        async def events() -> AsyncIterator[str]:
+            task = state.metadata_site_search_task
+            if task is None:
+                yield _sse("snapshot", {"done": True, "results": []})
+                yield _sse("done", {"done": True, "results": []})
+                return
+
+            yield _sse("snapshot", task.snapshot())
+            if task.done:
+                yield _sse("done", task.snapshot())
+                return
+
+            queue = await task.subscribe()
+            try:
+                while True:
+                    event, payload = await queue.get()
+                    yield _sse(event, payload)
+                    if event == "done":
+                        break
+            finally:
+                await task.unsubscribe(queue)
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
     @app.get("/api/search/stream")
     async def search_stream(query: str, limit: int = 20) -> StreamingResponse:
         async def events() -> AsyncIterator[str]:
@@ -362,7 +636,7 @@ def create_app() -> FastAPI:
     @app.post("/api/downloads", response_model=DownloadResponse, status_code=202)
     async def add_download(payload: DownloadRequest) -> DownloadResponse:
         if state.downloader is None:
-            state.reload_downloader()
+            await state.reload_downloader()
         if state.downloader is None:
             state.add_log(
                 "download",
@@ -370,39 +644,47 @@ def create_app() -> FastAPI:
                 "ERROR",
             )
             raise HTTPException(status_code=503, detail="No downloader is configured.")
-        result = SearchResult(
-            title=payload.title,
-            download_url=payload.download_url,
-            source=payload.source,
-            seeders=payload.seeders,
-            leechers=payload.leechers,
-            size_bytes=payload.size_bytes,
-            details_url=payload.details_url,
-            subtitle=payload.subtitle,
-            published_at=payload.published_at,
-            promotion=payload.promotion,
+        resource = (payload.resource or SearchResultResponse(**payload.model_dump())).model_dump()
+        media_metadata = payload.media_metadata.model_dump() if payload.media_metadata else {}
+        task = await state.repository.create_download_task(
+            resource=resource,
+            media_metadata=media_metadata,
+            selected_site_ids=payload.selected_site_ids,
+            category=payload.category,
         )
-        await state.event_bus.publish(DownloadEvent(result, category=payload.category))
-        state.add_log("download", f"Download queued: {payload.title}")
-        return DownloadResponse(status="queued")
+        try:
+            torrent_hash = await state.downloader.add_torrent(
+                str(resource["download_url"]),
+                category=payload.category,
+            )
+        except Exception as exc:  # noqa: BLE001
+            await state.repository.update_download_task(
+                task.id,
+                status="failed",
+                last_error=str(exc),
+            )
+            raise HTTPException(status_code=502, detail=f"Downloader submit failed: {exc}") from exc
+        default_downloader = await state.repository.default_downloader()
+        task_changes: dict[str, object] = {
+            "status": "submitted",
+            "downloader_id": default_downloader.id if default_downloader else None,
+            "submitted_at": datetime.now(UTC),
+        }
+        if torrent_hash:
+            task_changes["torrent_hash"] = torrent_hash
+        task = await state.repository.update_download_task(task.id, **task_changes)
+        await _send_event_notifications(state, "download", task)
+        state.add_log("download", f"Download submitted: {payload.title}")
+        return DownloadResponse(
+            status="submitted",
+            task_id=task.id if task else None,
+            torrent_hash=torrent_hash or None,
+        )
 
     @app.get("/api/downloads", response_model=list[DownloadTaskResponse])
     async def downloads() -> list[DownloadTaskResponse]:
-        if state.downloader is None:
-            state.reload_downloader()
-        if state.downloader is None:
-            return []
-        statuses = await state.downloader.list_statuses()
-        return [
-            DownloadTaskResponse(
-                torrent_hash=item.torrent_hash,
-                name=item.name,
-                state=item.state.value,
-                progress=item.progress,
-                save_path=str(item.save_path) if item.save_path is not None else None,
-            )
-            for item in statuses
-        ]
+        tasks = await state.repository.list_download_tasks()
+        return [_download_task_response(item) for item in tasks]
 
     @app.get("/api/indexers", response_model=list[IndexerResponse])
     async def indexers() -> list[IndexerResponse]:
@@ -455,17 +737,14 @@ def create_app() -> FastAPI:
 
     @app.get("/api/settings/downloaders", response_model=list[DownloaderResponse])
     async def downloaders() -> list[DownloaderResponse]:
-        return [
-            _downloader_response(item)
-            for item in state.config_store.list_downloaders()
-        ]
+        return [_downloader_response(item) for item in await state.repository.list_downloaders()]
 
     @app.post("/api/settings/downloaders", response_model=DownloaderResponse, status_code=201)
     async def create_downloader(payload: DownloaderCreateRequest) -> DownloaderResponse:
         if not payload.password:
             raise HTTPException(status_code=422, detail="Password is required.")
-        downloader = state.config_store.add_downloader(payload.model_dump())
-        state.reload_downloader()
+        downloader = await state.repository.upsert_downloader(payload=payload.model_dump())
+        await state.reload_downloader()
         return _downloader_response(downloader)
 
     @app.put("/api/settings/downloaders/{downloader_id}", response_model=DownloaderResponse)
@@ -473,18 +752,21 @@ def create_app() -> FastAPI:
         downloader_id: str,
         payload: DownloaderCreateRequest,
     ) -> DownloaderResponse:
-        downloader = state.config_store.update_downloader(downloader_id, payload.model_dump())
-        if downloader is None:
+        if await state.repository.get_downloader(downloader_id) is None:
             raise HTTPException(status_code=404, detail="Downloader not found.")
-        state.reload_downloader()
+        downloader = await state.repository.upsert_downloader(
+            downloader_id=downloader_id,
+            payload=payload.model_dump(),
+        )
+        await state.reload_downloader()
         return _downloader_response(downloader)
 
     @app.post("/api/settings/downloaders/test", response_model=TestResponse)
     async def test_downloader(payload: DownloaderCreateRequest) -> TestResponse:
         password = payload.password
         if not password and payload.id:
-            existing = state.config_store.get_downloader(payload.id)
-            password = str(existing.get("password", "")) if existing else ""
+            existing = await state.repository.get_downloader(payload.id)
+            password = existing.password if existing else ""
         if not password:
             return TestResponse(ok=False, message="下载器密码不能为空。")
         client = QBittorrentClient(
@@ -503,27 +785,74 @@ def create_app() -> FastAPI:
 
     @app.get("/api/settings/system", response_model=SystemSettingsResponse)
     async def system_settings() -> SystemSettingsResponse:
-        return SystemSettingsResponse(**state.config_store.get_system_settings())
+        return SystemSettingsResponse(**await state.repository.get_system_settings())
 
     @app.put("/api/settings/system", response_model=SystemSettingsResponse)
     async def update_system_settings(
         payload: SystemSettingsRequest,
     ) -> SystemSettingsResponse:
-        settings_payload = state.config_store.update_system_settings(payload.model_dump())
-        state.reload_notifiers()
+        return await _save_system_settings(payload)
+
+    @app.post("/api/settings/system", response_model=SystemSettingsResponse)
+    async def save_system_settings(
+        payload: SystemSettingsRequest,
+    ) -> SystemSettingsResponse:
+        return await _save_system_settings(payload)
+
+    async def _save_system_settings(
+        payload: SystemSettingsRequest,
+    ) -> SystemSettingsResponse:
+        settings_payload = await state.repository.update_system_settings(payload.model_dump())
+        await state.reload_notifiers()
         state.add_log("settings", "System settings saved")
         return SystemSettingsResponse(**settings_payload)
 
+    @app.get("/api/settings/media-servers", response_model=list[MediaServerResponse])
+    async def media_servers() -> list[MediaServerResponse]:
+        return [
+            _media_server_response(item)
+            for item in await state.repository.list_media_servers()
+        ]
+
+    @app.post("/api/settings/media-servers", response_model=MediaServerResponse, status_code=201)
+    async def create_media_server(payload: MediaServerCreateRequest) -> MediaServerResponse:
+        server = await state.repository.upsert_media_server(payload=payload.model_dump())
+        return _media_server_response(server)
+
+    @app.put("/api/settings/media-servers/{server_id}", response_model=MediaServerResponse)
+    async def update_media_server(
+        server_id: str,
+        payload: MediaServerCreateRequest,
+    ) -> MediaServerResponse:
+        server = await state.repository.upsert_media_server(
+            server_id=server_id,
+            payload=payload.model_dump(),
+        )
+        return _media_server_response(server)
+
+    @app.post("/api/settings/media-servers/test", response_model=TestResponse)
+    async def test_media_server(payload: MediaServerCreateRequest) -> TestResponse:
+        try:
+            async with httpx.AsyncClient(
+                base_url=payload.base_url.rstrip("/"),
+                timeout=20,
+            ) as client:
+                response = await client.get("/rest/ping.view", params=_navidrome_params(payload))
+                response.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            return TestResponse(ok=False, message=f"Navidrome 连接失败：{exc}")
+        return TestResponse(ok=True, message="Navidrome 连接成功")
+
     @app.get("/api/settings/notifiers", response_model=list[NotifierResponse])
     async def notifiers() -> list[NotifierResponse]:
-        return [_notifier_response(item) for item in state.config_store.list_notifiers()]
+        return [_notifier_response(item) for item in await state.repository.list_notifiers()]
 
     @app.post("/api/settings/notifiers", response_model=NotifierResponse, status_code=201)
     async def create_notifier(payload: NotifierCreateRequest) -> NotifierResponse:
         if not payload.bot_token:
             raise HTTPException(status_code=422, detail="Bot token is required.")
-        notifier = state.config_store.add_notifier(payload.model_dump())
-        state.reload_notifiers()
+        notifier = await state.repository.upsert_notifier(payload=payload.model_dump())
+        await state.reload_notifiers()
         return _notifier_response(notifier)
 
     @app.put("/api/settings/notifiers/{notifier_id}", response_model=NotifierResponse)
@@ -531,21 +860,28 @@ def create_app() -> FastAPI:
         notifier_id: str,
         payload: NotifierCreateRequest,
     ) -> NotifierResponse:
-        notifier = state.config_store.update_notifier(notifier_id, payload.model_dump())
-        if notifier is None:
+        if await state.repository.get_notifier(notifier_id) is None:
             raise HTTPException(status_code=404, detail="Notifier not found.")
-        state.reload_notifiers()
+        notifier = await state.repository.upsert_notifier(
+            notifier_id=notifier_id,
+            payload=payload.model_dump(),
+        )
+        await state.reload_notifiers()
         return _notifier_response(notifier)
 
     @app.post("/api/settings/notifiers/test", response_model=TestResponse)
     async def test_notifier(payload: NotifierCreateRequest) -> TestResponse:
         bot_token = payload.bot_token
         if not bot_token and payload.id:
-            existing = state.config_store.get_notifier(payload.id)
-            bot_token = str(existing.get("bot_token", "")) if existing else ""
+            existing = await state.repository.get_notifier(payload.id)
+            bot_token = existing.bot_token if existing else ""
         if not bot_token:
             return TestResponse(ok=False, message="Telegram Bot Token 不能为空。")
-        proxy = _proxy_url(state.config_store.get_system_settings()) if payload.use_proxy else None
+        proxy = (
+            _proxy_url(await state.repository.get_system_settings())
+            if payload.use_proxy
+            else None
+        )
         if payload.use_proxy and proxy is None:
             return TestResponse(ok=False, message="已开启代理，但系统代理地址未配置。")
         state.add_log(
@@ -650,7 +986,10 @@ def create_app() -> FastAPI:
             if payload is None or payload.download_path is None
             else Path(payload.download_path)
         )
-        await state.event_bus.publish(DownloadCompletedEvent(torrent_hash, download_path))
+        await state.repository.mark_torrent_completed(
+            torrent_hash=torrent_hash,
+            save_path=download_path,
+        )
         state.add_log("transfer", f"Download completed webhook accepted: {torrent_hash}")
         return {"status": "accepted", "torrent_hash": torrent_hash}
 
@@ -660,7 +999,7 @@ def create_app() -> FastAPI:
     return app
 
 
-def _sse(event: str, payload: dict[str, object]) -> str:
+def _sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
@@ -673,26 +1012,192 @@ async def _search_indexer(
     return indexer.name, results
 
 
-def _downloader_response(item: dict[str, object]) -> DownloaderResponse:
+async def _run_metadata_site_search_stream(
+    state: AppState,
+    task: MetadataSiteSearchTask,
+    indexers: list[object],
+    limit: int,
+) -> None:
+    if not indexers:
+        await task.finish()
+        return
+    try:
+        await asyncio.gather(
+            *(_run_metadata_site_search_for_indexer(task, indexer, limit) for indexer in indexers)
+        )
+    except Exception as exc:  # noqa: BLE001
+        state.add_log("search", f"Streaming metadata site search failed: {exc}", "ERROR")
+    finally:
+        await task.finish()
+        state.add_log(
+            "search",
+            f"Streaming metadata site search completed: raw={task.raw_count}, "
+            f"filtered={task.filtered_count}",
+        )
+
+
+async def _run_metadata_site_search_for_indexer(
+    task: MetadataSiteSearchTask,
+    indexer: object,
+    limit: int,
+) -> None:
+    site_name = str(getattr(indexer, "name", "unknown"))
+    try:
+        keywords = task.keywords
+        if not keywords:
+            await task.site_done(
+                site=site_name,
+                raw_count=0,
+                filtered_count=0,
+                results=[],
+                errors=[],
+            )
+            return
+
+        max_concurrency = max(1, int(getattr(indexer.config, "max_concurrency", 1)))
+        semaphore = asyncio.Semaphore(max_concurrency)
+        raw_results: list[SearchResult] = []
+        errors: list[str] = []
+
+        async def search_keyword(keyword: str) -> None:
+            async with semaphore:
+                await task.keyword_started(keyword)
+                try:
+                    _source, results = await _search_indexer(indexer, keyword, limit)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{keyword}: {exc}")
+                else:
+                    raw_results.extend(results)
+                finally:
+                    await task.keyword_finished(keyword)
+
+        await asyncio.gather(*(search_keyword(keyword) for keyword in keywords))
+        merged = _dedupe_results(raw_results)
+        filtered = _filter_by_artist(merged, task.media.artist)
+        ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[:limit]
+        await task.site_done(
+            site=site_name,
+            raw_count=len(merged),
+            filtered_count=len(filtered),
+            results=[_search_result_response(item) for item in ranked],
+            errors=errors,
+        )
+    except Exception as exc:  # noqa: BLE001
+        await task.site_error(site=site_name, message=str(exc))
+
+
+def _search_result_response(result: SearchResult) -> SearchResultResponse:
+    return SearchResultResponse(
+        title=result.title,
+        download_url=result.download_url,
+        source=result.source,
+        seeders=result.seeders,
+        leechers=result.leechers,
+        size_bytes=result.size_bytes,
+        details_url=result.details_url,
+        subtitle=result.subtitle,
+        published_at=result.published_at,
+        promotion=result.promotion,
+    )
+
+
+def _candidate_response(item: MediaCandidate) -> MediaCandidateResponse:
+    return MediaCandidateResponse(
+        title=item.title,
+        artist=item.artist,
+        album=item.album,
+        albums=[item.album] if item.album else [],
+        release_date=item.release_date,
+        cover_url=item.cover_url,
+        source=item.source,
+        external_id=item.external_id,
+    )
+
+
+def _aggregate_media_candidates(
+    candidates: list[MediaCandidate],
+    *,
+    limit: int,
+) -> list[MediaCandidateResponse]:
+    by_key: dict[tuple[str, str], MediaCandidateResponse] = {}
+    for candidate in candidates:
+        key = (
+            normalize_search_text(candidate.title),
+            normalize_search_text(candidate.artist or ""),
+        )
+        current = by_key.get(key)
+        if current is None:
+            current = _candidate_response(candidate)
+            by_key[key] = current
+        elif not current.cover_url and candidate.cover_url:
+            current.cover_url = candidate.cover_url
+        album = candidate.album
+        if album and album not in current.albums:
+            current.albums.append(album)
+        if current.album is None and album:
+            current.album = album
+        if current.release_date is None and candidate.release_date:
+            current.release_date = candidate.release_date
+    return list(by_key.values())[:limit]
+
+
+def _downloader_response(item: DownloaderConfig) -> DownloaderResponse:
     return DownloaderResponse(
-        id=str(item.get("id")) if item.get("id") else None,
-        name=str(item.get("name", "qBittorrent")),
-        type=str(item.get("type", "qbittorrent")),
-        base_url=str(item.get("base_url", "")),
-        username=str(item.get("username", "")),
-        download_path=str(item.get("download_path", "")),
-        is_default=bool(item.get("is_default", False)),
+        id=item.id,
+        name=item.name,
+        type=item.type,
+        base_url=item.base_url,
+        username=item.username,
+        download_path=item.download_path,
+        listen_mode=item.listen_mode,
+        is_default=item.is_default,
+        enabled=item.enabled,
     )
 
 
-def _notifier_response(item: dict[str, object]) -> NotifierResponse:
+def _media_server_response(item: MediaServerConfig) -> MediaServerResponse:
+    return MediaServerResponse(
+        id=item.id,
+        name=item.name,
+        type=item.type,
+        base_url=item.base_url,
+        api_key=item.api_key,
+        username=item.username,
+        is_default=item.is_default,
+        enabled=item.enabled,
+    )
+
+
+def _notifier_response(item: NotifierChannel) -> NotifierResponse:
     return NotifierResponse(
-        id=str(item.get("id")) if item.get("id") else None,
-        name=str(item.get("name", "Telegram Bot")),
-        type=str(item.get("type", "telegram")),
-        chat_ids=str(item.get("chat_ids", "")),
-        use_proxy=bool(item.get("use_proxy", False)),
+        id=item.id,
+        name=item.name,
+        type=item.type,
+        webhook_url=item.webhook_url,
+        chat_ids=item.chat_ids,
+        use_proxy=item.use_proxy,
+        enable_download_notify=item.enable_download_notify,
+        enable_library_notify=item.enable_library_notify,
+        enabled=item.enabled,
     )
+
+
+def _download_task_response(item: TorrentRecord) -> DownloadTaskResponse:
+    torrent_hash = None if _is_pending_hash(item.torrent_hash) else item.torrent_hash
+    return DownloadTaskResponse(
+        id=item.id,
+        torrent_hash=torrent_hash,
+        name=item.name,
+        state=item.status,
+        progress=item.progress,
+        save_path=item.save_path,
+        source=item.source,
+        last_error=item.last_error,
+    )
+
+
+def _is_pending_hash(value: str | None) -> bool:
+    return value is None or value.startswith("pending:")
 
 
 def _site_payload(site: IndexerSite) -> dict[str, object]:
@@ -706,8 +1211,309 @@ def _site_payload(site: IndexerSite) -> dict[str, object]:
     }
 
 
+def _dedupe_results(results: list[SearchResult]) -> list[SearchResult]:
+    by_key: dict[tuple[str, str], SearchResult] = {}
+    for result in results:
+        current = by_key.get(result.identity_key)
+        if current is None or result.seeders > current.seeders:
+            by_key[result.identity_key] = result
+    return list(by_key.values())
+
+
+def _metadata_search_keywords(media: MediaCandidateResponse) -> list[str]:
+    keywords: list[str] = []
+    albums = media.albums or ([media.album] if media.album else [])
+    for value in (media.title, *albums):
+        for keyword in _site_keyword_variants(value):
+            if keyword and keyword not in keywords:
+                keywords.append(keyword)
+    return keywords
+
+
+def _site_keyword_variants(value: str | None) -> list[str]:
+    if not value:
+        return []
+    normalized = value.replace("…", "...")
+    if normalized == value:
+        return [value]
+    return [normalized, value]
+
+
+def _filter_by_artist(results: list[SearchResult], artist: str | None) -> list[SearchResult]:
+    if not artist:
+        return results
+    needle = normalize_search_text(artist)
+    compact_needle = _compact_search_text(needle)
+    return [
+        item
+        for item in results
+        if _normalized_contains(_resource_text(item), needle, compact_needle)
+    ]
+
+
+def _resource_text(result: SearchResult) -> str:
+    values = [
+        result.title,
+        result.subtitle or "",
+        result.source,
+        result.details_url or "",
+        result.published_at or "",
+        result.promotion or "",
+        json.dumps(result.metadata, ensure_ascii=False),
+    ]
+    return " ".join(values)
+
+
+def normalize_search_text(value: str) -> str:
+    normalized = _OPENCC_T2S.convert(unicodedata.normalize("NFKC", value))
+    normalized = normalized.replace("…", "...")
+    normalized = re.sub(r"\s+", " ", normalized.casefold()).strip()
+    return normalized
+
+
+def _compact_search_text(value: str) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", value)
+
+
+def _normalized_contains(text: str, needle: str, compact_needle: str) -> bool:
+    haystack = normalize_search_text(text)
+    if needle and needle in haystack:
+        return True
+    return bool(compact_needle and compact_needle in _compact_search_text(haystack))
+
+
+def _navidrome_params(payload: MediaServerCreateRequest | MediaServerConfig) -> dict[str, str]:
+    params = {"v": "1.16.1", "c": "MusicPilot", "f": "json"}
+    token = getattr(payload, "api_key", "")
+    username = getattr(payload, "username", "")
+    password = getattr(payload, "password", "")
+    if token:
+        params["token"] = token
+    if username and password:
+        salt = uuid4().hex
+        auth_token = hashlib.md5(f"{password}{salt}".encode()).hexdigest()
+        params.update({"u": username, "t": auth_token, "s": salt})
+    return params
+
+
+async def _poll_download_tasks(state: AppState) -> None:
+    while True:
+        try:
+            await _poll_download_tasks_once(state)
+        except Exception as exc:  # noqa: BLE001
+            state.add_log("download", f"Download polling failed: {exc}", "ERROR")
+        await asyncio.sleep(DOWNLOAD_POLL_INTERVAL_SECONDS)
+
+
+async def _poll_download_tasks_once(state: AppState) -> None:
+    default = await state.repository.default_downloader()
+    if default is None or default.listen_mode != "polling" or not default.enabled:
+        return
+    if state.downloader is None:
+        await state.reload_downloader()
+    if state.downloader is None:
+        return
+
+    statuses = await state.downloader.list_statuses()
+    by_hash = {item.torrent_hash: item for item in statuses if item.torrent_hash}
+    tasks = await state.repository.list_unfinished_download_tasks()
+    for task in tasks:
+        if task.status in {"completed", "refreshing_library"}:
+            await _refresh_library_for_task(state, task)
+            continue
+        has_real_hash = not _is_pending_hash(task.torrent_hash)
+        status = by_hash.get(task.torrent_hash or "") if has_real_hash else None
+        if status is None and not has_real_hash:
+            status = _match_status_by_name(statuses, task)
+            if status is not None:
+                await state.repository.update_download_task(
+                    task.id,
+                    torrent_hash=status.torrent_hash,
+                )
+        if status is None:
+            continue
+        changes: dict[str, object] = {
+            "progress": status.progress,
+            "save_path": str(status.save_path) if status.save_path is not None else None,
+        }
+        if status.progress >= 1:
+            changes.update({"status": "completed", "completed_at": datetime.now(UTC)})
+        else:
+            changes["status"] = "downloading"
+            if task.download_started_at is None:
+                changes["download_started_at"] = datetime.now(UTC)
+        await state.repository.update_download_task(task.id, **changes)
+
+
+def _match_status_by_name(statuses: tuple[object, ...], task: TorrentRecord) -> object | None:
+    name = _normalize_match_text(task.name)
+    for status in statuses:
+        status_name = _normalize_match_text(getattr(status, "name", ""))
+        if not name or not status_name:
+            continue
+        if name in status_name or status_name in name:
+            return status
+    task_tokens = _match_tokens(task.name)
+    best_status = None
+    best_score = 0.0
+    for status in statuses:
+        status_tokens = _match_tokens(getattr(status, "name", ""))
+        if not task_tokens or not status_tokens:
+            continue
+        score = len(task_tokens & status_tokens) / len(status_tokens)
+        if score > best_score:
+            best_score = score
+            best_status = status
+    if best_score >= 0.7:
+        return best_status
+    return None
+
+
+def _normalize_match_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.casefold()).strip()
+
+
+def _match_tokens(value: str) -> set[str]:
+    normalized = _normalize_match_text(value)
+    return {
+        token
+        for token in re.split(r"[^0-9a-zA-Z\u4e00-\u9fff.]+", normalized)
+        if len(token) >= 2
+    }
+
+
+async def _refresh_library_for_task(state: AppState, task: TorrentRecord) -> None:
+    if task.status != "refreshing_library":
+        await state.repository.update_download_task(task.id, status="refreshing_library")
+    server = await state.repository.default_media_server()
+    if server is None:
+        await state.repository.update_download_task(
+            task.id,
+            status="failed",
+            last_error="No enabled default media server is configured.",
+        )
+        state.add_log(
+            "library",
+            f"Library refresh failed for {task.name}: no media server",
+            "ERROR",
+        )
+        return
+    try:
+        state.add_log("library", f"Refreshing media library via {server.name}: {task.name}")
+        async with httpx.AsyncClient(base_url=server.base_url.rstrip("/"), timeout=30) as client:
+            response = await client.get("/rest/startScan.view", params=_navidrome_params(server))
+            _validate_navidrome_scan_response(response)
+    except Exception as exc:  # noqa: BLE001
+        await state.repository.update_download_task(task.id, status="failed", last_error=str(exc))
+        state.add_log("library", f"Library refresh failed for {task.name}: {exc}", "ERROR")
+        return
+    refreshed = await state.repository.update_download_task(
+        task.id,
+        status="library_refreshed",
+        library_refreshed_at=datetime.now(UTC),
+    )
+    state.add_log("library", f"Media library refresh requested: {task.name}")
+    await _send_event_notifications(state, "library", refreshed or task)
+
+
+def _validate_navidrome_scan_response(response: httpx.Response) -> None:
+    response.raise_for_status()
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Navidrome scan returned a non-JSON response.") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Navidrome scan returned an invalid response.")
+    body = payload.get("subsonic-response")
+    if not isinstance(body, dict):
+        raise RuntimeError("Navidrome scan response is missing subsonic-response.")
+    status = str(body.get("status") or "").casefold()
+    if status == "ok":
+        return
+    error = body.get("error")
+    message = ""
+    if isinstance(error, dict):
+        code = error.get("code")
+        detail = error.get("message")
+        if code and detail:
+            message = f"{code}: {detail}"
+        elif detail:
+            message = str(detail)
+    if not message:
+        message = f"unexpected status {status or '<missing>'}"
+    raise RuntimeError(f"Navidrome scan failed: {message}")
+
+
+async def _send_event_notifications(
+    state: AppState,
+    event_name: str,
+    task: TorrentRecord | None,
+) -> None:
+    if task is None:
+        return
+    await state.reload_notifiers()
+    channels = await state.repository.list_notifiers()
+    enabled = [
+        item for item in channels
+        if item.enabled and (
+            (event_name == "download" and item.enable_download_notify)
+            or (event_name == "library" and item.enable_library_notify)
+        )
+    ]
+    if not enabled:
+        return
+    title = "MusicPilot 已提交下载" if event_name == "download" else "MusicPilot 媒体库已刷新"
+    text = task.name
+    system_settings = await state.repository.get_system_settings()
+    notifiers = [
+        TelegramHttpNotifier(
+            token=item.bot_token,
+            chat_ids=tuple(
+                int(chat_id.strip())
+                for chat_id in item.chat_ids.split(",")
+                if chat_id.strip().isdigit()
+            ),
+            proxy=_proxy_url(system_settings) if item.use_proxy else None,
+        )
+        for item in enabled
+        if item.type == "telegram" and item.bot_token.strip()
+    ]
+    await asyncio.gather(
+        *(notifier.notify(NotifyEvent(title=title, text=text)) for notifier in notifiers),
+        return_exceptions=True,
+    )
+
+
 def _site_response(site: IndexerSite, parser: NexusPHPParserConfig) -> SiteResponse:
     return SiteResponse(**_site_payload(site), parser=_parser_response(parser))
+
+
+def _legacy_downloader_payload(item: dict[str, object]) -> dict[str, object]:
+    return {
+        "name": str(item.get("name") or "qBittorrent"),
+        "type": str(item.get("type") or "qbittorrent"),
+        "base_url": str(item.get("base_url") or ""),
+        "username": str(item.get("username") or ""),
+        "password": str(item.get("password") or ""),
+        "download_path": str(item.get("download_path") or ""),
+        "listen_mode": str(item.get("listen_mode") or "polling"),
+        "is_default": bool(item.get("is_default", True)),
+        "enabled": bool(item.get("enabled", True)),
+    }
+
+
+def _legacy_notifier_payload(item: dict[str, object]) -> dict[str, object]:
+    return {
+        "name": str(item.get("name") or "Telegram Bot"),
+        "type": str(item.get("type") or "telegram"),
+        "bot_token": str(item.get("bot_token") or ""),
+        "webhook_url": str(item.get("webhook_url") or ""),
+        "chat_ids": str(item.get("chat_ids") or ""),
+        "use_proxy": bool(item.get("use_proxy", False)),
+        "enable_download_notify": bool(item.get("enable_download_notify", True)),
+        "enable_library_notify": bool(item.get("enable_library_notify", True)),
+        "enabled": bool(item.get("enabled", True)),
+    }
 
 
 def _parser_response(parser: NexusPHPParserConfig) -> NexusPHPParserRequest:

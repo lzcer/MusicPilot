@@ -35,6 +35,7 @@ class NexusPHPSiteConfig:
     name: str
     base_url: str
     parser: NexusPHPParserConfig
+    site_id: str | None = None
     cookie: str | None = None
     max_concurrency: int = 2
     user_agent: str | None = None

@@ -3,10 +3,21 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import select
 
-from musicpilot.infra.db.models import IndexerSite, MediaFile, Subscription, TorrentRecord
+from musicpilot.infra.db.models import (
+    DownloaderConfig,
+    IndexerSite,
+    MediaFile,
+    MediaServerConfig,
+    NotifierChannel,
+    Subscription,
+    SystemSetting,
+    TorrentRecord,
+)
 from musicpilot.infra.db.session import Database
 from musicpilot.ports.metadata import TrackMetadata
 
@@ -68,6 +79,212 @@ class SqlAlchemyMediaRepository:
             record.progress = 1.0
             record.save_path = str(save_path) if save_path is not None else None
             await session.commit()
+
+    async def list_downloaders(self) -> list[DownloaderConfig]:
+        async with self.database.session() as session:
+            result = await session.execute(select(DownloaderConfig).order_by(DownloaderConfig.name))
+            return list(result.scalars().all())
+
+    async def default_downloader(self) -> DownloaderConfig | None:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(DownloaderConfig)
+                .where(DownloaderConfig.enabled.is_(True), DownloaderConfig.is_default.is_(True))
+                .order_by(DownloaderConfig.updated_at.desc())
+            )
+            return result.scalars().first()
+
+    async def get_downloader(self, downloader_id: str) -> DownloaderConfig | None:
+        async with self.database.session() as session:
+            return await session.get(DownloaderConfig, downloader_id)
+
+    async def upsert_downloader(
+        self,
+        *,
+        downloader_id: str | None = None,
+        payload: dict[str, Any],
+    ) -> DownloaderConfig:
+        async with self.database.session() as session:
+            row = await session.get(DownloaderConfig, downloader_id) if downloader_id else None
+            if row is None:
+                row = DownloaderConfig(name=str(payload.get("name") or "qBittorrent"), base_url="")
+                session.add(row)
+            _assign_config_fields(
+                row,
+                payload,
+                (
+                    "name",
+                    "type",
+                    "base_url",
+                    "username",
+                    "download_path",
+                    "listen_mode",
+                    "is_default",
+                    "enabled",
+                ),
+            )
+            if payload.get("password"):
+                row.password = str(payload["password"])
+            if row.is_default:
+                await _clear_other_defaults(session, DownloaderConfig, row.id)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def list_media_servers(self) -> list[MediaServerConfig]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(MediaServerConfig).order_by(MediaServerConfig.name)
+            )
+            return list(result.scalars().all())
+
+    async def default_media_server(self) -> MediaServerConfig | None:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(MediaServerConfig)
+                .where(MediaServerConfig.enabled.is_(True))
+                .order_by(MediaServerConfig.is_default.desc(), MediaServerConfig.updated_at.desc())
+            )
+            return result.scalars().first()
+
+    async def upsert_media_server(
+        self,
+        *,
+        server_id: str | None = None,
+        payload: dict[str, Any],
+    ) -> MediaServerConfig:
+        async with self.database.session() as session:
+            row = await session.get(MediaServerConfig, server_id) if server_id else None
+            if row is None:
+                row = MediaServerConfig(name=str(payload.get("name") or "Navidrome"), base_url="")
+                session.add(row)
+            _assign_config_fields(
+                row,
+                payload,
+                ("name", "type", "base_url", "api_key", "username", "is_default", "enabled"),
+            )
+            if payload.get("password"):
+                row.password = str(payload["password"])
+            if row.is_default:
+                await _clear_other_defaults(session, MediaServerConfig, row.id)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def list_notifiers(self) -> list[NotifierChannel]:
+        async with self.database.session() as session:
+            result = await session.execute(            
+                select(NotifierChannel).order_by(NotifierChannel.name)
+            )
+            return list(result.scalars().all())
+
+    async def get_notifier(self, notifier_id: str) -> NotifierChannel | None:
+        async with self.database.session() as session:
+            return await session.get(NotifierChannel, notifier_id)
+
+    async def upsert_notifier(
+        self,
+        *,
+        notifier_id: str | None = None,
+        payload: dict[str, Any],
+    ) -> NotifierChannel:
+        async with self.database.session() as session:
+            row = await session.get(NotifierChannel, notifier_id) if notifier_id else None
+            if row is None:
+                row = NotifierChannel(name=str(payload.get("name") or "Telegram Bot"))
+                session.add(row)
+            _assign_config_fields(
+                row,
+                payload,
+                (
+                    "name",
+                    "type",
+                    "webhook_url",
+                    "chat_ids",
+                    "use_proxy",
+                    "enable_download_notify",
+                    "enable_library_notify",
+                    "enabled",
+                ),
+            )
+            if payload.get("bot_token"):
+                row.bot_token = str(payload["bot_token"])
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def get_system_settings(self) -> dict[str, Any]:
+        async with self.database.session() as session:
+            row = await session.get(SystemSetting, "runtime")
+            return row.value if row is not None else {"proxy": {}}
+
+    async def update_system_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        async with self.database.session() as session:
+            row = await session.get(SystemSetting, "runtime")
+            if row is None:
+                row = SystemSetting(key="runtime", value={})
+                session.add(row)
+            current = dict(row.value or {})
+            current.update(payload)
+            row.value = current
+            await session.commit()
+            await session.refresh(row)
+            return row.value
+
+    async def create_download_task(
+        self,
+        *,
+        resource: dict[str, Any],
+        media_metadata: dict[str, Any],
+        selected_site_ids: list[str],
+        category: str,
+    ) -> TorrentRecord:
+        async with self.database.session() as session:
+            record = TorrentRecord(
+                torrent_hash=f"pending:{uuid4().hex[:24]}",
+                name=str(resource.get("title") or "MusicPilot download"),
+                source=str(resource.get("source") or ""),
+                download_url=str(resource.get("download_url") or ""),
+                status="queued",
+                progress=0.0,
+                resource_payload=resource,
+                media_metadata=media_metadata,
+                selected_site_ids=selected_site_ids,
+                payload={"category": category},
+            )
+            session.add(record)
+            await session.commit()
+            await session.refresh(record)
+            return record
+
+    async def list_download_tasks(self) -> list[TorrentRecord]:
+        async with self.database.session() as session:
+            result = await session.execute(select(TorrentRecord).order_by(TorrentRecord.id.desc()))
+            return list(result.scalars().all())
+
+    async def list_unfinished_download_tasks(self) -> list[TorrentRecord]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(TorrentRecord)
+                .where(
+                    TorrentRecord.status.in_(
+                        ("submitted", "downloading", "completed", "refreshing_library")
+                    )
+                )
+                .order_by(TorrentRecord.id)
+            )
+            return list(result.scalars().all())
+
+    async def update_download_task(self, task_id: int, **changes: Any) -> TorrentRecord | None:
+        async with self.database.session() as session:
+            row = await session.get(TorrentRecord, task_id)
+            if row is None:
+                return None
+            for key, value in changes.items():
+                setattr(row, key, value)
+            await session.commit()
+            await session.refresh(row)
+            return row
 
     async def list_subscriptions(self) -> list[Subscription]:
         async with self.database.session() as session:
@@ -161,3 +378,15 @@ class SqlAlchemyMediaRepository:
             await session.commit()
             await session.refresh(site)
             return site
+
+
+def _assign_config_fields(row: object, payload: dict[str, Any], fields: tuple[str, ...]) -> None:
+    for field in fields:
+        if field in payload:
+            setattr(row, field, payload[field])
+
+
+async def _clear_other_defaults(session: object, model: type[object], active_id: str) -> None:
+    result = await session.execute(select(model).where(model.id != active_id))
+    for row in result.scalars().all():
+        row.is_default = False

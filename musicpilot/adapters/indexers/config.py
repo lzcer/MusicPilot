@@ -80,6 +80,7 @@ def _site_config(raw: Any, entry: ParserCatalogEntry) -> NexusPHPSiteConfig:
             name=str(raw["name"]),
             base_url=str(raw["base_url"]),
             cookie=str(raw["cookie"]) if raw.get("cookie") else None,
+            site_id=str(raw["id"]) if raw.get("id") else None,
             parser=entry.parser,
             max_concurrency=int(raw.get("max_concurrency", 2)),
             user_agent=str(raw["user_agent"]) if raw.get("user_agent") else None,

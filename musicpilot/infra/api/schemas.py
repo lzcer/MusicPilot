@@ -48,6 +48,34 @@ class SearchResponse(BaseModel):
     results: list[SearchResultResponse]
 
 
+class MediaCandidateResponse(BaseModel):
+    title: str
+    artist: str | None = None
+    album: str | None = None
+    albums: list[str] = Field(default_factory=list)
+    release_date: str | None = None
+    cover_url: str | None = None
+    source: str
+    external_id: str
+
+
+class MetadataSearchResponse(BaseModel):
+    query: str
+    candidates: list[MediaCandidateResponse]
+
+
+class MetadataSiteSearchRequest(BaseModel):
+    media: MediaCandidateResponse
+    site_ids: list[str] = Field(default_factory=list)
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+class MetadataSiteSearchResponse(BaseModel):
+    raw_count: int
+    filtered_count: int
+    results: list[SearchResultResponse]
+
+
 class DownloadRequest(BaseModel):
     title: str = Field(min_length=1)
     download_url: str = Field(min_length=1)
@@ -60,19 +88,26 @@ class DownloadRequest(BaseModel):
     published_at: str | None = None
     promotion: str | None = None
     category: str = "MusicPilot"
+    media_metadata: MediaCandidateResponse | None = None
+    resource: SearchResultResponse | None = None
+    selected_site_ids: list[str] = Field(default_factory=list)
 
 
 class DownloadResponse(BaseModel):
     status: str
+    task_id: int | None = None
     torrent_hash: str | None = None
 
 
 class DownloadTaskResponse(BaseModel):
-    torrent_hash: str
+    id: int | None = None
+    torrent_hash: str | None = None
     name: str
     state: str
     progress: float
     save_path: str | None = None
+    source: str = ""
+    last_error: str | None = None
 
 
 class IndexerResponse(BaseModel):
@@ -117,7 +152,9 @@ class DownloaderCreateRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = ""
     download_path: str = ""
+    listen_mode: str = Field(default="polling", pattern="^(polling|qb_callback)$")
     is_default: bool = True
+    enabled: bool = True
 
 
 class DownloaderResponse(BaseModel):
@@ -127,7 +164,32 @@ class DownloaderResponse(BaseModel):
     base_url: str
     username: str
     download_path: str = ""
+    listen_mode: str = "polling"
     is_default: bool
+    enabled: bool = True
+
+
+class MediaServerCreateRequest(BaseModel):
+    id: str | None = None
+    name: str = Field(default="Navidrome", min_length=1, max_length=128)
+    type: str = Field(default="navidrome", pattern="^navidrome$")
+    base_url: str = Field(min_length=1)
+    api_key: str = ""
+    username: str = ""
+    password: str = ""
+    is_default: bool = True
+    enabled: bool = True
+
+
+class MediaServerResponse(BaseModel):
+    id: str | None = None
+    name: str
+    type: str
+    base_url: str
+    api_key: str = ""
+    username: str = ""
+    is_default: bool
+    enabled: bool = True
 
 
 class NotifierCreateRequest(BaseModel):
@@ -135,16 +197,24 @@ class NotifierCreateRequest(BaseModel):
     name: str = Field(default="Telegram Bot", min_length=1, max_length=128)
     type: str = Field(default="telegram", pattern="^telegram$")
     bot_token: str = ""
+    webhook_url: str = ""
     chat_ids: str = ""
     use_proxy: bool = False
+    enable_download_notify: bool = True
+    enable_library_notify: bool = True
+    enabled: bool = True
 
 
 class NotifierResponse(BaseModel):
     id: str | None = None
     name: str
     type: str
+    webhook_url: str = ""
     chat_ids: str = ""
     use_proxy: bool = False
+    enable_download_notify: bool = True
+    enable_library_notify: bool = True
+    enabled: bool = True
 
 
 class ProxySettings(BaseModel):

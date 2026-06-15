@@ -25,6 +25,7 @@ dependencies = [
   "pydantic>=2.8",
   "pydantic-settings>=2.3",
   "pyyaml>=6.0",
+  "opencc-python-reimplemented>=0.1.7",
 ]
 
 [project.optional-dependencies]

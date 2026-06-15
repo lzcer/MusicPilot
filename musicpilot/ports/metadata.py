@@ -16,6 +16,17 @@ class TrackMetadata:
     extra: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class MediaCandidate:
+    title: str
+    artist: str | None = None
+    album: str | None = None
+    release_date: str | None = None
+    cover_url: str | None = None
+    source: str = ""
+    external_id: str = ""
+
+
 class MetadataProvider(Protocol):
     @property
     def name(self) -> str: ...
