@@ -11,6 +11,7 @@ from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from html import escape
 from pathlib import Path
 from secrets import compare_digest
 from typing import Any
@@ -735,6 +736,13 @@ def create_app() -> FastAPI:
         await state.reload_indexers()
         return _site_response(site, parser)
 
+    @app.delete("/api/sites/{site_id}", status_code=204)
+    async def delete_site(site_id: str) -> None:
+        deleted = await state.repository.delete_indexer_site(site_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Site not found.")
+        await state.reload_indexers()
+
     @app.get("/api/settings/downloaders", response_model=list[DownloaderResponse])
     async def downloaders() -> list[DownloaderResponse]:
         return [_downloader_response(item) for item in await state.repository.list_downloaders()]
@@ -760,6 +768,13 @@ def create_app() -> FastAPI:
         )
         await state.reload_downloader()
         return _downloader_response(downloader)
+
+    @app.delete("/api/settings/downloaders/{downloader_id}", status_code=204)
+    async def delete_downloader(downloader_id: str) -> None:
+        deleted = await state.repository.delete_downloader(downloader_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Downloader not found.")
+        await state.reload_downloader()
 
     @app.post("/api/settings/downloaders/test", response_model=TestResponse)
     async def test_downloader(payload: DownloaderCreateRequest) -> TestResponse:
@@ -830,6 +845,12 @@ def create_app() -> FastAPI:
         )
         return _media_server_response(server)
 
+    @app.delete("/api/settings/media-servers/{server_id}", status_code=204)
+    async def delete_media_server(server_id: str) -> None:
+        deleted = await state.repository.delete_media_server(server_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Media server not found.")
+
     @app.post("/api/settings/media-servers/test", response_model=TestResponse)
     async def test_media_server(payload: MediaServerCreateRequest) -> TestResponse:
         try:
@@ -868,6 +889,13 @@ def create_app() -> FastAPI:
         )
         await state.reload_notifiers()
         return _notifier_response(notifier)
+
+    @app.delete("/api/settings/notifiers/{notifier_id}", status_code=204)
+    async def delete_notifier(notifier_id: str) -> None:
+        deleted = await state.repository.delete_notifier(notifier_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Notifier not found.")
+        await state.reload_notifiers()
 
     @app.post("/api/settings/notifiers/test", response_model=TestResponse)
     async def test_notifier(payload: NotifierCreateRequest) -> TestResponse:
@@ -1463,7 +1491,7 @@ async def _send_event_notifications(
     if not enabled:
         return
     title = "MusicPilot 已提交下载" if event_name == "download" else "MusicPilot 媒体库已刷新"
-    text = task.name
+    text = _notification_body(event_name, task)
     system_settings = await state.repository.get_system_settings()
     notifiers = [
         TelegramHttpNotifier(
@@ -1482,6 +1510,72 @@ async def _send_event_notifications(
         *(notifier.notify(NotifyEvent(title=title, text=text)) for notifier in notifiers),
         return_exceptions=True,
     )
+
+
+def _notification_body(event_name: str, task: TorrentRecord) -> str:
+    if event_name == "download":
+        return _download_notification_body(task)
+    return _library_notification_body(task)
+
+
+def _download_notification_body(task: TorrentRecord) -> str:
+    resource = task.resource_payload or {}
+    return "\n".join(
+        [
+            _notification_line("种子名称", task.name),
+            _notification_line("大小", _format_size_bytes(resource.get("size_bytes"))),
+            _notification_line("站点", task.source or resource.get("source")),
+            _notification_line("促销信息", resource.get("promotion")),
+            _notification_line("发布时间", resource.get("published_at")),
+        ]
+    )
+
+
+def _library_notification_body(task: TorrentRecord) -> str:
+    resource = task.resource_payload or {}
+    return "\n".join(
+        [
+            _notification_line("种子名称", task.name),
+            _notification_line("大小", _format_size_bytes(resource.get("size_bytes"))),
+            _notification_line("入库时间", _format_datetime(task.library_refreshed_at)),
+        ]
+    )
+
+
+def _notification_line(label: str, value: object) -> str:
+    return f"<b>{escape(label)}：</b>{escape(_display_value(value))}"
+
+
+def _display_value(value: object) -> str:
+    if value is None:
+        return "-"
+    text = str(value).strip()
+    return text or "-"
+
+
+def _format_size_bytes(value: object) -> str:
+    if value is None:
+        return "-"
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return _display_value(value)
+    if size <= 0:
+        return "-"
+    units = ("B", "KB", "MB", "GB", "TB")
+    unit_index = 0
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(size)} {units[unit_index]}"
+    return f"{size:.2f} {units[unit_index]}"
+
+
+def _format_datetime(value: datetime | None) -> str:
+    if value is None:
+        return "-"
+    return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _site_response(site: IndexerSite, parser: NexusPHPParserConfig) -> SiteResponse:

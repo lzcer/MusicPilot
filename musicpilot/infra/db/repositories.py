@@ -98,6 +98,15 @@ class SqlAlchemyMediaRepository:
         async with self.database.session() as session:
             return await session.get(DownloaderConfig, downloader_id)
 
+    async def delete_downloader(self, downloader_id: str) -> bool:
+        async with self.database.session() as session:
+            row = await session.get(DownloaderConfig, downloader_id)
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.commit()
+            return True
+
     async def upsert_downloader(
         self,
         *,
@@ -138,6 +147,15 @@ class SqlAlchemyMediaRepository:
                 select(MediaServerConfig).order_by(MediaServerConfig.name)
             )
             return list(result.scalars().all())
+
+    async def delete_media_server(self, server_id: str) -> bool:
+        async with self.database.session() as session:
+            row = await session.get(MediaServerConfig, server_id)
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.commit()
+            return True
 
     async def default_media_server(self) -> MediaServerConfig | None:
         async with self.database.session() as session:
@@ -183,6 +201,15 @@ class SqlAlchemyMediaRepository:
     async def get_notifier(self, notifier_id: str) -> NotifierChannel | None:
         async with self.database.session() as session:
             return await session.get(NotifierChannel, notifier_id)
+
+    async def delete_notifier(self, notifier_id: str) -> bool:
+        async with self.database.session() as session:
+            row = await session.get(NotifierChannel, notifier_id)
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.commit()
+            return True
 
     async def upsert_notifier(
         self,
@@ -380,6 +407,15 @@ class SqlAlchemyMediaRepository:
             await session.commit()
             await session.refresh(site)
             return site
+
+    async def delete_indexer_site(self, site_id: str) -> bool:
+        async with self.database.session() as session:
+            site = await session.get(IndexerSite, site_id)
+            if site is None:
+                return False
+            await session.delete(site)
+            await session.commit()
+            return True
 
 
 def _assign_config_fields(row: object, payload: dict[str, Any], fields: tuple[str, ...]) -> None:

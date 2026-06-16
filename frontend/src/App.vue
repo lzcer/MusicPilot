@@ -154,6 +154,14 @@ type TestResponse = {
   message: string
 }
 
+type DeleteTarget = {
+  kind: 'site' | 'downloader' | 'mediaServer' | 'notifier'
+  id: string
+  name: string
+}
+
+type ConfigMenuKind = DeleteTarget['kind']
+
 const loggedIn = ref(false)
 const loginLoading = ref(false)
 const loginForm = ref({ username: 'admin', password: 'musicpilot' })
@@ -199,10 +207,12 @@ const siteDialog = ref(false)
 const downloaderDialog = ref(false)
 const mediaServerDialog = ref(false)
 const notifierDialog = ref(false)
+const deleteDialog = ref(false)
 const siteTesting = ref(false)
 const downloaderTesting = ref(false)
 const mediaServerTesting = ref(false)
 const notifierTesting = ref(false)
+const deleting = ref(false)
 const systemSaving = ref(false)
 const editingSiteId = ref<string | null>(null)
 const editingDownloaderId = ref<string | null>(null)
@@ -210,6 +220,8 @@ const editingMediaServerId = ref<string | null>(null)
 const editingNotifierId = ref<string | null>(null)
 
 const snackbar = ref({ show: false, color: 'success', text: '' })
+const deleteTarget = ref<DeleteTarget | null>(null)
+const activeConfigMenu = ref<string | null>(null)
 
 const siteForm = ref({
   name: '',
@@ -314,6 +326,20 @@ async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
     throw new Error(await readError(response))
   }
   return response.json() as Promise<T>
+}
+
+async function apiNoContent(url: string, options: RequestInit = {}) {
+  const response = await fetch(url, {
+    credentials: 'include',
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers ?? {})
+    }
+  })
+  if (!response.ok) {
+    throw new Error(await readError(response))
+  }
 }
 
 async function readError(response: Response) {
@@ -684,6 +710,11 @@ async function saveSite() {
   }
 }
 
+function openDeleteSite(site: Site) {
+  if (!site.id) return
+  openDeleteDialog({ kind: 'site', id: site.id, name: site.name })
+}
+
 async function testSite() {
   siteTesting.value = true
   try {
@@ -774,6 +805,11 @@ async function saveDownloader() {
   notify('下载器已保存')
 }
 
+function openDeleteDownloader(downloader: DownloaderConfig) {
+  if (!downloader.id) return
+  openDeleteDialog({ kind: 'downloader', id: downloader.id, name: downloader.name })
+}
+
 async function loadMediaServers() {
   mediaServers.value = await api<MediaServerConfig[]>('/api/settings/media-servers')
 }
@@ -843,6 +879,11 @@ async function saveMediaServer() {
   }
   mediaServerDialog.value = false
   notify('媒体服务器已保存')
+}
+
+function openDeleteMediaServer(server: MediaServerConfig) {
+  if (!server.id) return
+  openDeleteDialog({ kind: 'mediaServer', id: server.id, name: server.name })
 }
 
 async function loadNotifiers() {
@@ -916,6 +957,70 @@ async function saveNotifier() {
   notify('通知已保存')
 }
 
+function openDeleteNotifier(notifier: NotifierConfig) {
+  if (!notifier.id) return
+  openDeleteDialog({ kind: 'notifier', id: notifier.id, name: notifier.name })
+}
+
+function openDeleteDialog(target: DeleteTarget) {
+  activeConfigMenu.value = null
+  deleteTarget.value = target
+  deleteDialog.value = true
+}
+
+function configMenuKey(kind: ConfigMenuKind, id: string) {
+  return `${kind}:${id}`
+}
+
+function toggleConfigMenu(kind: ConfigMenuKind, id: string) {
+  const key = configMenuKey(kind, id)
+  activeConfigMenu.value = activeConfigMenu.value === key ? null : key
+}
+
+function deleteTargetLabel(target: DeleteTarget | null) {
+  if (!target) return ''
+  return {
+    site: '站点',
+    downloader: '下载器',
+    mediaServer: '媒体服务器',
+    notifier: '通知'
+  }[target.kind]
+}
+
+function deleteTargetUrl(target: DeleteTarget) {
+  return {
+    site: `/api/sites/${target.id}`,
+    downloader: `/api/settings/downloaders/${target.id}`,
+    mediaServer: `/api/settings/media-servers/${target.id}`,
+    notifier: `/api/settings/notifiers/${target.id}`
+  }[target.kind]
+}
+
+async function confirmDelete() {
+  if (!deleteTarget.value) return
+  const target = deleteTarget.value
+  deleting.value = true
+  try {
+    await apiNoContent(deleteTargetUrl(target), { method: 'DELETE' })
+    if (target.kind === 'site') {
+      sites.value = sites.value.filter((item) => item.id !== target.id)
+    } else if (target.kind === 'downloader') {
+      downloaders.value = downloaders.value.filter((item) => item.id !== target.id)
+    } else if (target.kind === 'mediaServer') {
+      mediaServers.value = mediaServers.value.filter((item) => item.id !== target.id)
+    } else {
+      notifiers.value = notifiers.value.filter((item) => item.id !== target.id)
+    }
+    deleteDialog.value = false
+    deleteTarget.value = null
+    notify(`${deleteTargetLabel(target)}已删除`)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '删除失败', 'error')
+  } finally {
+    deleting.value = false
+  }
+}
+
 async function loadSystemSettings() {
   systemForm.value = await api<SystemSettings>('/api/settings/system')
 }
@@ -985,7 +1090,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <v-app>
+  <v-app @click="activeConfigMenu = null">
     <main v-if="!loggedIn" class="login-screen">
       <v-card class="login-card">
         <v-card-title class="text-h5 font-weight-bold">MusicPilot</v-card-title>
@@ -1224,7 +1329,28 @@ onUnmounted(() => {
             </div>
             <div class="card-grid">
               <v-card v-for="site in sites" :key="site.id || site.name" class="config-card" @click="editSite(site)">
-                <v-card-title>{{ site.name }}</v-card-title>
+                <v-card-title class="config-card-title d-flex align-center">
+                  <span>{{ site.name }}</span>
+                  <v-spacer />
+                  <div v-if="site.id" class="config-card-menu" @click.stop>
+                    <v-btn
+                      icon="mdi-dots-vertical"
+                      size="small"
+                      variant="text"
+                      @click.stop="toggleConfigMenu('site', site.id)"
+                    />
+                    <v-card
+                      v-if="activeConfigMenu === configMenuKey('site', site.id)"
+                      class="config-card-menu-panel"
+                      elevation="1"
+                      @click.stop
+                    >
+                      <button class="config-card-menu-item" type="button" @click="openDeleteSite(site)">
+                        删除
+                      </button>
+                    </v-card>
+                  </div>
+                </v-card-title>
                 <v-card-text>
                   <div class="muted">{{ site.base_url }}</div>
                   <v-chip size="small" variant="tonal">{{ site.max_concurrency }} 并发</v-chip>
@@ -1292,7 +1418,28 @@ onUnmounted(() => {
                     class="config-card"
                     @click="editDownloader(downloader)"
                   >
-                    <v-card-title>{{ downloader.name }}</v-card-title>
+                    <v-card-title class="config-card-title d-flex align-center">
+                      <span>{{ downloader.name }}</span>
+                      <v-spacer />
+                      <div v-if="downloader.id" class="config-card-menu" @click.stop>
+                        <v-btn
+                          icon="mdi-dots-vertical"
+                          size="small"
+                          variant="text"
+                          @click.stop="toggleConfigMenu('downloader', downloader.id)"
+                        />
+                        <v-card
+                          v-if="activeConfigMenu === configMenuKey('downloader', downloader.id)"
+                          class="config-card-menu-panel"
+                          elevation="1"
+                          @click.stop
+                        >
+                          <button class="config-card-menu-item" type="button" @click="openDeleteDownloader(downloader)">
+                            删除
+                          </button>
+                        </v-card>
+                      </div>
+                    </v-card-title>
                     <v-card-text>
                       <div class="muted">{{ downloader.base_url }}</div>
                       <div class="muted">{{ downloader.download_path || '未设置下载目录' }}</div>
@@ -1314,7 +1461,28 @@ onUnmounted(() => {
                     class="config-card"
                     @click="editMediaServer(server)"
                   >
-                    <v-card-title>{{ server.name }}</v-card-title>
+                    <v-card-title class="config-card-title d-flex align-center">
+                      <span>{{ server.name }}</span>
+                      <v-spacer />
+                      <div v-if="server.id" class="config-card-menu" @click.stop>
+                        <v-btn
+                          icon="mdi-dots-vertical"
+                          size="small"
+                          variant="text"
+                          @click.stop="toggleConfigMenu('mediaServer', server.id)"
+                        />
+                        <v-card
+                          v-if="activeConfigMenu === configMenuKey('mediaServer', server.id)"
+                          class="config-card-menu-panel"
+                          elevation="1"
+                          @click.stop
+                        >
+                          <button class="config-card-menu-item" type="button" @click="openDeleteMediaServer(server)">
+                            删除
+                          </button>
+                        </v-card>
+                      </div>
+                    </v-card-title>
                     <v-card-text>
                       <div class="muted">{{ server.base_url }}</div>
                       <v-chip size="small" variant="tonal">{{ server.type }}</v-chip>
@@ -1336,7 +1504,28 @@ onUnmounted(() => {
                     class="config-card"
                     @click="editNotifier(notifier)"
                   >
-                    <v-card-title>{{ notifier.name }}</v-card-title>
+                    <v-card-title class="config-card-title d-flex align-center">
+                      <span>{{ notifier.name }}</span>
+                      <v-spacer />
+                      <div v-if="notifier.id" class="config-card-menu" @click.stop>
+                        <v-btn
+                          icon="mdi-dots-vertical"
+                          size="small"
+                          variant="text"
+                          @click.stop="toggleConfigMenu('notifier', notifier.id)"
+                        />
+                        <v-card
+                          v-if="activeConfigMenu === configMenuKey('notifier', notifier.id)"
+                          class="config-card-menu-panel"
+                          elevation="1"
+                          @click.stop
+                        >
+                          <button class="config-card-menu-item" type="button" @click="openDeleteNotifier(notifier)">
+                            删除
+                          </button>
+                        </v-card>
+                      </div>
+                    </v-card-title>
                     <v-card-text>
                       <v-chip size="small" variant="tonal">{{ notifier.type }}</v-chip>
                       <v-chip v-if="notifier.use_proxy" color="warning" size="small" variant="tonal">代理</v-chip>
@@ -1590,8 +1779,68 @@ onUnmounted(() => {
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="deleteDialog" max-width="420">
+      <v-card title="确认删除">
+        <v-card-text>
+          确定删除{{ deleteTargetLabel(deleteTarget) }}“{{ deleteTarget?.name }}”吗？
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="deleting" @click="deleteDialog = false">取消</v-btn>
+          <v-btn color="error" :loading="deleting" @click="confirmDelete">删除</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-snackbar v-model="snackbar.show" :color="snackbar.color" location="top right">
       {{ snackbar.text }}
     </v-snackbar>
   </v-app>
 </template>
+
+<style scoped>
+.config-card {
+  overflow: visible !important;
+  position: relative;
+}
+
+.config-card-title {
+  overflow: visible;
+  position: relative;
+  z-index: 30;
+}
+
+.config-card-menu {
+  align-items: center;
+  display: inline-flex;
+  position: relative;
+  z-index: 40;
+}
+
+.config-card-menu-panel {
+  min-width: 72px;
+  padding: 2px 0;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 200;
+}
+
+.config-card-menu-item {
+  background: transparent;
+  border: 0;
+  color: rgb(var(--v-theme-error));
+  cursor: pointer;
+  display: block;
+  font: inherit;
+  font-size: 14px;
+  line-height: 20px;
+  padding: 6px 14px;
+  text-align: left;
+  width: 100%;
+}
+
+.config-card-menu-item:hover {
+  background: rgba(var(--v-theme-error), 0.08);
+}
+</style>

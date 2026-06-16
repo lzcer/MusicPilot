@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from html import escape
 
 import httpx
 
@@ -55,9 +56,9 @@ class TelegramBotAdapter:
     async def send_notification(self, event: NotifyEvent) -> None:
         if self._bot is None:
             return
-        text = f"{event.title}\n{event.text}"
+        text = _telegram_message_text(event)
         for chat_id in self.chat_ids:
-            await self._bot.send_message(chat_id, text)
+            await self._bot.send_message(chat_id, text, parse_mode="HTML")
 
     async def notify(self, event: NotifyEvent) -> None:
         await self.send_notification(event)
@@ -82,11 +83,18 @@ class TelegramHttpNotifier:
     async def notify(self, event: NotifyEvent) -> None:
         if not self.chat_ids:
             return
-        text = f"{event.title}\n{event.text}"
+        text = _telegram_message_text(event)
         async with httpx.AsyncClient(timeout=20, proxy=self.proxy) as client:
             for chat_id in self.chat_ids:
                 response = await client.post(
                     f"https://api.telegram.org/bot{self.token}/sendMessage",
-                    json={"chat_id": chat_id, "text": text},
+                    json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
                 )
                 response.raise_for_status()
+
+
+def _telegram_message_text(event: NotifyEvent) -> str:
+    title = f"<b>{escape(event.title)}</b>"
+    if "<b>" in event.text or "<strong>" in event.text:
+        return f"{title}\n{event.text}"
+    return f"{title}\n{escape(event.text)}"
