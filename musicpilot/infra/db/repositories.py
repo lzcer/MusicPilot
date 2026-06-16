@@ -126,6 +126,7 @@ class SqlAlchemyMediaRepository:
             if payload.get("password"):
                 row.password = str(payload["password"])
             if row.is_default:
+                await session.flush()
                 await _clear_other_defaults(session, DownloaderConfig, row.id)
             await session.commit()
             await session.refresh(row)
@@ -166,6 +167,7 @@ class SqlAlchemyMediaRepository:
             if payload.get("password"):
                 row.password = str(payload["password"])
             if row.is_default:
+                await session.flush()
                 await _clear_other_defaults(session, MediaServerConfig, row.id)
             await session.commit()
             await session.refresh(row)
