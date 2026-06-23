@@ -348,7 +348,7 @@ class SqlAlchemyMediaRepository:
                 select(TorrentRecord)
                 .where(
                     TorrentRecord.status.in_(
-                        ("submitted", "downloading", "completed", "refreshing_library")
+                        ("queued", "submitted", "downloading", "completed", "refreshing_library")
                     )
                 )
                 .order_by(TorrentRecord.id)

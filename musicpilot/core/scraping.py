@@ -77,6 +77,12 @@ class ScrapingSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class _PathOperationResult:
+    path: Path
+    overwritten_existing: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class _MatchScore:
     title: int = 0
     artist: int = 0
@@ -225,8 +231,8 @@ class LocalMusicScraper:
             (*library_tracks, *media_history),
         )
         overwrite_duplicate = False
+        current_size = await asyncio.to_thread(_file_size, source_file)
         if duplicate is not None:
-            current_size = source_file.stat().st_size
             if config.duplicate_handling == "ignore":
                 return (
                     ScrapingFileResult(
@@ -279,23 +285,28 @@ class LocalMusicScraper:
             elif config.duplicate_handling in {"overwrite", "keep_largest"}:
                 overwrite_duplicate = True
 
+        overwritten_existing_target = False
         if config.mode == "mapped":
-            working_file = await asyncio.to_thread(
+            mapped_result = await asyncio.to_thread(
                 _copy_to_mapping,
                 source_file,
                 config,
                 hardlink=not needs_update,
-                overwrite=overwrite_duplicate and not _will_classify_or_rename(config),
+                overwrite=not _will_classify_or_rename(config),
             )
+            working_file = mapped_result.path
+            overwritten_existing_target = mapped_result.overwritten_existing
             mapped_files += 1
         elif config.mode == "copy":
-            working_file = await asyncio.to_thread(
+            mapped_result = await asyncio.to_thread(
                 _copy_to_mapping,
                 source_file,
                 config,
                 hardlink=False,
-                overwrite=overwrite_duplicate and not _will_classify_or_rename(config),
+                overwrite=not _will_classify_or_rename(config),
             )
+            working_file = mapped_result.path
+            overwritten_existing_target = mapped_result.overwritten_existing
             mapped_files += 1
 
         if needs_update:
@@ -303,20 +314,25 @@ class LocalMusicScraper:
             await tag_writer.write(working_file, metadata)
             updated_files += 1
 
-        final_file = await asyncio.to_thread(
+        final_result = await asyncio.to_thread(
             _classify_or_rename,
             working_file,
             metadata,
             config,
-            overwrite=overwrite_duplicate,
+            overwrite=True,
+        )
+        final_file = final_result.path
+        overwritten_existing_target = (
+            overwritten_existing_target or final_result.overwritten_existing
         )
         if final_file != working_file:
             moved_files += 1
-        remark = (
-            _duplicate_overwrite_message(metadata, duplicate, source_file.stat().st_size)
-            if overwrite_duplicate and duplicate is not None
-            else "刮削并转移完成"
-        )
+        if overwrite_duplicate and duplicate is not None:
+            remark = _duplicate_overwrite_message(metadata, duplicate, current_size)
+        elif overwritten_existing_target:
+            remark = _target_overwrite_message(final_file)
+        else:
+            remark = "刮削并转移完成"
         return (
             ScrapingFileResult(
                 source_path=source_file,
@@ -468,7 +484,7 @@ def _copy_to_mapping(
     *,
     hardlink: bool,
     overwrite: bool,
-) -> Path:
+) -> _PathOperationResult:
     if config.mapped_directory is None:
         raise RuntimeError("Target directory is required for mapped or copy scraping.")
     relative = source_file.name
@@ -480,19 +496,22 @@ def _copy_to_mapping(
     target = config.mapped_directory / relative
     if not overwrite:
         target = _unique_path(target)
+    elif _same_existing_file(source_file, target):
+        return _PathOperationResult(target)
+    overwritten_existing = overwrite and target.exists()
     target.parent.mkdir(parents=True, exist_ok=True)
     if hardlink:
         try:
-            if overwrite:
+            if overwritten_existing:
                 _remove_existing_target(target)
             os.link(source_file, target)
-            return target
+            return _PathOperationResult(target, overwritten_existing=overwritten_existing)
         except OSError:
             pass
-    if overwrite:
+    if overwritten_existing:
         _remove_existing_target(target)
     shutil.copy2(source_file, target)
-    return target
+    return _PathOperationResult(target, overwritten_existing=overwritten_existing)
 
 
 def _classify_or_rename(
@@ -501,7 +520,7 @@ def _classify_or_rename(
     config: ScrapingConfig,
     *,
     overwrite: bool,
-) -> Path:
+) -> _PathOperationResult:
     target_dir = path.parent
     if config.auto_classify:
         group = metadata.artist if config.classify_by == "artist" else metadata.album
@@ -518,13 +537,14 @@ def _classify_or_rename(
     target = target_dir / target_name
     if not overwrite:
         target = _unique_path(target, current=path)
-    if target == path:
-        return path
+    if target == path or _same_existing_file(path, target):
+        return _PathOperationResult(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    if overwrite:
+    overwritten_existing = overwrite and target.exists()
+    if overwritten_existing:
         _remove_existing_target(target)
     shutil.move(str(path), str(target))
-    return target
+    return _PathOperationResult(target, overwritten_existing=overwritten_existing)
 
 
 def _remove_existing_target(target: Path) -> None:
@@ -533,6 +553,17 @@ def _remove_existing_target(target: Path) -> None:
     if target.is_dir():
         raise RuntimeError(f"Target path is a directory: {target}")
     target.unlink()
+
+
+def _same_existing_file(left: Path, right: Path) -> bool:
+    try:
+        return left.exists() and right.exists() and left.samefile(right)
+    except OSError:
+        return False
+
+
+def _file_size(path: Path) -> int:
+    return path.stat().st_size
 
 
 def _will_classify_or_rename(config: ScrapingConfig) -> bool:
@@ -627,6 +658,10 @@ def _duplicate_overwrite_message(
         f"音乐库大小={_format_size(track.size)}"
         f"{path_text}"
     )
+
+
+def _target_overwrite_message(target: Path) -> str:
+    return f"覆盖完成：目标路径已存在。路径={target}"
 
 
 def _format_size(value: int | None) -> str:

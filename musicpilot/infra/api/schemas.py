@@ -102,6 +102,7 @@ class DownloadResponse(BaseModel):
 
 DownloadDeleteMode = Literal["record_only", "all"]
 MediaDeleteMode = Literal["record_only", "media_file", "all"]
+FileEntryType = Literal["file", "directory"]
 
 
 class DownloadTaskResponse(BaseModel):
@@ -113,6 +114,65 @@ class DownloadTaskResponse(BaseModel):
     save_path: str | None = None
     source: str = ""
     last_error: str | None = None
+
+
+class FileEntryResponse(BaseModel):
+    name: str
+    path: str
+    type: FileEntryType
+    size: int | None = None
+    modified_at: datetime | None = None
+
+
+class FileListResponse(BaseModel):
+    root: str
+    path: str = ""
+    parent: str | None = None
+    entries: list[FileEntryResponse] = Field(default_factory=list)
+
+
+class FileOrganizeRequest(BaseModel):
+    path: str = ""
+
+
+class FileOrganizeResponse(BaseModel):
+    source_files: int
+    mapped_files: int
+    updated_files: int
+    moved_files: int
+    failed_files: int
+    skipped_files: int
+
+
+class FileBulkDeleteRequest(BaseModel):
+    paths: list[str] = Field(min_length=1)
+
+
+class FileBulkDeleteFailure(BaseModel):
+    path: str
+    message: str
+
+
+class FileBulkDeleteResponse(BaseModel):
+    deleted_paths: list[str] = Field(default_factory=list)
+    not_found_paths: list[str] = Field(default_factory=list)
+    failures: list[FileBulkDeleteFailure] = Field(default_factory=list)
+
+
+class MediaBulkDeleteRequest(BaseModel):
+    ids: list[int] = Field(min_length=1)
+    mode: MediaDeleteMode = "record_only"
+
+
+class MediaBulkDeleteFailure(BaseModel):
+    id: int
+    message: str
+
+
+class MediaBulkDeleteResponse(BaseModel):
+    deleted_ids: list[int] = Field(default_factory=list)
+    not_found_ids: list[int] = Field(default_factory=list)
+    failures: list[MediaBulkDeleteFailure] = Field(default_factory=list)
 
 
 class IndexerResponse(BaseModel):

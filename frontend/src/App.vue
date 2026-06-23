@@ -95,6 +95,42 @@ type MediaFile = {
   track_number?: number | null
 }
 
+type FileEntry = {
+  name: string
+  path: string
+  type: 'file' | 'directory'
+  size?: number | null
+  modified_at?: string | null
+}
+
+type FileListResponse = {
+  root: string
+  path: string
+  parent?: string | null
+  entries: FileEntry[]
+}
+
+type FileOrganizeResponse = {
+  source_files: number
+  mapped_files: number
+  updated_files: number
+  moved_files: number
+  failed_files: number
+  skipped_files: number
+}
+
+type MediaBulkDeleteResponse = {
+  deleted_ids: number[]
+  not_found_ids: number[]
+  failures: Array<{ id: number; message: string }>
+}
+
+type FileBulkDeleteResponse = {
+  deleted_paths: string[]
+  not_found_paths: string[]
+  failures: Array<{ path: string; message: string }>
+}
+
 type MusicLibraryTrack = {
   id: string
   title: string
@@ -229,6 +265,15 @@ let metadataSearchStream: EventSource | undefined
 const downloads = ref<DownloadTask[]>([])
 const selectedDownloadIds = ref<number[]>([])
 const mediaFiles = ref<MediaFile[]>([])
+const selectedMediaIds = ref<number[]>([])
+const fileEntries = ref<FileEntry[]>([])
+const selectedFilePaths = ref<string[]>([])
+const filePath = ref('')
+const fileParent = ref<string | null>(null)
+const fileRoot = ref('')
+const fileLoading = ref(false)
+const fileError = ref('')
+const fileSearchQuery = ref('')
 const musicLibraryTracks = ref<MusicLibraryTrack[]>([])
 const sites = ref<Site[]>([])
 const downloaders = ref<DownloaderConfig[]>([])
@@ -242,6 +287,8 @@ const notifierDialog = ref(false)
 const deleteDialog = ref(false)
 const downloadDeleteDialog = ref(false)
 const mediaDeleteDialog = ref(false)
+const fileOrganizeDialog = ref(false)
+const fileDeleteDialog = ref(false)
 const siteTesting = ref(false)
 const downloaderTesting = ref(false)
 const mediaServerTesting = ref(false)
@@ -249,6 +296,8 @@ const notifierTesting = ref(false)
 const deleting = ref(false)
 const downloadDeleting = ref(false)
 const mediaDeleting = ref(false)
+const fileOrganizing = ref(false)
+const fileDeleting = ref(false)
 const activeDownloadDeleteMode = ref<DownloadDeleteMode | null>(null)
 const activeMediaDeleteMode = ref<MediaDeleteMode | null>(null)
 const systemSaving = ref(false)
@@ -262,6 +311,12 @@ const deleteTarget = ref<DeleteTarget | null>(null)
 const pendingDownloadDeleteIds = ref<number[]>([])
 const pendingDownloadDeleteLabel = ref('')
 const pendingMediaDelete = ref<MediaFile | null>(null)
+const pendingMediaDeleteIds = ref<number[]>([])
+const pendingMediaDeleteLabel = ref('')
+const pendingFileOrganize = ref<FileEntry | null>(null)
+const pendingFileDeletePaths = ref<string[]>([])
+const pendingFileDeleteLabel = ref('')
+const pendingFileDeleteHasDirectory = ref(false)
 const activeConfigMenu = ref<string | null>(null)
 
 const siteForm = ref({
@@ -357,6 +412,7 @@ const navItems = [
   { title: '搜索', value: 'search', icon: 'mdi-magnify' },
   { title: '下载', value: 'downloads', icon: 'mdi-download' },
   { title: '整理', value: 'media', icon: 'mdi-music-box-multiple' },
+  { title: '文件管理', value: 'files', icon: 'mdi-folder-music-outline' },
   { title: '音乐库', value: 'musicLibrary', icon: 'mdi-music-circle-outline' },
   { title: '站点', value: 'sites', icon: 'mdi-server-network' },
   { title: '日志', value: 'logs', icon: 'mdi-text-box-search-outline' },
@@ -417,6 +473,17 @@ const musicLibraryStats = computed(() => {
   }
 })
 
+const fileBreadcrumbs = computed(() => {
+  const segments = filePath.value.split('/').filter(Boolean)
+  const items = [{ title: '源目录', path: '' }]
+  let current = ''
+  for (const segment of segments) {
+    current = current ? `${current}/${segment}` : segment
+    items.push({ title: segment, path: current })
+  }
+  return items
+})
+
 const downloadableTaskIds = computed(() =>
   downloads.value.map((item) => item.id).filter((id): id is number => typeof id === 'number')
 )
@@ -434,6 +501,40 @@ const someDownloadsSelected = computed(
   () =>
     selectedDownloadIds.value.length > 0 &&
     !downloadableTaskIds.value.every((id) => selectedDownloadIds.value.includes(id))
+)
+
+const mediaFileIds = computed(() => mediaFiles.value.map((item) => item.id))
+
+const allMediaSelected = computed({
+  get: () =>
+    mediaFileIds.value.length > 0 &&
+    mediaFileIds.value.every((id) => selectedMediaIds.value.includes(id)),
+  set: (selected: boolean) => {
+    selectedMediaIds.value = selected ? [...mediaFileIds.value] : []
+  }
+})
+
+const someMediaSelected = computed(
+  () =>
+    selectedMediaIds.value.length > 0 &&
+    !mediaFileIds.value.every((id) => selectedMediaIds.value.includes(id))
+)
+
+const fileEntryPaths = computed(() => fileEntries.value.map((item) => item.path))
+
+const allFilesSelected = computed({
+  get: () =>
+    fileEntryPaths.value.length > 0 &&
+    fileEntryPaths.value.every((path) => selectedFilePaths.value.includes(path)),
+  set: (selected: boolean) => {
+    selectedFilePaths.value = selected ? [...fileEntryPaths.value] : []
+  }
+})
+
+const someFilesSelected = computed(
+  () =>
+    selectedFilePaths.value.length > 0 &&
+    !fileEntryPaths.value.every((path) => selectedFilePaths.value.includes(path))
 )
 
 async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
@@ -728,6 +829,9 @@ function switchPage(page: string) {
   if (page === 'musicLibrary' && !musicLibraryTracks.value.length) {
     void loadMusicLibrary()
   }
+  if (page === 'files' && !fileEntries.value.length && !fileLoading.value) {
+    void loadFiles('')
+  }
 }
 
 async function confirmDownload() {
@@ -805,30 +909,193 @@ async function confirmDeleteDownloads(mode: DownloadDeleteMode) {
 
 async function loadMedia() {
   mediaFiles.value = await api<MediaFile[]>('/api/media')
+  const existingIds = new Set(mediaFileIds.value)
+  selectedMediaIds.value = selectedMediaIds.value.filter((id) => existingIds.has(id))
 }
 
 function deleteMediaFile(row: MediaFile) {
   pendingMediaDelete.value = row
+  pendingMediaDeleteIds.value = [row.id]
+  pendingMediaDeleteLabel.value = `整理记录“${row.title || row.source_path || '-'}”`
+  mediaDeleteDialog.value = true
+}
+
+function deleteSelectedMediaFiles() {
+  const ids = [...selectedMediaIds.value]
+  if (!ids.length) return
+  pendingMediaDelete.value = null
+  pendingMediaDeleteIds.value = ids
+  pendingMediaDeleteLabel.value = `选中的 ${ids.length} 条整理记录`
   mediaDeleteDialog.value = true
 }
 
 async function confirmDeleteMedia(mode: MediaDeleteMode) {
-  const row = pendingMediaDelete.value
-  if (!row) return
+  const ids = [...pendingMediaDeleteIds.value]
+  if (!ids.length) return
+  const deletingSingle = ids.length === 1 && Boolean(pendingMediaDelete.value)
   mediaDeleting.value = true
   activeMediaDeleteMode.value = mode
   try {
-    await apiNoContent(`/api/media/${row.id}?mode=${mode}`, { method: 'DELETE' })
+    if (deletingSingle) {
+      await apiNoContent(`/api/media/${ids[0]}?mode=${mode}`, { method: 'DELETE' })
+    } else {
+      const result = await api<MediaBulkDeleteResponse>('/api/media', {
+        method: 'DELETE',
+        body: JSON.stringify({ ids, mode })
+      })
+      if (result.failures.length) {
+        notify(
+          `已删除 ${result.deleted_ids.length} 条，失败 ${result.failures.length} 条`,
+          'warning'
+        )
+      } else if (result.not_found_ids.length) {
+        notify(
+          `已删除 ${result.deleted_ids.length} 条，${result.not_found_ids.length} 条记录不存在`,
+          'warning'
+        )
+      } else {
+        notify(`已删除 ${result.deleted_ids.length} 条整理记录`)
+      }
+    }
+    selectedMediaIds.value = selectedMediaIds.value.filter((id) => !ids.includes(id))
     pendingMediaDelete.value = null
+    pendingMediaDeleteIds.value = []
+    pendingMediaDeleteLabel.value = ''
     mediaDeleteDialog.value = false
     await loadMedia()
-    notify('整理记录已删除')
+    if (deletingSingle) {
+      notify('整理记录已删除')
+    }
   } catch (error) {
     notify(error instanceof Error ? error.message : '整理记录删除失败', 'error')
     await loadMedia()
   } finally {
     mediaDeleting.value = false
     activeMediaDeleteMode.value = null
+  }
+}
+
+async function loadFiles(path = filePath.value) {
+  fileLoading.value = true
+  fileError.value = ''
+  try {
+    const search = fileSearchQuery.value.trim()
+    const params = new URLSearchParams()
+    if (path) params.set('path', path)
+    if (search) {
+      params.set('query', search)
+      params.set('limit', '500')
+    }
+    const query = params.toString()
+    const response = await api<FileListResponse>(`/api/files${query ? `?${query}` : ''}`)
+    fileEntries.value = response.entries
+    filePath.value = response.path
+    fileParent.value = response.parent ?? null
+    fileRoot.value = response.root
+    const existingPaths = new Set(fileEntryPaths.value)
+    selectedFilePaths.value = selectedFilePaths.value.filter((item) => existingPaths.has(item))
+  } catch (error) {
+    fileEntries.value = []
+    selectedFilePaths.value = []
+    fileError.value = error instanceof Error ? error.message : '文件列表加载失败'
+  } finally {
+    fileLoading.value = false
+  }
+}
+
+function openFileEntry(entry: FileEntry) {
+  if (entry.type !== 'directory') return
+  void loadFiles(entry.path)
+}
+
+function runFileSearch() {
+  void loadFiles(filePath.value)
+}
+
+function clearFileSearch() {
+  fileSearchQuery.value = ''
+  void loadFiles(filePath.value)
+}
+
+function openFileOrganize(entry: FileEntry) {
+  pendingFileOrganize.value = entry
+  fileOrganizeDialog.value = true
+}
+
+function openFileDelete(entry: FileEntry) {
+  pendingFileDeletePaths.value = [entry.path]
+  pendingFileDeleteLabel.value = `“${entry.name}”`
+  pendingFileDeleteHasDirectory.value = entry.type === 'directory'
+  fileDeleteDialog.value = true
+}
+
+function deleteSelectedFiles() {
+  const paths = [...selectedFilePaths.value]
+  if (!paths.length) return
+  const selected = new Set(paths)
+  pendingFileDeletePaths.value = paths
+  pendingFileDeleteLabel.value = `选中的 ${paths.length} 个项目`
+  pendingFileDeleteHasDirectory.value = fileEntries.value.some(
+    (item) => selected.has(item.path) && item.type === 'directory'
+  )
+  fileDeleteDialog.value = true
+}
+
+async function confirmFileDelete() {
+  const paths = [...pendingFileDeletePaths.value]
+  if (!paths.length) return
+  fileDeleting.value = true
+  try {
+    const result = await api<FileBulkDeleteResponse>('/api/files', {
+      method: 'DELETE',
+      body: JSON.stringify({ paths })
+    })
+    selectedFilePaths.value = selectedFilePaths.value.filter((item) => !paths.includes(item))
+    pendingFileDeletePaths.value = []
+    pendingFileDeleteLabel.value = ''
+    pendingFileDeleteHasDirectory.value = false
+    fileDeleteDialog.value = false
+    await loadFiles(filePath.value)
+    if (result.failures.length) {
+      notify(
+        `已删除 ${result.deleted_paths.length} 个，失败 ${result.failures.length} 个`,
+        'warning'
+      )
+    } else if (result.not_found_paths.length) {
+      notify(
+        `已删除 ${result.deleted_paths.length} 个，${result.not_found_paths.length} 个不存在`,
+        'warning'
+      )
+    } else {
+      notify(`已删除 ${result.deleted_paths.length} 个项目`)
+    }
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '文件删除失败', 'error')
+    await loadFiles(filePath.value)
+  } finally {
+    fileDeleting.value = false
+  }
+}
+
+async function confirmFileOrganize() {
+  const entry = pendingFileOrganize.value
+  if (!entry) return
+  fileOrganizing.value = true
+  try {
+    const summary = await api<FileOrganizeResponse>('/api/files/organize', {
+      method: 'POST',
+      body: JSON.stringify({ path: entry.path })
+    })
+    fileOrganizeDialog.value = false
+    pendingFileOrganize.value = null
+    await Promise.all([loadFiles(filePath.value), loadMedia()])
+    notify(
+      `整理完成：文件 ${summary.source_files}，成功 ${summary.source_files - summary.failed_files - summary.skipped_files}，失败 ${summary.failed_files}，跳过 ${summary.skipped_files}`
+    )
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '整理失败', 'error')
+  } finally {
+    fileOrganizing.value = false
   }
 }
 
@@ -1398,9 +1665,6 @@ onUnmounted(() => {
         <v-app-bar-nav-icon @click="drawer = !drawer" />
         <v-toolbar-title>{{ pageTitle }}</v-toolbar-title>
         <v-spacer />
-        <v-btn prepend-icon="mdi-text-box-search-outline" variant="tonal" @click="activePage = 'logs'">
-          日志
-        </v-btn>
       </v-app-bar>
 
       <v-main>
@@ -1600,11 +1864,28 @@ onUnmounted(() => {
           <section v-if="activePage === 'media'" class="page-stack">
             <div class="toolbar-row">
               <v-btn prepend-icon="mdi-refresh" variant="tonal" @click="loadMedia">刷新</v-btn>
+              <v-btn
+                prepend-icon="mdi-delete"
+                color="error"
+                variant="tonal"
+                :disabled="!selectedMediaIds.length"
+                @click="deleteSelectedMediaFiles"
+              >
+                删除
+              </v-btn>
             </div>
             <v-card>
               <v-table>
                 <thead>
                   <tr>
+                    <th class="select-cell">
+                      <v-checkbox
+                        v-model="allMediaSelected"
+                        :indeterminate="someMediaSelected"
+                        density="compact"
+                        hide-details
+                      />
+                    </th>
                     <th>标题</th>
                     <th>艺人</th>
                     <th>专辑</th>
@@ -1616,8 +1897,16 @@ onUnmounted(() => {
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-if="!mediaFiles.length"><td colspan="8" class="empty-cell">暂无整理记录</td></tr>
+                  <tr v-if="!mediaFiles.length"><td colspan="9" class="empty-cell">暂无整理记录</td></tr>
                   <tr v-for="row in mediaFiles" :key="row.id">
+                    <td class="select-cell">
+                      <v-checkbox
+                        v-model="selectedMediaIds"
+                        :value="row.id"
+                        density="compact"
+                        hide-details
+                      />
+                    </td>
                     <td>{{ row.title || '-' }}</td>
                     <td>{{ row.artist || '-' }}</td>
                     <td>{{ row.album || '-' }}</td>
@@ -1641,6 +1930,154 @@ onUnmounted(() => {
                         size="small"
                         title="删除整理记录"
                         @click="deleteMediaFile(row)"
+                      />
+                    </td>
+                  </tr>
+                </tbody>
+              </v-table>
+            </v-card>
+          </section>
+
+          <section v-if="activePage === 'files'" class="page-stack">
+            <div class="toolbar-row">
+              <v-btn
+                prepend-icon="mdi-refresh"
+                variant="tonal"
+                :loading="fileLoading"
+                @click="loadFiles(filePath)"
+              >
+                刷新
+              </v-btn>
+              <v-btn
+                prepend-icon="mdi-arrow-up"
+                variant="tonal"
+                :disabled="fileParent === null || fileLoading"
+                @click="loadFiles(fileParent || '')"
+              >
+                上级目录
+              </v-btn>
+              <v-btn
+                prepend-icon="mdi-delete"
+                color="error"
+                variant="tonal"
+                :disabled="!selectedFilePaths.length || fileLoading"
+                @click="deleteSelectedFiles"
+              >
+                删除
+              </v-btn>
+              <v-text-field
+                v-model="fileSearchQuery"
+                label="搜索文件"
+                prepend-inner-icon="mdi-magnify"
+                hide-details
+                clearable
+                class="file-search"
+                @keyup.enter="runFileSearch"
+                @click:clear="clearFileSearch"
+              />
+              <v-btn
+                prepend-icon="mdi-magnify"
+                variant="tonal"
+                :loading="fileLoading"
+                @click="runFileSearch"
+              >
+                搜索
+              </v-btn>
+              <v-chip v-if="fileRoot" color="secondary" variant="tonal">{{ fileRoot }}</v-chip>
+            </div>
+
+            <div class="file-breadcrumbs">
+              <button
+                v-for="(item, index) in fileBreadcrumbs"
+                :key="item.path"
+                class="file-breadcrumb"
+                type="button"
+                :disabled="item.path === filePath || fileLoading"
+                @click="loadFiles(item.path)"
+              >
+                <span v-if="index > 0">/</span>
+                {{ item.title }}
+              </button>
+            </div>
+
+            <v-card>
+              <v-progress-linear v-if="fileLoading" indeterminate color="primary" />
+              <v-table>
+                <thead>
+                  <tr>
+                    <th class="select-cell">
+                      <v-checkbox
+                        v-model="allFilesSelected"
+                        :indeterminate="someFilesSelected"
+                        density="compact"
+                        hide-details
+                      />
+                    </th>
+                    <th>名称</th>
+                    <th>类型</th>
+                    <th>大小</th>
+                    <th>修改时间</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-if="fileError">
+                    <td colspan="6" class="empty-cell">{{ fileError }}</td>
+                  </tr>
+                  <tr v-else-if="!fileEntries.length && !fileLoading">
+                    <td colspan="6" class="empty-cell">
+                      {{ fileSearchQuery.trim() ? '没有匹配文件' : '目录为空' }}
+                    </td>
+                  </tr>
+                  <tr
+                    v-for="entry in fileEntries"
+                    :key="entry.path"
+                    :class="{ 'file-row-clickable': entry.type === 'directory' }"
+                    @click="openFileEntry(entry)"
+                  >
+                    <td class="select-cell" @click.stop>
+                      <v-checkbox
+                        v-model="selectedFilePaths"
+                        :value="entry.path"
+                        density="compact"
+                        hide-details
+                      />
+                    </td>
+                    <td>
+                      <div class="file-name-cell">
+                        <v-icon
+                          :icon="entry.type === 'directory' ? 'mdi-folder-outline' : 'mdi-file-music-outline'"
+                          size="22"
+                        />
+                        <button
+                          class="file-name-button"
+                          type="button"
+                          :disabled="entry.type !== 'directory'"
+                          @click.stop="openFileEntry(entry)"
+                        >
+                          {{ entry.name }}
+                        </button>
+                      </div>
+                    </td>
+                    <td>{{ entry.type === 'directory' ? '目录' : '文件' }}</td>
+                    <td>{{ entry.type === 'directory' ? '-' : formatSize(entry.size) }}</td>
+                    <td>{{ entry.modified_at ? formatTime(entry.modified_at) : '-' }}</td>
+                    <td>
+                      <v-btn
+                        icon="mdi-playlist-check"
+                        color="primary"
+                        variant="text"
+                        size="small"
+                        title="整理"
+                        @click.stop="openFileOrganize(entry)"
+                      />
+                      <v-btn
+                        icon="mdi-delete"
+                        color="error"
+                        variant="text"
+                        size="small"
+                        title="删除"
+                        @click.stop="openFileDelete(entry)"
                       />
                     </td>
                   </tr>
@@ -2290,7 +2727,7 @@ onUnmounted(() => {
     <v-dialog v-model="mediaDeleteDialog" max-width="520">
       <v-card title="确认删除">
         <v-card-text>
-          请选择整理记录“{{ pendingMediaDelete?.title || pendingMediaDelete?.source_path || '-' }}”的删除方式。
+          请选择{{ pendingMediaDeleteLabel || '整理记录' }}的删除方式。
         </v-card-text>
         <v-card-actions class="delete-action-buttons">
           <v-btn
@@ -2325,6 +2762,42 @@ onUnmounted(() => {
             @click="confirmDeleteMedia('all')"
           >
             删除全部
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="fileOrganizeDialog" max-width="460">
+      <v-card title="确认整理">
+        <v-card-text>
+          确定整理“{{ pendingFileOrganize?.name || '-' }}”吗？
+          <span v-if="pendingFileOrganize?.type === 'directory'">目录中的音频文件会批量刮削转移。</span>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="fileOrganizing" @click="fileOrganizeDialog = false">
+            取消
+          </v-btn>
+          <v-btn color="primary" :loading="fileOrganizing" @click="confirmFileOrganize">
+            整理
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="fileDeleteDialog" max-width="480">
+      <v-card title="确认删除">
+        <v-card-text>
+          确定删除{{ pendingFileDeleteLabel || '选中的项目' }}吗？
+          <span v-if="pendingFileDeleteHasDirectory">目录会被递归删除。</span>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="fileDeleting" @click="fileDeleteDialog = false">
+            取消
+          </v-btn>
+          <v-btn color="error" :loading="fileDeleting" @click="confirmFileDelete">
+            删除
           </v-btn>
         </v-card-actions>
       </v-card>
@@ -2396,6 +2869,68 @@ onUnmounted(() => {
 
 .select-cell {
   width: 48px;
+}
+
+.file-breadcrumbs {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-height: 32px;
+}
+
+.file-breadcrumb {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: rgb(var(--v-theme-primary));
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 14px;
+  gap: 4px;
+  line-height: 20px;
+  padding: 2px 4px;
+}
+
+.file-breadcrumb:disabled {
+  color: rgba(var(--v-theme-on-surface), 0.72);
+  cursor: default;
+}
+
+.file-search {
+  max-width: 360px;
+  min-width: 240px;
+}
+
+.file-row-clickable {
+  cursor: pointer;
+}
+
+.file-name-cell {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  min-width: 280px;
+}
+
+.file-name-button {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  display: block;
+  font: inherit;
+  max-width: 560px;
+  overflow: hidden;
+  padding: 0;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-name-button:disabled {
+  cursor: default;
 }
 
 .settings-checks {

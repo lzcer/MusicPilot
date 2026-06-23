@@ -5,7 +5,9 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
+import shutil
 import unicodedata
 from collections import deque
 from collections.abc import AsyncIterator
@@ -47,21 +49,33 @@ from musicpilot.core.processor import MediaProcessor
 from musicpilot.core.scraping import (
     LibraryTrackSnapshot,
     LocalMusicScraper,
+    ScrapingConfig,
     ScrapingFileResult,
+    ScrapingSummary,
     scraping_config_from_payload,
 )
 from musicpilot.infra.api.schemas import (
+    DownloadDeleteMode,
     DownloaderCreateRequest,
     DownloaderResponse,
     DownloadRequest,
-    DownloadDeleteMode,
     DownloadResponse,
     DownloadTaskResponse,
+    FileBulkDeleteFailure,
+    FileBulkDeleteRequest,
+    FileBulkDeleteResponse,
+    FileEntryResponse,
+    FileListResponse,
+    FileOrganizeRequest,
+    FileOrganizeResponse,
     HealthResponse,
     IndexerResponse,
     LogEntryResponse,
     LoginRequest,
     LoginResponse,
+    MediaBulkDeleteFailure,
+    MediaBulkDeleteRequest,
+    MediaBulkDeleteResponse,
     MediaCandidateResponse,
     MediaDeleteMode,
     MediaFileResponse,
@@ -414,6 +428,8 @@ class AppLogHandler(logging.Handler):
         self.entries = entries
 
     def emit(self, record: logging.LogRecord) -> None:
+        if _skip_app_log_record(record):
+            return
         try:
             message = record.getMessage()
         except Exception:  # noqa: BLE001
@@ -1019,6 +1035,88 @@ def create_app() -> FastAPI:
         limited = max(1, min(limit, 500))
         return [LogEntryResponse(**entry) for entry in list(state.logs)[:limited]]
 
+    @app.get("/api/files", response_model=FileListResponse)
+    async def source_files(path: str = "", query: str = "", limit: int = 500) -> FileListResponse:
+        settings_payload = await state.repository.get_system_settings()
+        config = scraping_config_from_payload(settings_payload)
+        root = _scraping_source_root_or_409(config)
+        target = _resolve_source_relative_path(root, path)
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="文件或目录不存在。")
+        if not target.is_dir():
+            raise HTTPException(status_code=422, detail="只能浏览目录。")
+        search_query = query.strip()
+        limited = max(1, min(limit, 500))
+        entries = await asyncio.to_thread(
+            _source_search_entries if search_query else _source_directory_entries,
+            root,
+            target,
+            search_query,
+            limited,
+        )
+        return FileListResponse(
+            root=str(root),
+            path=_source_relative_path(root, target),
+            parent=_source_parent_path(root, target),
+            entries=entries,
+        )
+
+    @app.delete("/api/files", response_model=FileBulkDeleteResponse)
+    async def delete_source_files(payload: FileBulkDeleteRequest) -> FileBulkDeleteResponse:
+        settings_payload = await state.repository.get_system_settings()
+        config = scraping_config_from_payload(settings_payload)
+        root = _scraping_source_root_or_409(config)
+        deleted_paths: list[str] = []
+        not_found_paths: list[str] = []
+        failures: list[FileBulkDeleteFailure] = []
+        seen: set[str] = set()
+        for item_path in payload.paths:
+            if item_path in seen:
+                continue
+            seen.add(item_path)
+            try:
+                target = _resolve_source_delete_path(root, item_path)
+                if not _path_lexists(target):
+                    not_found_paths.append(item_path)
+                    continue
+                await asyncio.to_thread(_delete_source_path_sync, target)
+            except Exception as exc:  # noqa: BLE001
+                failures.append(FileBulkDeleteFailure(path=item_path, message=str(exc)))
+                continue
+            deleted_paths.append(item_path)
+        return FileBulkDeleteResponse(
+            deleted_paths=deleted_paths,
+            not_found_paths=not_found_paths,
+            failures=failures,
+        )
+
+    @app.post("/api/files/organize", response_model=FileOrganizeResponse, status_code=202)
+    async def organize_source_file(payload: FileOrganizeRequest) -> FileOrganizeResponse:
+        settings_payload = await state.repository.get_system_settings()
+        config = scraping_config_from_payload(settings_payload)
+        if not config.enabled:
+            raise HTTPException(status_code=409, detail="请先在刮削设置中开启刮削。")
+        root = _scraping_source_root_or_409(config)
+        target = _resolve_source_relative_path(root, payload.path)
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="文件或目录不存在。")
+        source_files = await asyncio.to_thread(_source_audio_files, root, target)
+        if not source_files:
+            raise HTTPException(status_code=422, detail="目标中没有可整理的音频文件。")
+        try:
+            summary = await _scrape_manual_source_files(state, config, target, source_files)
+        except Exception as exc:  # noqa: BLE001
+            state.add_log("metadata", f"Manual scraping failed for {target}: {exc}", "ERROR")
+            raise HTTPException(status_code=502, detail=f"整理失败：{exc}") from exc
+        return FileOrganizeResponse(
+            source_files=summary.source_files,
+            mapped_files=summary.mapped_files,
+            updated_files=summary.updated_files,
+            moved_files=summary.moved_files,
+            failed_files=summary.failed_files,
+            skipped_files=sum(1 for item in summary.results if item.status == "skipped"),
+        )
+
     @app.get("/api/media", response_model=list[MediaFileResponse])
     async def media_files() -> list[MediaFileResponse]:
         rows = await state.repository.list_media_files()
@@ -1041,23 +1139,47 @@ def create_app() -> FastAPI:
             for row in rows
         ]
 
+    @app.delete("/api/media", response_model=MediaBulkDeleteResponse)
+    async def delete_media_files(payload: MediaBulkDeleteRequest) -> MediaBulkDeleteResponse:
+        deleted_ids: list[int] = []
+        not_found_ids: list[int] = []
+        failures: list[MediaBulkDeleteFailure] = []
+        seen: set[int] = set()
+        for media_id in payload.ids:
+            if media_id in seen:
+                continue
+            seen.add(media_id)
+            media = await state.repository.get_media_file(media_id)
+            if media is None:
+                not_found_ids.append(media_id)
+                continue
+            try:
+                deleted = await _delete_media_record(state, media, payload.mode)
+            except Exception as exc:  # noqa: BLE001
+                failures.append(MediaBulkDeleteFailure(id=media_id, message=str(exc)))
+                continue
+            if deleted:
+                deleted_ids.append(media_id)
+            else:
+                not_found_ids.append(media_id)
+        return MediaBulkDeleteResponse(
+            deleted_ids=deleted_ids,
+            not_found_ids=not_found_ids,
+            failures=failures,
+        )
+
     @app.delete("/api/media/{media_id}", status_code=204)
     async def delete_media_file(media_id: int, mode: MediaDeleteMode = "record_only") -> None:
         media = await state.repository.get_media_file(media_id)
         if media is None:
             raise HTTPException(status_code=404, detail="Media record not found.")
-        if mode in {"media_file", "all"}:
-            try:
-                if mode == "all":
-                    await _delete_media_source(state, media)
-                if media.status == "success" and media.library_path:
-                    await _delete_file_path(Path(media.library_path))
-            except Exception as exc:  # noqa: BLE001
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Media file delete failed: {exc}",
-                ) from exc
-        deleted = await state.repository.delete_media_file(media_id)
+        try:
+            deleted = await _delete_media_record(state, media, mode)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=502,
+                detail=f"Media file delete failed: {exc}",
+            ) from exc
         if not deleted:
             raise HTTPException(status_code=404, detail="Media record not found.")
 
@@ -1633,6 +1755,19 @@ async def _delete_media_source(state: AppState, media: MediaFile) -> None:
     await _delete_file_path(Path(media.source_path))
 
 
+async def _delete_media_record(
+    state: AppState,
+    media: MediaFile,
+    mode: MediaDeleteMode,
+) -> bool:
+    if mode in {"media_file", "all"}:
+        if mode == "all":
+            await _delete_media_source(state, media)
+        if media.status == "success" and media.library_path:
+            await _delete_file_path(Path(media.library_path))
+    return await state.repository.delete_media_file(media.id)
+
+
 async def _delete_file_path(path: Path) -> None:
     await asyncio.to_thread(_delete_file_path_sync, path)
 
@@ -1657,7 +1792,235 @@ def _file_size_or_none(path: str | None) -> int | None:
     return None
 
 
+def _scraping_source_root_or_409(config: ScrapingConfig) -> Path:
+    if config.source_directory is None:
+        raise HTTPException(status_code=409, detail="请先配置刮削源文件目录。")
+    root = config.source_directory.expanduser().resolve()
+    if not root.exists():
+        raise HTTPException(status_code=404, detail="刮削源文件目录不存在。")
+    if not root.is_dir():
+        raise HTTPException(status_code=422, detail="刮削源文件目录不是目录。")
+    return root
+
+
+def _resolve_source_relative_path(root: Path, relative_path: str) -> Path:
+    relative = Path(relative_path or "")
+    if relative.is_absolute():
+        raise HTTPException(status_code=400, detail="只能访问源文件目录下的相对路径。")
+    target = (root / relative).resolve()
+    if not target.is_relative_to(root):
+        raise HTTPException(status_code=403, detail="不能访问源文件目录之外的路径。")
+    return target
+
+
+def _resolve_source_delete_path(root: Path, relative_path: str) -> Path:
+    relative = Path(relative_path or "")
+    if relative.is_absolute():
+        raise HTTPException(status_code=400, detail="只能访问源文件目录下的相对路径。")
+    if not relative.parts:
+        raise HTTPException(status_code=400, detail="不能删除源文件目录。")
+    parent = (root / relative).parent.resolve()
+    if not parent.is_relative_to(root):
+        raise HTTPException(status_code=403, detail="不能访问源文件目录之外的路径。")
+    return parent / relative.name
+
+
+def _source_relative_path(root: Path, path: Path) -> str:
+    if path == root:
+        return ""
+    return path.relative_to(root).as_posix()
+
+
+def _source_parent_path(root: Path, path: Path) -> str | None:
+    if path == root:
+        return None
+    return _source_relative_path(root, path.parent)
+
+
+def _source_directory_entries(
+    root: Path,
+    directory: Path,
+    query: str = "",
+    limit: int = 500,
+) -> list[FileEntryResponse]:
+    entries: list[FileEntryResponse] = []
+    for item in directory.iterdir():
+        entry = _source_entry_response(root, item)
+        if entry is None:
+            continue
+        entries.append(entry)
+    entries.sort(key=lambda item: (item.type != "directory", item.name.casefold()))
+    return entries
+
+
+def _source_search_entries(
+    root: Path,
+    directory: Path,
+    query: str,
+    limit: int = 500,
+) -> list[FileEntryResponse]:
+    needle = query.casefold()
+    entries: list[FileEntryResponse] = []
+    for item in directory.rglob("*"):
+        entry = _source_entry_response(root, item)
+        if entry is None:
+            continue
+        text = f"{entry.name} {entry.path}".casefold()
+        if needle not in text:
+            continue
+        entries.append(entry)
+        if len(entries) >= limit:
+            break
+    entries.sort(key=lambda item: (item.type != "directory", item.path.casefold()))
+    return entries
+
+
+def _source_entry_response(root: Path, path: Path) -> FileEntryResponse | None:
+    try:
+        resolved = path.resolve()
+        if not resolved.is_relative_to(root):
+            return None
+        stat = resolved.stat()
+    except OSError:
+        return None
+    if resolved.is_dir():
+        entry_type = "directory"
+        size = None
+    elif resolved.is_file():
+        entry_type = "file"
+        size = stat.st_size
+    else:
+        return None
+    return FileEntryResponse(
+        name=path.name,
+        path=_source_relative_path(root, resolved),
+        type=entry_type,
+        size=size,
+        modified_at=datetime.fromtimestamp(stat.st_mtime, UTC),
+    )
+
+
+def _path_lexists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def _delete_source_path_sync(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+        return
+    if not _path_lexists(path):
+        return
+    raise RuntimeError(f"不支持删除该路径类型：{path}")
+
+
+def _source_audio_files(root: Path, target: Path) -> tuple[Path, ...]:
+    candidates = (target,) if target.is_file() else tuple(target.rglob("*"))
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if (
+            resolved in seen
+            or not resolved.is_relative_to(root)
+            or not resolved.is_file()
+            or not _is_audio_file(resolved)
+        ):
+            continue
+        seen.add(resolved)
+        files.append(resolved)
+    return tuple(sorted(files, key=lambda path: path.as_posix().casefold()))
+
+
+async def _scrape_manual_source_files(
+    state: AppState,
+    config: ScrapingConfig,
+    target: Path,
+    source_files: tuple[Path, ...],
+) -> ScrapingSummary:
+    try:
+        await _sync_music_library_from_navidrome(state)
+    except Exception as exc:  # noqa: BLE001
+        state.add_log(
+            "library",
+            f"Music library sync before manual scraping failed: {exc}",
+            "WARNING",
+        )
+    library_tracks = tuple(
+        LibraryTrackSnapshot(
+            title=item.title,
+            artist=item.artist,
+            album=item.album,
+            size=item.size,
+            path=item.path,
+        )
+        for item in await state.repository.list_music_library_tracks()
+    )
+    media_history = tuple(
+        LibraryTrackSnapshot(
+            title=item.title or "",
+            artist=item.artist,
+            album=item.album,
+            size=_file_size_or_none(item.library_path),
+            path=item.library_path,
+        )
+        for item in await state.repository.list_media_files()
+        if item.title
+    )
+    summary = await state.scraper.process_download(
+        task_name=target.name or "manual",
+        save_path=None,
+        config=config,
+        source_files=source_files,
+        library_tracks=library_tracks,
+        media_history=media_history,
+    )
+    for item in summary.results:
+        await state.repository.record_scraping_result(
+            torrent_hash=None,
+            source_path=item.source_path,
+            library_path=item.library_path,
+            metadata=item.metadata,
+            status=item.status,
+            error_message=item.error_message,
+        )
+        state.add_log(
+            "metadata",
+            _scraping_file_log_message(target.name or "manual", item),
+            "WARNING" if item.status == "failed" else "INFO",
+        )
+    state.add_log(
+        "metadata",
+        "Manual scraping completed for "
+        f"{target}: files={summary.source_files}, mapped={summary.mapped_files}, "
+        f"updated={summary.updated_files}, moved={summary.moved_files}, "
+        f"failed={summary.failed_files}, "
+        f"skipped={sum(1 for item in summary.results if item.status == 'skipped')}",
+    )
+    return summary
+
+
 async def _poll_download_tasks_once(state: AppState) -> None:
+    tasks = await state.repository.list_unfinished_download_tasks()
+    if not tasks:
+        return
+
+    active_tasks: list[TorrentRecord] = []
+    for task in tasks:
+        if task.status in {"completed", "refreshing_library"}:
+            await _refresh_library_for_task(state, task)
+            continue
+        if task.status in {"queued", "submitted", "downloading"}:
+            active_tasks.append(task)
+
+    if not active_tasks:
+        return
+
     default = await state.repository.default_downloader()
     if default is None or default.listen_mode != "polling" or not default.enabled:
         return
@@ -1668,11 +2031,7 @@ async def _poll_download_tasks_once(state: AppState) -> None:
 
     statuses = await state.downloader.list_statuses()
     by_hash = {item.torrent_hash: item for item in statuses if item.torrent_hash}
-    tasks = await state.repository.list_unfinished_download_tasks()
-    for task in tasks:
-        if task.status in {"completed", "refreshing_library"}:
-            await _refresh_library_for_task(state, task)
-            continue
+    for task in active_tasks:
         has_real_hash = not _is_pending_hash(task.torrent_hash)
         status = by_hash.get(task.torrent_hash or "") if has_real_hash else None
         if status is None and not has_real_hash:
@@ -2228,3 +2587,9 @@ def _category_from_logger(name: str) -> str:
     if "notifier" in name or "bot" in name:
         return "notify"
     return "system"
+
+
+def _skip_app_log_record(record: logging.LogRecord) -> bool:
+    if record.name.startswith(("httpx", "httpcore")) and record.levelno < logging.WARNING:
+        return True
+    return False
