@@ -65,7 +65,7 @@ class MediaFile(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     torrent_hash: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
     source_path: Mapped[str] = mapped_column(Text)
-    library_path: Mapped[str] = mapped_column(Text, unique=True)
+    library_path: Mapped[str | None] = mapped_column(Text, unique=True, nullable=True)
     title: Mapped[str | None] = mapped_column(String(512), nullable=True)
     artist: Mapped[str | None] = mapped_column(String(512), nullable=True)
     album: Mapped[str | None] = mapped_column(String(512), nullable=True)

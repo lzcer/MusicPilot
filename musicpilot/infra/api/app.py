@@ -45,6 +45,7 @@ from musicpilot.core.metadata import MetadataCascade
 from musicpilot.core.pipeline import MusicPipeline
 from musicpilot.core.processor import MediaProcessor
 from musicpilot.core.scraping import (
+    LibraryTrackSnapshot,
     LocalMusicScraper,
     ScrapingFileResult,
     scraping_config_from_payload,
@@ -53,6 +54,7 @@ from musicpilot.infra.api.schemas import (
     DownloaderCreateRequest,
     DownloaderResponse,
     DownloadRequest,
+    DownloadDeleteMode,
     DownloadResponse,
     DownloadTaskResponse,
     HealthResponse,
@@ -61,6 +63,7 @@ from musicpilot.infra.api.schemas import (
     LoginRequest,
     LoginResponse,
     MediaCandidateResponse,
+    MediaDeleteMode,
     MediaFileResponse,
     MediaServerCreateRequest,
     MediaServerResponse,
@@ -90,6 +93,7 @@ from musicpilot.infra.db import Database, SqlAlchemyMediaRepository
 from musicpilot.infra.db.models import (
     DownloaderConfig,
     IndexerSite,
+    MediaFile,
     MediaServerConfig,
     MusicLibraryTrack,
     NotifierChannel,
@@ -732,7 +736,18 @@ def create_app() -> FastAPI:
         return [_download_task_response(item) for item in tasks]
 
     @app.delete("/api/downloads/{task_id}", status_code=204)
-    async def delete_download(task_id: int) -> None:
+    async def delete_download(task_id: int, mode: DownloadDeleteMode = "record_only") -> None:
+        task = await state.repository.get_download_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Download task not found.")
+        if mode == "all":
+            try:
+                await _delete_task_torrent(state, task, delete_files=True)
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Download task external delete failed: {exc}",
+                ) from exc
         deleted = await state.repository.delete_download_task(task_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Download task not found.")
@@ -1014,6 +1029,8 @@ def create_app() -> FastAPI:
                 source_path=row.source_path,
                 library_path=row.library_path,
                 status=row.status,
+                operation_time=row.updated_at,
+                remark=row.error_message,
                 error_message=row.error_message,
                 title=row.title,
                 artist=row.artist,
@@ -1023,6 +1040,26 @@ def create_app() -> FastAPI:
             )
             for row in rows
         ]
+
+    @app.delete("/api/media/{media_id}", status_code=204)
+    async def delete_media_file(media_id: int, mode: MediaDeleteMode = "record_only") -> None:
+        media = await state.repository.get_media_file(media_id)
+        if media is None:
+            raise HTTPException(status_code=404, detail="Media record not found.")
+        if mode in {"media_file", "all"}:
+            try:
+                if mode == "all":
+                    await _delete_media_source(state, media)
+                if media.status == "success" and media.library_path:
+                    await _delete_file_path(Path(media.library_path))
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Media file delete failed: {exc}",
+                ) from exc
+        deleted = await state.repository.delete_media_file(media_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Media record not found.")
 
     @app.get("/api/music-library", response_model=list[MusicLibraryTrackResponse])
     async def music_library() -> list[MusicLibraryTrackResponse]:
@@ -1565,6 +1602,61 @@ async def _fetch_navidrome_music_library(server: MediaServerConfig) -> list[dict
     return tracks
 
 
+async def _delete_task_torrent(
+    state: AppState,
+    task: TorrentRecord,
+    *,
+    delete_files: bool,
+) -> None:
+    await _delete_torrent_hash(state, task.torrent_hash, delete_files=delete_files)
+
+
+async def _delete_torrent_hash(
+    state: AppState,
+    torrent_hash: str | None,
+    *,
+    delete_files: bool,
+) -> None:
+    if _is_pending_hash(torrent_hash):
+        return
+    if state.downloader is None:
+        await state.reload_downloader()
+    if state.downloader is None:
+        raise RuntimeError("Downloader is unavailable.")
+    await state.downloader.delete_torrent(torrent_hash or "", delete_files=delete_files)
+
+
+async def _delete_media_source(state: AppState, media: MediaFile) -> None:
+    if media.torrent_hash and not _is_pending_hash(media.torrent_hash):
+        await _delete_torrent_hash(state, media.torrent_hash, delete_files=True)
+        return
+    await _delete_file_path(Path(media.source_path))
+
+
+async def _delete_file_path(path: Path) -> None:
+    await asyncio.to_thread(_delete_file_path_sync, path)
+
+
+def _delete_file_path_sync(path: Path) -> None:
+    if not path.exists():
+        return
+    if not path.is_file():
+        raise RuntimeError(f"Refusing to delete non-file path: {path}")
+    path.unlink()
+
+
+def _file_size_or_none(path: str | None) -> int | None:
+    if not path:
+        return None
+    try:
+        target = Path(path)
+        if target.is_file():
+            return target.stat().st_size
+    except OSError:
+        return None
+    return None
+
+
 async def _poll_download_tasks_once(state: AppState) -> None:
     default = await state.repository.default_downloader()
     if default is None or default.listen_mode != "polling" or not default.enabled:
@@ -1695,6 +1787,31 @@ async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> Non
     if (task.payload or {}).get("scraping_completed"):
         return
     try:
+        try:
+            await _sync_music_library_from_navidrome(state)
+        except Exception as exc:  # noqa: BLE001
+            state.add_log("library", f"Music library sync before scraping failed: {exc}", "WARNING")
+        library_tracks = tuple(
+            LibraryTrackSnapshot(
+                title=item.title,
+                artist=item.artist,
+                album=item.album,
+                size=item.size,
+                path=item.path,
+            )
+            for item in await state.repository.list_music_library_tracks()
+        )
+        media_history = tuple(
+            LibraryTrackSnapshot(
+                title=item.title or "",
+                artist=item.artist,
+                album=item.album,
+                size=_file_size_or_none(item.library_path),
+                path=item.library_path,
+            )
+            for item in await state.repository.list_media_files()
+            if item.title
+        )
         source_files = await _scraping_source_files_for_task(state, task)
         if source_files is None:
             return
@@ -1703,6 +1820,8 @@ async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> Non
             save_path=task.save_path,
             config=config,
             source_files=source_files,
+            library_tracks=library_tracks,
+            media_history=media_history,
         )
     except Exception as exc:  # noqa: BLE001
         state.add_log("metadata", f"Scraping failed for {task.name}: {exc}", "WARNING")
@@ -1729,7 +1848,8 @@ async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> Non
         "Scraping completed for "
         f"{task.name}: files={summary.source_files}, mapped={summary.mapped_files}, "
         f"updated={summary.updated_files}, moved={summary.moved_files}, "
-        f"failed={summary.failed_files}",
+        f"failed={summary.failed_files}, "
+        f"skipped={sum(1 for item in summary.results if item.status == 'skipped')}",
     )
 
 

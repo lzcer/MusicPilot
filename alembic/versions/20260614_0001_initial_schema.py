@@ -67,7 +67,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Integer(), nullable=False),
         sa.Column("torrent_hash", sa.String(length=64), nullable=True),
         sa.Column("source_path", sa.Text(), nullable=False),
-        sa.Column("library_path", sa.Text(), nullable=False),
+        sa.Column("library_path", sa.Text(), nullable=True),
         sa.Column("title", sa.String(length=512), nullable=True),
         sa.Column("artist", sa.String(length=512), nullable=True),
         sa.Column("album", sa.String(length=512), nullable=True),

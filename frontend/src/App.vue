@@ -76,12 +76,17 @@ type DownloadTask = {
   last_error?: string | null
 }
 
+type DownloadDeleteMode = 'record_only' | 'all'
+type MediaDeleteMode = 'record_only' | 'media_file' | 'all'
+
 type MediaFile = {
   id: number
   torrent_hash?: string | null
   source_path: string
-  library_path: string
+  library_path?: string | null
   status: string
+  operation_time: string
+  remark?: string | null
   error_message?: string | null
   title?: string | null
   artist?: string | null
@@ -161,6 +166,7 @@ type SystemSettings = {
     auto_rename: boolean
     auto_classify: boolean
     classify_by: 'artist' | 'album'
+    duplicate_handling: 'ignore' | 'overwrite' | 'keep_largest'
   }
 }
 
@@ -235,12 +241,16 @@ const mediaServerDialog = ref(false)
 const notifierDialog = ref(false)
 const deleteDialog = ref(false)
 const downloadDeleteDialog = ref(false)
+const mediaDeleteDialog = ref(false)
 const siteTesting = ref(false)
 const downloaderTesting = ref(false)
 const mediaServerTesting = ref(false)
 const notifierTesting = ref(false)
 const deleting = ref(false)
 const downloadDeleting = ref(false)
+const mediaDeleting = ref(false)
+const activeDownloadDeleteMode = ref<DownloadDeleteMode | null>(null)
+const activeMediaDeleteMode = ref<MediaDeleteMode | null>(null)
 const systemSaving = ref(false)
 const editingSiteId = ref<string | null>(null)
 const editingDownloaderId = ref<string | null>(null)
@@ -251,6 +261,7 @@ const snackbar = ref({ show: false, color: 'success', text: '' })
 const deleteTarget = ref<DeleteTarget | null>(null)
 const pendingDownloadDeleteIds = ref<number[]>([])
 const pendingDownloadDeleteLabel = ref('')
+const pendingMediaDelete = ref<MediaFile | null>(null)
 const activeConfigMenu = ref<string | null>(null)
 
 const siteForm = ref({
@@ -314,7 +325,8 @@ const systemForm = ref<SystemSettings>({
     required_metadata: [],
     auto_rename: false,
     auto_classify: false,
-    classify_by: 'artist'
+    classify_by: 'artist',
+    duplicate_handling: 'ignore'
   }
 })
 
@@ -333,6 +345,12 @@ const scrapingRequiredMetadataOptions = [
 const scrapingClassifyOptions = [
   { title: '艺术家', value: 'artist' },
   { title: '专辑', value: 'album' }
+]
+
+const duplicateHandlingOptions = [
+  { title: '不处理', value: 'ignore' },
+  { title: '总是覆盖', value: 'overwrite' },
+  { title: '保留最大文件', value: 'keep_largest' }
 ]
 
 const navItems = [
@@ -718,6 +736,9 @@ async function confirmDownload() {
   try {
     await addDownload(pendingDownload.value)
     pendingDownload.value = null
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '下载失败', 'error')
+    await loadDownloads().catch(() => undefined)
   } finally {
     downloadSubmitting.value = false
   }
@@ -758,12 +779,15 @@ function deleteSelectedDownloads() {
   downloadDeleteDialog.value = true
 }
 
-async function confirmDeleteDownloads() {
+async function confirmDeleteDownloads(mode: DownloadDeleteMode) {
   const ids = [...pendingDownloadDeleteIds.value]
   if (!ids.length) return
   downloadDeleting.value = true
+  activeDownloadDeleteMode.value = mode
   try {
-    await Promise.all(ids.map((id) => apiNoContent(`/api/downloads/${id}`, { method: 'DELETE' })))
+    await Promise.all(
+      ids.map((id) => apiNoContent(`/api/downloads/${id}?mode=${mode}`, { method: 'DELETE' }))
+    )
     selectedDownloadIds.value = selectedDownloadIds.value.filter((id) => !ids.includes(id))
     pendingDownloadDeleteIds.value = []
     pendingDownloadDeleteLabel.value = ''
@@ -775,11 +799,37 @@ async function confirmDeleteDownloads() {
     await loadDownloads()
   } finally {
     downloadDeleting.value = false
+    activeDownloadDeleteMode.value = null
   }
 }
 
 async function loadMedia() {
   mediaFiles.value = await api<MediaFile[]>('/api/media')
+}
+
+function deleteMediaFile(row: MediaFile) {
+  pendingMediaDelete.value = row
+  mediaDeleteDialog.value = true
+}
+
+async function confirmDeleteMedia(mode: MediaDeleteMode) {
+  const row = pendingMediaDelete.value
+  if (!row) return
+  mediaDeleting.value = true
+  activeMediaDeleteMode.value = mode
+  try {
+    await apiNoContent(`/api/media/${row.id}?mode=${mode}`, { method: 'DELETE' })
+    pendingMediaDelete.value = null
+    mediaDeleteDialog.value = false
+    await loadMedia()
+    notify('整理记录已删除')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '整理记录删除失败', 'error')
+    await loadMedia()
+  } finally {
+    mediaDeleting.value = false
+    activeMediaDeleteMode.value = null
+  }
 }
 
 async function loadMusicLibrary() {
@@ -1251,6 +1301,28 @@ function formatTime(value: string) {
   return new Date(value).toLocaleString()
 }
 
+function mediaStatusColor(status: string) {
+  if (status === 'failed') return 'error'
+  if (status === 'skipped') return 'warning'
+  return 'success'
+}
+
+function mediaStatusText(status: string) {
+  if (status === 'failed') return '失败'
+  if (status === 'skipped') return '跳过'
+  return '成功'
+}
+
+function mediaRemark(row: MediaFile) {
+  return row.remark || row.error_message || '-'
+}
+
+function mediaDisplayPath(row: MediaFile) {
+  if (row.status === 'failed') return row.source_path
+  if (row.status === 'skipped') return '-'
+  return row.library_path || '-'
+}
+
 function logColor(level: string) {
   if (level === 'ERROR') return 'error'
   if (level === 'WARNING') return 'warning'
@@ -1536,28 +1608,41 @@ onUnmounted(() => {
                     <th>标题</th>
                     <th>艺人</th>
                     <th>专辑</th>
+                    <th>操作时间</th>
                     <th>状态</th>
                     <th>入库路径</th>
-                    <th>失败原因</th>
+                    <th>备注</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-if="!mediaFiles.length"><td colspan="6" class="empty-cell">暂无整理记录</td></tr>
+                  <tr v-if="!mediaFiles.length"><td colspan="8" class="empty-cell">暂无整理记录</td></tr>
                   <tr v-for="row in mediaFiles" :key="row.id">
                     <td>{{ row.title || '-' }}</td>
                     <td>{{ row.artist || '-' }}</td>
                     <td>{{ row.album || '-' }}</td>
+                    <td>{{ formatTime(row.operation_time) }}</td>
                     <td>
                       <v-chip
-                        :color="row.status === 'failed' ? 'error' : 'success'"
+                        :color="mediaStatusColor(row.status)"
                         size="small"
                         variant="tonal"
                       >
-                        {{ row.status === 'failed' ? '失败' : '成功' }}
+                        {{ mediaStatusText(row.status) }}
                       </v-chip>
                     </td>
-                    <td class="path-cell">{{ row.status === 'failed' ? row.source_path : row.library_path }}</td>
-                    <td>{{ row.error_message || '-' }}</td>
+                    <td class="path-cell">{{ mediaDisplayPath(row) }}</td>
+                    <td>{{ mediaRemark(row) }}</td>
+                    <td>
+                      <v-btn
+                        icon="mdi-delete"
+                        color="error"
+                        variant="text"
+                        size="small"
+                        title="删除整理记录"
+                        @click="deleteMediaFile(row)"
+                      />
+                    </td>
                   </tr>
                 </tbody>
               </v-table>
@@ -1914,6 +1999,11 @@ onUnmounted(() => {
                         :items="scrapingClassifyOptions"
                         label="分类方式"
                       />
+                      <v-select
+                        v-model="systemForm.scraping.duplicate_handling"
+                        :items="duplicateHandlingOptions"
+                        label="重复文件处理"
+                      />
                     </div>
                   </v-card-text>
                   <v-card-actions>
@@ -2166,10 +2256,9 @@ onUnmounted(() => {
     <v-dialog v-model="downloadDeleteDialog" max-width="420">
       <v-card title="确认删除">
         <v-card-text>
-          确定删除{{ pendingDownloadDeleteLabel }}吗？
+          请选择{{ pendingDownloadDeleteLabel }}的删除方式。
         </v-card-text>
-        <v-card-actions>
-          <v-spacer />
+        <v-card-actions class="delete-action-buttons">
           <v-btn
             variant="text"
             :disabled="downloadDeleting"
@@ -2177,8 +2266,65 @@ onUnmounted(() => {
           >
             取消
           </v-btn>
-          <v-btn color="error" :loading="downloadDeleting" @click="confirmDeleteDownloads">
-            删除
+          <v-spacer />
+          <v-btn
+            variant="tonal"
+            :disabled="downloadDeleting"
+            :loading="activeDownloadDeleteMode === 'record_only'"
+            @click="confirmDeleteDownloads('record_only')"
+          >
+            仅删除记录
+          </v-btn>
+          <v-btn
+            color="error"
+            :disabled="downloadDeleting"
+            :loading="activeDownloadDeleteMode === 'all'"
+            @click="confirmDeleteDownloads('all')"
+          >
+            删除全部
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="mediaDeleteDialog" max-width="520">
+      <v-card title="确认删除">
+        <v-card-text>
+          请选择整理记录“{{ pendingMediaDelete?.title || pendingMediaDelete?.source_path || '-' }}”的删除方式。
+        </v-card-text>
+        <v-card-actions class="delete-action-buttons">
+          <v-btn
+            variant="text"
+            :disabled="mediaDeleting"
+            @click="mediaDeleteDialog = false"
+          >
+            取消
+          </v-btn>
+          <v-spacer />
+          <v-btn
+            variant="tonal"
+            :disabled="mediaDeleting"
+            :loading="activeMediaDeleteMode === 'record_only'"
+            @click="confirmDeleteMedia('record_only')"
+          >
+            仅删除记录
+          </v-btn>
+          <v-btn
+            color="warning"
+            variant="tonal"
+            :disabled="mediaDeleting"
+            :loading="activeMediaDeleteMode === 'media_file'"
+            @click="confirmDeleteMedia('media_file')"
+          >
+            删除媒体文件
+          </v-btn>
+          <v-btn
+            color="error"
+            :disabled="mediaDeleting"
+            :loading="activeMediaDeleteMode === 'all'"
+            @click="confirmDeleteMedia('all')"
+          >
+            删除全部
           </v-btn>
         </v-card-actions>
       </v-card>
@@ -2191,6 +2337,12 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.delete-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .config-card {
   overflow: visible !important;
   position: relative;

@@ -15,6 +15,7 @@ from musicpilot.ports.tag_writer import TagWriter
 ScrapingMode = Literal["source", "mapped", "copy"]
 RequiredMetadata = Literal["album", "artist", "lyrics"]
 ClassifyBy = Literal["artist", "album"]
+DuplicateHandling = Literal["ignore", "overwrite", "keep_largest"]
 
 _AUDIO_EXTENSIONS = {
     ".aac",
@@ -41,6 +42,16 @@ class ScrapingConfig:
     auto_rename: bool = False
     auto_classify: bool = False
     classify_by: ClassifyBy = "artist"
+    duplicate_handling: DuplicateHandling = "ignore"
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryTrackSnapshot:
+    title: str
+    artist: str | None = None
+    album: str | None = None
+    size: int | None = None
+    path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +59,7 @@ class ScrapingFileResult:
     source_path: Path
     library_path: Path | None
     metadata: TrackMetadata
-    status: Literal["success", "failed"]
+    status: Literal["success", "failed", "skipped"]
     error_message: str | None = None
     stage: str = "completed"
     needs_metadata_update: bool = False
@@ -93,6 +104,8 @@ class LocalMusicScraper:
         save_path: str | None,
         config: ScrapingConfig,
         source_files: tuple[Path, ...] | None = None,
+        library_tracks: tuple[LibraryTrackSnapshot, ...] = (),
+        media_history: tuple[LibraryTrackSnapshot, ...] = (),
     ) -> ScrapingSummary:
         if not config.enabled:
             return ScrapingSummary()
@@ -110,7 +123,12 @@ class LocalMusicScraper:
         results: list[ScrapingFileResult] = []
         for source_file in audio_files:
             try:
-                result, mapped, updated, moved = await self._process_file(source_file, config)
+                result, mapped, updated, moved = await self._process_file(
+                    source_file,
+                    config,
+                    library_tracks,
+                    media_history,
+                )
             except Exception as exc:
                 try:
                     source_metadata = await asyncio.to_thread(read_track_metadata, source_file)
@@ -143,6 +161,8 @@ class LocalMusicScraper:
         self,
         source_file: Path,
         config: ScrapingConfig,
+        library_tracks: tuple[LibraryTrackSnapshot, ...],
+        media_history: tuple[LibraryTrackSnapshot, ...],
     ) -> tuple[ScrapingFileResult, int, int, int]:
         working_file = source_file
         mapped_files = 0
@@ -200,12 +220,72 @@ class LocalMusicScraper:
                 )
             metadata = _merge_metadata(metadata, looked_up)
 
+        duplicate = _find_duplicate_media(
+            _duplicate_metadata_candidates(source_metadata, match_metadata, metadata),
+            (*library_tracks, *media_history),
+        )
+        overwrite_duplicate = False
+        if duplicate is not None:
+            current_size = source_file.stat().st_size
+            if config.duplicate_handling == "ignore":
+                return (
+                    ScrapingFileResult(
+                        source_path=source_file,
+                        library_path=None,
+                        metadata=metadata,
+                        status="skipped",
+                        error_message=_duplicate_skip_message(
+                            metadata,
+                            duplicate,
+                            current_size,
+                            reason="音乐库已存在，重复文件处理为不处理",
+                        ),
+                        stage="skip_duplicate",
+                        needs_metadata_update=needs_update,
+                        candidate_count=candidate_count,
+                    ),
+                    0,
+                    0,
+                    0,
+                )
+            if config.duplicate_handling == "keep_largest":
+                if duplicate.size is None or current_size <= duplicate.size:
+                    reason = (
+                        "音乐库文件大小未知，无法确认当前文件更大"
+                        if duplicate.size is None
+                        else "当前文件不大于音乐库文件，保留最大文件"
+                    )
+                    return (
+                        ScrapingFileResult(
+                            source_path=source_file,
+                            library_path=None,
+                            metadata=metadata,
+                            status="skipped",
+                            error_message=_duplicate_skip_message(
+                                metadata,
+                                duplicate,
+                                current_size,
+                                reason=reason,
+                            ),
+                            stage="skip_smaller_duplicate",
+                            needs_metadata_update=needs_update,
+                            candidate_count=candidate_count,
+                        ),
+                        0,
+                        0,
+                        0,
+                    )
+                overwrite_duplicate = True
+            elif config.duplicate_handling in {"overwrite", "keep_largest"}:
+                overwrite_duplicate = True
+
         if config.mode == "mapped":
             working_file = await asyncio.to_thread(
                 _copy_to_mapping,
                 source_file,
                 config,
                 hardlink=not needs_update,
+                overwrite=overwrite_duplicate and not _will_classify_or_rename(config),
             )
             mapped_files += 1
         elif config.mode == "copy":
@@ -214,6 +294,7 @@ class LocalMusicScraper:
                 source_file,
                 config,
                 hardlink=False,
+                overwrite=overwrite_duplicate and not _will_classify_or_rename(config),
             )
             mapped_files += 1
 
@@ -227,15 +308,22 @@ class LocalMusicScraper:
             working_file,
             metadata,
             config,
+            overwrite=overwrite_duplicate,
         )
         if final_file != working_file:
             moved_files += 1
+        remark = (
+            _duplicate_overwrite_message(metadata, duplicate, source_file.stat().st_size)
+            if overwrite_duplicate and duplicate is not None
+            else "刮削并转移完成"
+        )
         return (
             ScrapingFileResult(
                 source_path=source_file,
                 library_path=final_file,
                 metadata=metadata,
                 status="success",
+                error_message=remark,
                 needs_metadata_update=needs_update,
                 candidate_count=candidate_count,
             ),
@@ -281,9 +369,12 @@ def scraping_config_from_payload(payload: dict[str, object]) -> ScrapingConfig:
         scraping = {}
     mode = str(scraping.get("mode") or "mapped")
     classify_by = str(scraping.get("classify_by") or "artist")
+    duplicate_handling = str(scraping.get("duplicate_handling") or "ignore")
     required = scraping.get("required_metadata")
     if mode not in {"source", "mapped", "copy"}:
         mode = "mapped"
+    if duplicate_handling not in {"ignore", "overwrite", "keep_largest"}:
+        duplicate_handling = "ignore"
     return ScrapingConfig(
         enabled=bool(scraping.get("enabled")),
         mode=mode,
@@ -293,6 +384,7 @@ def scraping_config_from_payload(payload: dict[str, object]) -> ScrapingConfig:
         auto_rename=bool(scraping.get("auto_rename")),
         auto_classify=bool(scraping.get("auto_classify")),
         classify_by="album" if classify_by == "album" else "artist",
+        duplicate_handling=duplicate_handling,
     )
 
 
@@ -370,7 +462,13 @@ def _audio_files(path: Path) -> list[Path]:
     return []
 
 
-def _copy_to_mapping(source_file: Path, config: ScrapingConfig, *, hardlink: bool) -> Path:
+def _copy_to_mapping(
+    source_file: Path,
+    config: ScrapingConfig,
+    *,
+    hardlink: bool,
+    overwrite: bool,
+) -> Path:
     if config.mapped_directory is None:
         raise RuntimeError("Target directory is required for mapped or copy scraping.")
     relative = source_file.name
@@ -379,19 +477,31 @@ def _copy_to_mapping(source_file: Path, config: ScrapingConfig, *, hardlink: boo
             relative = str(source_file.relative_to(config.source_directory))
         except ValueError:
             relative = source_file.name
-    target = _unique_path(config.mapped_directory / relative)
+    target = config.mapped_directory / relative
+    if not overwrite:
+        target = _unique_path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     if hardlink:
         try:
+            if overwrite:
+                _remove_existing_target(target)
             os.link(source_file, target)
             return target
         except OSError:
             pass
+    if overwrite:
+        _remove_existing_target(target)
     shutil.copy2(source_file, target)
     return target
 
 
-def _classify_or_rename(path: Path, metadata: TrackMetadata, config: ScrapingConfig) -> Path:
+def _classify_or_rename(
+    path: Path,
+    metadata: TrackMetadata,
+    config: ScrapingConfig,
+    *,
+    overwrite: bool,
+) -> Path:
     target_dir = path.parent
     if config.auto_classify:
         group = metadata.artist if config.classify_by == "artist" else metadata.album
@@ -405,12 +515,132 @@ def _classify_or_rename(path: Path, metadata: TrackMetadata, config: ScrapingCon
     target_name = path.name
     if config.auto_rename:
         target_name = f"{_safe_path_part(metadata.title or path.stem)}{path.suffix}"
-    target = _unique_path(target_dir / target_name, current=path)
+    target = target_dir / target_name
+    if not overwrite:
+        target = _unique_path(target, current=path)
     if target == path:
         return path
     target.parent.mkdir(parents=True, exist_ok=True)
+    if overwrite:
+        _remove_existing_target(target)
     shutil.move(str(path), str(target))
     return target
+
+
+def _remove_existing_target(target: Path) -> None:
+    if not target.exists():
+        return
+    if target.is_dir():
+        raise RuntimeError(f"Target path is a directory: {target}")
+    target.unlink()
+
+
+def _will_classify_or_rename(config: ScrapingConfig) -> bool:
+    return config.auto_classify or config.auto_rename
+
+
+def _duplicate_metadata_candidates(
+    source_metadata: TrackMetadata,
+    match_metadata: TrackMetadata,
+    scraped_metadata: TrackMetadata,
+) -> tuple[TrackMetadata, ...]:
+    candidates: list[TrackMetadata] = []
+    seen: set[tuple[str, str, str]] = set()
+    for metadata in (source_metadata, match_metadata, scraped_metadata):
+        key = (
+            _normalize_match_text(metadata.title),
+            _normalize_match_text(metadata.artist),
+            _normalize_match_text(metadata.album),
+        )
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        candidates.append(metadata)
+    return tuple(candidates)
+
+
+def _find_duplicate_media(
+    candidates: tuple[TrackMetadata, ...],
+    tracks: tuple[LibraryTrackSnapshot, ...],
+) -> LibraryTrackSnapshot | None:
+    best: LibraryTrackSnapshot | None = None
+    best_score = 0
+    for metadata in candidates:
+        title = _normalize_match_text(metadata.title)
+        artist = _normalize_match_text(metadata.artist)
+        album = _normalize_match_text(metadata.album)
+        if not title:
+            continue
+        for track in tracks:
+            if _normalize_match_text(track.title) != title:
+                continue
+            track_artist = _normalize_match_text(track.artist)
+            track_album = _normalize_match_text(track.album)
+            if artist and track_artist and artist != track_artist:
+                continue
+            score = 1
+            if artist and track_artist == artist:
+                score += 2
+            if album and track_album == album:
+                score += 1
+            if score > best_score:
+                best = track
+                best_score = score
+    return best
+
+
+def _library_track_path(track: LibraryTrackSnapshot) -> Path | None:
+    if not track.path:
+        return None
+    return Path(track.path)
+
+
+def _duplicate_skip_message(
+    metadata: TrackMetadata,
+    track: LibraryTrackSnapshot,
+    current_size: int,
+    *,
+    reason: str,
+) -> str:
+    existing_path = _library_track_path(track)
+    path_text = f"，已存在路径={existing_path}" if existing_path is not None else ""
+    return (
+        f"已跳过：{reason}。"
+        f"识别={metadata.title}/{metadata.artist or '-'}，"
+        f"当前大小={_format_size(current_size)}，"
+        f"音乐库大小={_format_size(track.size)}"
+        f"{path_text}"
+    )
+
+
+def _duplicate_overwrite_message(
+    metadata: TrackMetadata,
+    track: LibraryTrackSnapshot,
+    current_size: int,
+) -> str:
+    existing_path = _library_track_path(track)
+    path_text = f"，原路径={existing_path}" if existing_path is not None else ""
+    return (
+        "覆盖完成：音乐库中已存在匹配媒体。"
+        f"识别={metadata.title}/{metadata.artist or '-'}，"
+        f"当前大小={_format_size(current_size)}，"
+        f"音乐库大小={_format_size(track.size)}"
+        f"{path_text}"
+    )
+
+
+def _format_size(value: int | None) -> str:
+    if value is None:
+        return "未知"
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(value)
+    index = 0
+    while size >= 1024 and index < len(units) - 1:
+        size /= 1024
+        index += 1
+    if index == 0:
+        return f"{int(size)} {units[index]}"
+    return f"{size:.2f} {units[index]}"
 
 
 def _metadata_missing(metadata: TrackMetadata, required: tuple[RequiredMetadata, ...]) -> bool:

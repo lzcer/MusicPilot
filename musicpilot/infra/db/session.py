@@ -65,6 +65,10 @@ class Database:
                     "error_message": "TEXT",
                 },
             )
+            await _ensure_media_files_library_path_nullable(conn)
+            await conn.exec_driver_sql(
+                "UPDATE media_files SET library_path = NULL WHERE status != 'success'"
+            )
 
     async def dispose(self) -> None:
         await self.engine.dispose()
@@ -109,3 +113,76 @@ async def _add_sqlite_columns(
     for name, definition in columns.items():
         if name not in existing:
             await conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+async def _ensure_media_files_library_path_nullable(conn: object) -> None:
+    result = await conn.exec_driver_sql("PRAGMA table_info(media_files)")
+    columns = result.fetchall()
+    if not columns:
+        return
+    library_path = next((row for row in columns if str(row[1]) == "library_path"), None)
+    if library_path is None or int(library_path[3]) == 0:
+        return
+    await conn.exec_driver_sql("ALTER TABLE media_files RENAME TO media_files_old")
+    await conn.exec_driver_sql(
+        """
+        CREATE TABLE media_files (
+            id INTEGER NOT NULL,
+            torrent_hash VARCHAR(64),
+            source_path TEXT NOT NULL,
+            library_path TEXT,
+            title VARCHAR(512),
+            artist VARCHAR(512),
+            album VARCHAR(512),
+            year INTEGER,
+            track_number INTEGER,
+            status VARCHAR(64) NOT NULL,
+            error_message TEXT,
+            metadata JSON NOT NULL,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE (library_path)
+        )
+        """
+    )
+    await conn.exec_driver_sql(
+        """
+        INSERT INTO media_files (
+            id,
+            torrent_hash,
+            source_path,
+            library_path,
+            title,
+            artist,
+            album,
+            year,
+            track_number,
+            status,
+            error_message,
+            metadata,
+            created_at,
+            updated_at
+        )
+        SELECT
+            id,
+            torrent_hash,
+            source_path,
+            CASE WHEN status = 'success' THEN library_path ELSE NULL END,
+            title,
+            artist,
+            album,
+            year,
+            track_number,
+            status,
+            error_message,
+            metadata,
+            created_at,
+            updated_at
+        FROM media_files_old
+        """
+    )
+    await conn.exec_driver_sql("DROP TABLE media_files_old")
+    await conn.exec_driver_sql(
+        "CREATE INDEX ix_media_files_torrent_hash ON media_files (torrent_hash)"
+    )

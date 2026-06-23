@@ -100,6 +100,10 @@ class DownloadResponse(BaseModel):
     torrent_hash: str | None = None
 
 
+DownloadDeleteMode = Literal["record_only", "all"]
+MediaDeleteMode = Literal["record_only", "media_file", "all"]
+
+
 class DownloadTaskResponse(BaseModel):
     id: int | None = None
     torrent_hash: str | None = None
@@ -234,6 +238,7 @@ class ScrapingSettings(BaseModel):
     auto_rename: bool = False
     auto_classify: bool = False
     classify_by: Literal["artist", "album"] = "artist"
+    duplicate_handling: Literal["ignore", "overwrite", "keep_largest"] = "ignore"
 
 
 class SystemSettingsRequest(BaseModel):
@@ -277,8 +282,10 @@ class MediaFileResponse(BaseModel):
     id: int
     torrent_hash: str | None
     source_path: str
-    library_path: str
+    library_path: str | None = None
     status: str = "success"
+    operation_time: datetime
+    remark: str | None = None
     error_message: str | None = None
     title: str | None
     artist: str | None

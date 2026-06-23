@@ -39,7 +39,7 @@ class SqlAlchemyMediaRepository:
             result = await session.execute(
                 select(MediaFile).where(MediaFile.library_path == str(library_path))
             )
-            media_file = result.scalar_one_or_none()
+            media_file = result.scalars().first()
             if media_file is None:
                 media_file = MediaFile(
                     torrent_hash=torrent_hash,
@@ -70,23 +70,30 @@ class SqlAlchemyMediaRepository:
         status: str,
         error_message: str | None = None,
     ) -> None:
-        result_path = library_path or source_path
+        result_path = str(library_path) if library_path is not None else None
         async with self.database.session() as session:
-            result = await session.execute(
-                select(MediaFile).where(MediaFile.source_path == str(source_path))
-            )
-            media_file = result.scalar_one_or_none()
+            media_file = None
+            if result_path is not None:
+                result = await session.execute(
+                    select(MediaFile).where(MediaFile.library_path == result_path)
+                )
+                media_file = result.scalars().first()
+            if media_file is None:
+                result = await session.execute(
+                    select(MediaFile).where(MediaFile.source_path == str(source_path))
+                )
+                media_file = result.scalars().first()
             if media_file is None:
                 media_file = MediaFile(
                     torrent_hash=torrent_hash,
                     source_path=str(source_path),
-                    library_path=str(result_path),
+                    library_path=result_path,
                 )
                 session.add(media_file)
 
             media_file.torrent_hash = torrent_hash
             media_file.source_path = str(source_path)
-            media_file.library_path = str(result_path)
+            media_file.library_path = result_path
             media_file.title = metadata.title
             media_file.artist = metadata.artist
             media_file.album = metadata.album
@@ -331,6 +338,10 @@ class SqlAlchemyMediaRepository:
             result = await session.execute(select(TorrentRecord).order_by(TorrentRecord.id.desc()))
             return list(result.scalars().all())
 
+    async def get_download_task(self, task_id: int) -> TorrentRecord | None:
+        async with self.database.session() as session:
+            return await session.get(TorrentRecord, task_id)
+
     async def list_unfinished_download_tasks(self) -> list[TorrentRecord]:
         async with self.database.session() as session:
             result = await session.execute(
@@ -373,6 +384,19 @@ class SqlAlchemyMediaRepository:
         async with self.database.session() as session:
             result = await session.execute(select(MediaFile).order_by(MediaFile.id.desc()))
             return list(result.scalars().all())
+
+    async def get_media_file(self, media_id: int) -> MediaFile | None:
+        async with self.database.session() as session:
+            return await session.get(MediaFile, media_id)
+
+    async def delete_media_file(self, media_id: int) -> bool:
+        async with self.database.session() as session:
+            row = await session.get(MediaFile, media_id)
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.commit()
+            return True
 
     async def list_music_library_tracks(self) -> list[MusicLibraryTrack]:
         async with self.database.session() as session:

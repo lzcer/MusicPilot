@@ -177,6 +177,17 @@ class QBittorrentClient:
         response.raise_for_status()
         return tuple(_file_from_item(item) for item in response.json())
 
+    async def delete_torrent(self, torrent_hash: str, *, delete_files: bool) -> None:
+        response = await self._request(
+            "POST",
+            "/api/v2/torrents/delete",
+            data={
+                "hashes": torrent_hash,
+                "deleteFiles": "true" if delete_files else "false",
+            },
+        )
+        response.raise_for_status()
+
     async def _list_info(self) -> list[dict[str, object]]:
         response = await self._request("GET", "/api/v2/torrents/info")
         response.raise_for_status()
