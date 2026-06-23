@@ -1,0 +1,17 @@
+.git
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.venv
+__pycache__
+*.pyc
+
+.env
+data
+frontend/dist
+frontend/node_modules
+musicpilot.egg-info
+
+docs
+tests
+tools

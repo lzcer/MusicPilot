@@ -1,14 +1,29 @@
 services:
   musicpilot:
-    build: .
-    container_name: musicpilot
+    build:
+      context: .
+      dockerfile: Dockerfile
     environment:
-      MP_DATABASE_URL: sqlite+aiosqlite:////data/musicpilot.db
-      MP_MUSIC_LIBRARY_PATH: /music
-      MP_DOWNLOAD_STAGING_PATH: /downloads
+      MP_APP_NAME: ${MP_APP_NAME:-MusicPilot}
+      MP_LOG_LEVEL: ${MP_LOG_LEVEL:-INFO}
+      MP_ADMIN_USERNAME: ${MP_ADMIN_USERNAME:-admin}
+      MP_ADMIN_PASSWORD: ${MP_ADMIN_PASSWORD:-musicpilot}
+      MP_SESSION_SECRET: ${MP_SESSION_SECRET:-musicpilot-change-me}
+      MP_DATABASE_URL: ${MP_DATABASE_URL:-sqlite+aiosqlite:////data/musicpilot.db}
+      MP_MUSIC_LIBRARY_PATH: ${MP_MUSIC_LIBRARY_PATH:-/music}
+      MP_DOWNLOAD_STAGING_PATH: ${MP_DOWNLOAD_STAGING_PATH:-/downloads}
+      MP_STATIC_DIR: /app/frontend/dist
+      MP_INDEXER_PARSER_CONFIG: ${MP_INDEXER_PARSER_CONFIG:-/config/sites.parser.yaml}
+      MP_RUNTIME_CONFIG: ${MP_RUNTIME_CONFIG:-/config/runtime.json}
+      MP_MUSICBRAINZ_USER_AGENT: ${MP_MUSICBRAINZ_USER_AGENT:-MusicPilot/0.1.0 (self-hosted)}
+      MP_WRITE_AUDIO_TAGS: ${MP_WRITE_AUDIO_TAGS:-true}
+      MP_SUBSCRIPTIONS_ENABLED: ${MP_SUBSCRIPTIONS_ENABLED:-true}
+      MP_SUBSCRIPTION_CHECK_INTERVAL_MINUTES: ${MP_SUBSCRIPTION_CHECK_INTERVAL_MINUTES:-1440}
+    restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "${MP_HTTP_PORT:-8000}:8000"
     volumes:
       - ./data:/data
-      - ./data/library:/music
-      - ./data/downloads:/downloads
+      - ./config:/config
+      - ${MP_HOST_MUSIC_PATH:-./data/library}:/music
+      - ${MP_HOST_DOWNLOADS_PATH:-./data/downloads}:/downloads
