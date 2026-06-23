@@ -21,7 +21,14 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY musicpilot ./musicpilot
 COPY config ./config
-RUN uv pip install --system --no-cache . \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    UV_HTTP_TIMEOUT=120 \
+    UV_HTTP_RETRIES=5 \
+    uv pip install \
+      --system \
+      --verbose \
+      --default-index https://pypi.tuna.tsinghua.edu.cn/simple \
+      . \
     && mkdir -p /data /music /downloads /config \
     && cp -n /app/config/sites.parser.yaml /config/sites.parser.yaml
 COPY --from=frontend /app/frontend/dist /app/frontend/dist
