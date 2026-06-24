@@ -53,6 +53,13 @@ _DIR_NOISE_RE = re.compile(
     re.I,
 )
 _ARTIST_SEP_RE = re.compile(r"\s+[–—\-|/]\s+")
+_DISC_DIR_RE = re.compile(r"^(?:CD|Disc|Disk|ディスク|Volume|Vol)\s*\d+", re.I)
+# Trailing noise to strip from album/artist names: year, format tags
+_ALBUM_TRAILING_NOISE_RE = re.compile(
+    r"\s+(?:20\d{2}\s*)?(?:FLAC|MP3|WAV|ALAC|APE|AAC|DSD|SACD|"
+    r"Hi.?Res|24.?[Bb]it|96[kK][Hh]z|无损|WEB|LP|Vinyl|EP|Single|单曲|专辑)\s*$",
+    re.I,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -606,17 +613,27 @@ def _infer_batch_metadata(source_files: list[Path]) -> dict[Path, TrackMetadata]
     return result
 
 
+def _clean_album_name(name: str) -> str:
+    """Remove trailing format/quality noise from an album or artist name."""
+    name = _ALBUM_TRAILING_NOISE_RE.sub("", name).strip()
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+
 def _analyze_directory(dir_path: Path, children: list[Path]) -> _DirInferredInfo:
     """Analyze a single directory name and its child files for metadata.
 
     Returns inferred artist/album or None if the directory name is not
-    informative (e.g. root directories, generic names).
+    informative (e.g. root directories, generic names, disc markers).
+
+    Handles multi-CD structures by skipping disc-marking dirs (CD1, CD2, etc.)
+    and analyzing their parent instead.
     """
     dir_name = dir_path.name.strip()
     if not dir_name or dir_name in {".", "..", "downloads", "music", "library"}:
         return _DirInferredInfo()
 
-    # Strip noise
+    # Strip bracketed noise
     cleaned = _DIR_NOISE_RE.sub("", dir_name).strip()
     if not cleaned:
         cleaned = dir_name
@@ -624,18 +641,22 @@ def _analyze_directory(dir_path: Path, children: list[Path]) -> _DirInferredInfo
     # Strip leading year patterns: "2014 周杰伦 - 哎呦" → "周杰伦 - 哎呦"
     cleaned = re.sub(r"^\d{4}\s+", "", cleaned).strip()
 
+    # Detect disc markers (CD1, CD2, Disc 2, etc.) — skip and analyze parent
+    if _DISC_DIR_RE.match(cleaned):
+        parent = dir_path.parent
+        if parent.name.strip() and parent.name.strip() not in {".", "..", "downloads"}:
+            return _analyze_directory(parent, children)
+        return _DirInferredInfo()
+
     # Try "Artist - Album" pattern
     parts = _ARTIST_SEP_RE.split(cleaned, maxsplit=1)
     if len(parts) == 2:
         artist_part = parts[0].strip()
-        album_part = parts[1].strip()
-
-        # Validate: artist part shouldn't look like a generic word or noise
+        album_part = _clean_album_name(parts[1].strip())
         if artist_part and len(artist_part) >= 1:
             return _DirInferredInfo(artist=artist_part, album=album_part)
 
-    # No artist separator found. Always check grandparent as potential artist,
-    # then decide whether current dir is an album or standalone artist dir.
+    # No artist separator found. Check grandparent as potential artist.
     grandparent = dir_path.parent.name.strip()
     grandparent_valid = (
         grandparent
@@ -646,12 +667,16 @@ def _analyze_directory(dir_path: Path, children: list[Path]) -> _DirInferredInfo
         gp_cleaned = _DIR_NOISE_RE.sub("", grandparent).strip()
         gp_cleaned = re.sub(r"^\d{4}\s+", "", gp_cleaned).strip()
         gp_parts = _ARTIST_SEP_RE.split(gp_cleaned, maxsplit=1)
+
         if len(gp_parts) == 2:
-            # Grandparent has "Artist - Album"
-            return _DirInferredInfo(artist=gp_parts[0].strip(), album=cleaned)
+            # Grandparent has "Artist - Album" format
+            # Current dir is the actual album, OR if it's a sub-dir (like CD1),
+            # it was already handled above. Use grandparent's album content here.
+            gp_album = _clean_album_name(gp_parts[1].strip())
+            return _DirInferredInfo(artist=gp_parts[0].strip(), album=gp_album)
         elif gp_cleaned and len(gp_cleaned) >= 2:
             # Grandparent is the artist, current dir is the album
-            return _DirInferredInfo(artist=gp_cleaned, album=cleaned)
+            return _DirInferredInfo(artist=gp_cleaned, album=_clean_album_name(cleaned))
 
     # No grandparent or grandparent not usable. Try to determine if current
     # dir is an artist name or album name by checking child stems.
@@ -661,11 +686,9 @@ def _analyze_directory(dir_path: Path, children: list[Path]) -> _DirInferredInfo
         if _normalize_match_text(cleaned) in _normalize_match_text(s)
     )
     if children and match_count / len(children) >= 0.5:
-        # Dir name matches child stems → it's an album
-        return _DirInferredInfo(artist=None, album=cleaned)
+        return _DirInferredInfo(artist=None, album=_clean_album_name(cleaned))
 
-    # Default: the dir name is the artist name (and also album)
-    return _DirInferredInfo(artist=cleaned, album=cleaned)
+    return _DirInferredInfo(artist=cleaned, album=_clean_album_name(cleaned))
 
 
 def _audio_files(path: Path) -> list[Path]:
