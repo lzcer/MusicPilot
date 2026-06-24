@@ -9,6 +9,8 @@ from uuid import uuid4
 from sqlalchemy import delete, select
 
 from musicpilot.infra.db.models import (
+    Artist,
+    ArtistAlias,
     DownloaderConfig,
     IndexerSite,
     MediaFile,
@@ -791,6 +793,147 @@ class SqlAlchemyMediaRepository:
             await session.delete(site)
             await session.commit()
             return True
+
+    # ── Artist queries ──────────────────────────────────────────
+
+    async def find_artist_id_by_alias(self, alias: str) -> int | None:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(ArtistAlias).where(ArtistAlias.alias == alias).limit(1)
+            )
+            row = result.scalars().first()
+            return row.artist_id if row is not None else None
+
+    async def find_artist_by_normalized(self, normalized: str) -> Artist | None:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(Artist).where(Artist.normalized_name == normalized).limit(1)
+            )
+            return result.scalars().first()
+
+    async def get_artist(self, artist_id: int) -> Artist | None:
+        async with self.database.session() as session:
+            return await session.get(Artist, artist_id)
+
+    async def create_artist(
+        self,
+        *,
+        name: str,
+        normalized_name: str,
+        external_ids: dict[str, str],
+    ) -> Artist:
+        async with self.database.session() as session:
+            artist = Artist(
+                name=name,
+                normalized_name=normalized_name,
+                external_ids=external_ids,
+            )
+            session.add(artist)
+            await session.commit()
+            await session.refresh(artist)
+            return artist
+
+    async def delete_artist(self, artist_id: int) -> bool:
+        async with self.database.session() as session:
+            artist = await session.get(Artist, artist_id)
+            if artist is None:
+                return False
+            await session.delete(artist)
+            await session.commit()
+            return True
+
+    async def add_alias(self, artist_id: int, alias: str, source: str = "manual") -> None:
+        async with self.database.session() as session:
+            # Check for duplicate
+            result = await session.execute(
+                select(ArtistAlias).where(
+                    ArtistAlias.artist_id == artist_id, ArtistAlias.alias == alias
+                ).limit(1)
+            )
+            existing = result.scalars().first()
+            if existing is not None:
+                return
+            row = ArtistAlias(artist_id=artist_id, alias=alias, source=source)
+            session.add(row)
+            await session.commit()
+
+    async def list_artist_aliases(self, artist_id: int) -> list[str]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(ArtistAlias).where(ArtistAlias.artist_id == artist_id)
+            )
+            rows = result.scalars().all()
+            artist = await session.get(Artist, artist_id)
+            aliases = [artist.name] if artist else []
+            aliases.extend(row.alias for row in rows if row.alias != (artist.name if artist else None))
+            # Deduplicate while preserving order
+            seen: set[str] = set()
+            unique: list[str] = []
+            for a in aliases:
+                if a not in seen:
+                    seen.add(a)
+                    unique.append(a)
+            return unique
+
+    async def reassign_aliases(self, from_artist_id: int, to_artist_id: int) -> int:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(ArtistAlias).where(ArtistAlias.artist_id == from_artist_id)
+            )
+            moved = 0
+            for row in result.scalars().all():
+                row.artist_id = to_artist_id
+                moved += 1
+            await session.commit()
+            return moved
+
+    async def list_all_artists(self) -> list[Artist]:
+        async with self.database.session() as session:
+            result = await session.execute(select(Artist).order_by(Artist.name))
+            return list(result.scalars().all())
+
+    async def clear_all_artists(self) -> tuple[int, int]:
+        """Delete all artists and aliases. Returns (deleted_aliases, deleted_artists)."""
+        async with self.database.session() as session:
+            alias_result = await session.execute(select(ArtistAlias))
+            aliases = alias_result.scalars().all()
+            for row in aliases:
+                await session.delete(row)
+            artist_result = await session.execute(select(Artist))
+            artists = artist_result.scalars().all()
+            for row in artists:
+                await session.delete(row)
+            await session.commit()
+            return len(aliases), len(artists)
+
+    async def list_distinct_artists(self) -> list[str]:
+        """Return all unique artist names from media_files and music_library_tracks."""
+        async with self.database.session() as session:
+            from sqlalchemy import func as sa_func
+
+            media_result = await session.execute(
+                select(MediaFile.artist).where(
+                    MediaFile.artist.isnot(None),
+                    MediaFile.artist != "",
+                ).distinct()
+            )
+            library_result = await session.execute(
+                select(MusicLibraryTrack.artist).where(
+                    MusicLibraryTrack.artist.isnot(None),
+                    MusicLibraryTrack.artist != "",
+                ).distinct()
+            )
+            seen: set[str] = set()
+            all_names: list[str] = []
+            for (name,) in media_result.fetchall():
+                if name and name not in seen:
+                    seen.add(name)
+                    all_names.append(name)
+            for (name,) in library_result.fetchall():
+                if name and name not in seen:
+                    seen.add(name)
+                    all_names.append(name)
+            return all_names
 
 
 def _assign_config_fields(row: object, payload: dict[str, Any], fields: tuple[str, ...]) -> None:

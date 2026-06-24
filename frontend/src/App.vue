@@ -131,6 +131,10 @@ type FileBulkDeleteResponse = {
   failures: Array<{ path: string; message: string }>
 }
 
+type BuildArtistLibraryResponse = {
+  created: number
+}
+
 type MusicLibraryTrack = {
   id: string
   title: string
@@ -293,6 +297,18 @@ type TestResponse = {
   message: string
 }
 
+type ArtistAlias = {
+  alias: string
+  source: string
+}
+
+type Artist = {
+  id: number
+  name: string
+  normalized_name: string
+  aliases: ArtistAlias[]
+}
+
 type DeleteTarget = {
   kind: 'site' | 'downloader' | 'mediaServer' | 'notifier' | 'musicPlatform' | 'playlist'
   id: string | number
@@ -393,6 +409,14 @@ const fileDeleting = ref(false)
 const activeDownloadDeleteMode = ref<DownloadDeleteMode | null>(null)
 const activeMediaDeleteMode = ref<MediaDeleteMode | null>(null)
 const systemSaving = ref(false)
+const artists = ref<Artist[]>([])
+const artistLoading = ref(false)
+const artistBuilding = ref(false)
+const artistAliasDialog = ref(false)
+const artistAliasForm = ref({ artist_id: 0, alias: '', source: 'user' })
+const artistMergeDialog = ref(false)
+const artistMergeForm = ref({ target_id: 0, source_id: 0, target_name: '', source_name: '' })
+const clearArtistDialog = ref(false)
 const editingSiteId = ref<string | null>(null)
 const editingDownloaderId = ref<string | null>(null)
 const editingMediaServerId = ref<string | null>(null)
@@ -514,6 +538,7 @@ const navItems = [
   { title: '文件管理', value: 'files', icon: 'mdi-folder-music-outline' },
   { title: '音乐库', value: 'musicLibrary', icon: 'mdi-music-circle-outline' },
   { title: '歌单', value: 'playlists', icon: 'mdi-playlist-music-outline' },
+  { title: '歌手库', value: 'artists', icon: 'mdi-account-music-outline' },
   { title: '站点', value: 'sites', icon: 'mdi-server-network' },
   { title: '日志', value: 'logs', icon: 'mdi-text-box-search-outline' },
   { title: '设置', value: 'settings', icon: 'mdi-cog-outline' }
@@ -947,6 +972,9 @@ function switchPage(page: string) {
   if (page === 'playlists' && !playlists.value.length && !playlistLoading.value) {
     void loadPlaylists()
   }
+  if (page === 'artists') {
+    void loadArtists()
+  }
 }
 
 async function confirmDownload() {
@@ -1236,6 +1264,92 @@ async function syncMusicLibrary() {
     notify(error instanceof Error ? error.message : '音乐库同步失败', 'error')
   } finally {
     musicLibraryLoading.value = false
+  }
+}
+
+async function loadArtists() {
+  artists.value = await api<Artist[]>('/api/artists')
+}
+
+async function buildArtistLibrary() {
+  artistBuilding.value = true
+  try {
+    const result = await api<BuildArtistLibraryResponse>('/api/artists/build-library', {
+      method: 'POST'
+    })
+    await loadArtists()
+    notify(`歌手库已构建：${result.created} 个歌手组`)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '构建歌手库失败', 'error')
+  } finally {
+    artistBuilding.value = false
+  }
+}
+
+async function clearAndRebuildArtistLibrary() {
+  clearArtistDialog.value = true
+}
+
+async function confirmClearAndRebuildArtistLibrary() {
+  clearArtistDialog.value = false
+  artistBuilding.value = true
+  try {
+    await api('/api/artists', { method: 'DELETE' })
+    const result = await api<BuildArtistLibraryResponse>('/api/artists/build-library', {
+      method: 'POST'
+    })
+    await loadArtists()
+    notify(`歌手库已清空并重建：${result.created} 个歌手组`)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '清空重建失败', 'error')
+  } finally {
+    artistBuilding.value = false
+  }
+}
+
+async function openArtistAliasDialog(artist: Artist) {
+  artistAliasForm.value = { artist_id: artist.id, alias: '', source: 'user' }
+  artistAliasDialog.value = true
+}
+
+async function saveArtistAlias() {
+  try {
+    await api('/api/artists/alias', {
+      method: 'POST',
+      body: JSON.stringify(artistAliasForm.value)
+    })
+    await loadArtists()
+    artistAliasDialog.value = false
+    notify('别名已添加')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '添加别名失败', 'error')
+  }
+}
+
+function openArtistMergeDialog(source: Artist) {
+  artistMergeForm.value = {
+    target_id: source.id,
+    source_id: 0,
+    target_name: source.name,
+    source_name: ''
+  }
+  artistMergeDialog.value = true
+}
+
+async function confirmMergeArtists() {
+  try {
+    const result = await api<Artist>('/api/artists/merge', {
+      method: 'POST',
+      body: JSON.stringify({
+        target_id: artistMergeForm.value.target_id,
+        source_id: artistMergeForm.value.source_id
+      })
+    })
+    await loadArtists()
+    artistMergeDialog.value = false
+    notify(`已合并：${result.name}`)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '合并失败', 'error')
   }
 }
 
@@ -2676,6 +2790,95 @@ onUnmounted(() => {
             </v-card>
           </section>
 
+<section v-if="activePage === 'artists'" class="page-stack">
+            <div class="toolbar-row">
+              <v-btn
+                prepend-icon="mdi-refresh"
+                variant="tonal"
+                :loading="artistLoading"
+                @click="loadArtists"
+              >
+                刷新
+              </v-btn>
+              <v-btn
+                color="primary"
+                prepend-icon="mdi-database-plus"
+                :loading="artistBuilding"
+                @click="buildArtistLibrary"
+              >
+                从曲库构建
+              </v-btn>
+              <v-btn
+                color="warning"
+                prepend-icon="mdi-database-refresh"
+                :loading="artistBuilding"
+                @click="clearAndRebuildArtistLibrary"
+              >
+                清空并重建
+              </v-btn>
+              <v-chip v-if="artists.length" color="primary" variant="tonal">
+                共 {{ artists.length }} 个歌手
+              </v-chip>
+            </div>
+            <v-card>
+              <v-table>
+                <thead>
+                  <tr>
+                    <th>歌手名（权威名）</th>
+                    <th>归一化名</th>
+                    <th>别名</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-if="!artists.length">
+                    <td colspan="4" class="empty-cell">
+                      暂无歌手数据，点击「从曲库构建」按钮自动生成
+                    </td>
+                  </tr>
+                  <tr v-for="artist in artists" :key="artist.id">
+                    <td>
+                      <strong>{{ artist.name }}</strong>
+                    </td>
+                    <td class="muted">{{ artist.normalized_name }}</td>
+                    <td>
+                      <div v-if="artist.aliases.length" class="alias-list">
+                        <v-chip
+                          v-for="alias in artist.aliases"
+                          :key="alias.alias"
+                          size="x-small"
+                          variant="tonal"
+                          class="alias-chip"
+                        >
+                          {{ alias.alias }}
+                        </v-chip>
+                      </div>
+                      <span v-else class="muted">-</span>
+                    </td>
+                    <td>
+                      <v-btn
+                        icon="mdi-book-plus"
+                        color="primary"
+                        variant="text"
+                        size="small"
+                        title="添加别名"
+                        @click="openArtistAliasDialog(artist)"
+                      />
+                      <v-btn
+                        icon="mdi-call-merge"
+                        color="warning"
+                        variant="text"
+                        size="small"
+                        title="合并到此歌手"
+                        @click="openArtistMergeDialog(artist)"
+                      />
+                    </td>
+                  </tr>
+                </tbody>
+              </v-table>
+            </v-card>
+          </section>
+
           <section v-if="activePage === 'sites'" class="page-stack">
             <div class="toolbar-row">
               <v-btn color="primary" prepend-icon="mdi-plus" @click="openNewSiteDialog">新增站点</v-btn>
@@ -3522,6 +3725,75 @@ onUnmounted(() => {
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="artistAliasDialog" max-width="460">
+      <v-card title="添加别名">
+        <v-card-text class="dialog-stack">
+          <v-text-field
+            v-model="artistAliasForm.alias"
+            label="别名"
+            placeholder="例如：Jay Chou / G.E.M."
+            autofocus
+            @keyup.enter="saveArtistAlias"
+          />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="artistAliasDialog = false">取消</v-btn>
+          <v-btn color="primary" :disabled="!artistAliasForm.alias.trim()" @click="saveArtistAlias">
+            保存
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="artistMergeDialog" max-width="480">
+      <v-card title="合并歌手">
+        <v-card-text class="dialog-stack">
+          <p class="mb-2">
+            将另一个歌手合并到
+            <strong>{{ artistMergeForm.target_name }}</strong> 中。
+            被合并歌手的全部别名会转移到目标歌手，被合并歌手删除。
+          </p>
+          <v-select
+            v-model.number="artistMergeForm.source_id"
+            :items="artists.filter(a => a.id !== artistMergeForm.target_id).map(a => ({
+              title: `${a.name} (${a.aliases.length} 个别名)`,
+              value: a.id
+            }))"
+            label="被合并的歌手"
+            item-title="title"
+            item-value="value"
+          />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="artistMergeDialog = false">取消</v-btn>
+          <v-btn
+            color="warning"
+            :disabled="!artistMergeForm.source_id"
+            @click="confirmMergeArtists"
+          >
+            合并
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="clearArtistDialog" max-width="420">
+      <v-card title="清空并重建">
+        <v-card-text>
+          确定清空并重建歌手库吗？所有手动添加的别名和合并操作会丢失。
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="clearArtistDialog = false">取消</v-btn>
+          <v-btn color="warning" :loading="artistBuilding" @click="confirmClearAndRebuildArtistLibrary">
+            确定
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-snackbar v-model="snackbar.show" :color="snackbar.color" location="top right">
       {{ snackbar.text }}
     </v-snackbar>
@@ -3761,6 +4033,16 @@ onUnmounted(() => {
 .file-breadcrumb:disabled {
   color: rgba(var(--v-theme-on-surface), 0.72);
   cursor: default;
+}
+
+.alias-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.alias-chip {
+  max-width: 200px;
 }
 
 .file-search {

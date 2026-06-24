@@ -251,3 +251,21 @@ class SystemSetting(TimestampMixin, Base):
 
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
     value: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class Artist(TimestampMixin, Base):
+    __tablename__ = "artists"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(512))
+    normalized_name: Mapped[str] = mapped_column(String(512), index=True)
+    external_ids: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class ArtistAlias(TimestampMixin, Base):
+    __tablename__ = "artist_aliases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    artist_id: Mapped[int] = mapped_column(Integer, index=True)
+    alias: Mapped[str] = mapped_column(String(512), index=True)
+    source: Mapped[str] = mapped_column(String(64), default="manual")

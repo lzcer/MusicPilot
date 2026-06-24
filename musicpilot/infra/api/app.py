@@ -54,6 +54,7 @@ from musicpilot.adapters.music_platforms.spotify import (
     refresh_token_expiry,
     token_expiry,
 )
+from musicpilot.core.artist import ArtistService
 from musicpilot.core.event_bus import EventBus
 from musicpilot.core.events import NotifyEvent, SearchEvent, SearchResult
 from musicpilot.core.metadata import MetadataCascade
@@ -68,6 +69,11 @@ from musicpilot.core.scraping import (
     scraping_config_from_payload,
 )
 from musicpilot.infra.api.schemas import (
+    AddArtistAliasRequest,
+    ArtistAliasResponse,
+    ArtistResponse,
+    BuildArtistLibraryResponse,
+    ClearArtistLibraryResponse,
     DownloadDeleteMode,
     DownloaderCreateRequest,
     DownloaderResponse,
@@ -94,6 +100,7 @@ from musicpilot.infra.api.schemas import (
     MediaFileResponse,
     MediaServerCreateRequest,
     MediaServerResponse,
+    MergeArtistsRequest,
     MetadataSearchResponse,
     MetadataSiteSearchRequest,
     MetadataSiteSearchResponse,
@@ -264,6 +271,7 @@ class AppState:
         self.parser_catalog = load_parser_catalog(settings.indexer_parser_config)
         self.indexers = ()
         self.repository = SqlAlchemyMediaRepository(self.database)
+        self.artist_service = ArtistService(repository=self.repository)
         self.scheduler = SubscriptionScheduler(
             repository=self.repository,
             interval_minutes=settings.subscription_check_interval_minutes,
@@ -287,6 +295,7 @@ class AppState:
         self.scraper = LocalMusicScraper(
             metadata=self.scraping_metadata,
             tag_writer=MutagenTagWriter(),
+            artist_service=self.artist_service,
         )
         self.configured_notifiers: tuple[TelegramHttpNotifier, ...] = ()
         self.bots = self._build_bots(settings)
@@ -494,6 +503,15 @@ def create_app() -> FastAPI:
         await state.database.create_all()
         await state.database.migrate_phase_one_schema()
         await state.migrate_legacy_runtime_config()
+        # Auto-build artist library from existing media files if empty
+        artists = await state.repository.list_all_artists()
+        if not artists:
+            try:
+                created = await state.artist_service.build_library_from_media_files()
+                if created:
+                    state.add_log("artist", f"启动时自动构建歌手库：已创建 {created} 个歌手组。", "INFO")
+            except Exception as exc:  # noqa: BLE001
+                state.add_log("artist", f"自动构建歌手库失败（可稍后手动构建）：{exc}", "WARNING")
         await state.reload_indexers()
         await state.reload_downloader()
         await state.reload_notifiers()
@@ -1612,6 +1630,100 @@ def create_app() -> FastAPI:
             _music_library_track_response(item)
             for item in await state.repository.list_music_library_tracks()
         ]
+
+    # ── Artist API ──────────────────────────────────────────────
+
+    @app.get("/api/artists", response_model=list[ArtistResponse])
+    async def list_artists() -> list[ArtistResponse]:
+        artists = await state.artist_service.list_artists()
+        result = []
+        for artist_info in artists:
+            # Get aliases with sources from DB
+            raw_aliases = await state.repository.list_artist_aliases(artist_info.id)
+            aliases_resp = []
+            seen: set[str] = set()
+            for alias_name in raw_aliases:
+                if alias_name != artist_info.name and alias_name not in seen:
+                    seen.add(alias_name)
+                    aliases_resp.append(
+                        ArtistAliasResponse(alias=alias_name, source="merged")
+                    )
+            result.append(
+                ArtistResponse(
+                    id=artist_info.id,
+                    name=artist_info.name,
+                    normalized_name=artist_info.normalized_name,
+                    aliases=aliases_resp,
+                )
+            )
+        return result
+
+    @app.post("/api/artists/build-library", response_model=BuildArtistLibraryResponse)
+    async def build_artist_library() -> BuildArtistLibraryResponse:
+        try:
+            created = await state.artist_service.build_library_from_media_files()
+            state.add_log(
+                "artist",
+                f"已从曲库自动构建歌手库，共 {created} 个歌手组。",
+                "INFO",
+            )
+            return BuildArtistLibraryResponse(created=created)
+        except Exception as exc:  # noqa: BLE001
+            state.add_log("artist", f"构建歌手库失败：{exc}", "ERROR")
+            raise HTTPException(status_code=502, detail=f"构建失败：{exc}") from exc
+
+    @app.delete("/api/artists", response_model=ClearArtistLibraryResponse)
+    async def clear_artist_library() -> ClearArtistLibraryResponse:
+        deleted_aliases, deleted_artists = await state.repository.clear_all_artists()
+        state.add_log(
+            "artist",
+            f"已清空歌手库：删除 {deleted_aliases} 个别名，{deleted_artists} 个歌手。",
+            "INFO",
+        )
+        return ClearArtistLibraryResponse(
+            deleted_artists=deleted_artists,
+            deleted_aliases=deleted_aliases,
+        )
+
+    @app.post("/api/artists/merge", response_model=ArtistResponse, status_code=200)
+    async def merge_artists(payload: MergeArtistsRequest) -> ArtistResponse:
+        try:
+            artist_info = await state.artist_service.merge_artists(
+                target_id=payload.target_id,
+                source_id=payload.source_id,
+            )
+            state.add_log(
+                "artist",
+                f"已合并歌手 {payload.source_id} → {payload.target_id} ({artist_info.name})",
+                "INFO",
+            )
+            return ArtistResponse(
+                id=artist_info.id,
+                name=artist_info.name,
+                normalized_name=artist_info.normalized_name,
+                aliases=[ArtistAliasResponse(alias=a) for a in artist_info.aliases],
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/artists/alias", status_code=201)
+    async def add_artist_alias(payload: AddArtistAliasRequest) -> dict[str, str]:
+        try:
+            await state.artist_service.add_alias(
+                artist_id=payload.artist_id,
+                alias=payload.alias,
+                source=payload.source,
+            )
+            return {"status": "ok"}
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/artists/check-aliases", response_model=list[str])
+    async def check_artist_aliases(artist: str = "") -> list[str]:
+        aliases = await state.artist_service.get_aliases(artist)
+        if not aliases:
+            return [artist] if artist else []
+        return aliases
 
     @app.get("/api/subscriptions", response_model=list[SubscriptionResponse])
     async def subscriptions() -> list[SubscriptionResponse]:

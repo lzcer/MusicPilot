@@ -8,9 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from opencc import OpenCC
+
+from musicpilot.core.artist import ArtistService, normalize_artist_name
 from musicpilot.core.metadata import MetadataCascade
 from musicpilot.ports.metadata import TrackMetadata
 from musicpilot.ports.tag_writer import TagWriter
+
+_t2s = OpenCC("t2s")  # Traditional → Simplified
 
 ScrapingMode = Literal["source", "mapped", "copy"]
 RequiredMetadata = Literal["album", "artist", "lyrics"]
@@ -99,9 +104,11 @@ class LocalMusicScraper:
         *,
         metadata: MetadataCascade,
         tag_writer: TagWriter | None,
+        artist_service: ArtistService | None = None,
     ) -> None:
         self.metadata = metadata
         self.tag_writer = tag_writer
+        self.artist_service = artist_service
 
     async def process_download(
         self,
@@ -225,6 +232,21 @@ class LocalMusicScraper:
                     0,
                 )
             metadata = _merge_metadata(metadata, looked_up)
+
+        # Resolve artist to canonical name
+        if self.artist_service is not None:
+            canonical = await self.artist_service.get_canonical_name(metadata.artist)
+            if canonical is not None:
+                metadata = TrackMetadata(
+                    title=metadata.title,
+                    artist=canonical,
+                    album=metadata.album,
+                    year=metadata.year,
+                    track_number=metadata.track_number,
+                    lyrics=metadata.lyrics,
+                    cover_url=metadata.cover_url,
+                    extra=metadata.extra,
+                )
 
         duplicate = _find_duplicate_media(
             _duplicate_metadata_candidates(source_metadata, match_metadata, metadata),
@@ -353,10 +375,38 @@ class LocalMusicScraper:
         source_metadata: TrackMetadata,
         match_metadata: TrackMetadata,
     ) -> tuple[TrackMetadata, ...]:
-        searches = [
+        # Build search tuples: (title, artist) from various sources
+        searches: list[tuple[str, str | None]] = []
+        seen_queries: set[tuple[str, str | None]] = set()
+
+        for title, artist in [
             (match_metadata.title, match_metadata.artist),
             (source_metadata.title, source_metadata.artist),
-        ]
+        ]:
+            if not title:
+                continue
+            # Search with each alias of the artist
+            if self.artist_service is not None and artist:
+                aliases = await self.artist_service.get_aliases(artist)
+                for alias in aliases:
+                    query = (title, alias)
+                    if query not in seen_queries:
+                        seen_queries.add(query)
+                        searches.append(query)
+            else:
+                query = (title, artist)
+                if query not in seen_queries:
+                    seen_queries.add(query)
+                    searches.append(query)
+
+        # Also add a pure title search as fallback
+        for title in (match_metadata.title, source_metadata.title):
+            if title:
+                query = (title, None)
+                if query not in seen_queries:
+                    seen_queries.add(query)
+                    searches.append((title, None))
+
         candidates: list[TrackMetadata] = []
         seen: set[tuple[str, str, str]] = set()
         for title, artist in searches:
@@ -365,7 +415,7 @@ class LocalMusicScraper:
             for candidate in await self.metadata.search_metadata(
                 title=title,
                 artist=artist,
-                limit=8,
+                limit=5,
             ):
                 key = (
                     _normalize_match_text(candidate.title),
@@ -722,15 +772,41 @@ def _strip_track_prefix(value: str) -> str:
     return re.sub(r"^\s*(?:cd\s*)?\d{1,3}(?:[.\-_、\s]+)", "", value, flags=re.I).strip()
 
 
+_MATCH_SCORE_THRESHOLD = 1  # Minimum total score to accept a candidate
+
+
 def _select_metadata_candidate(
     existing: TrackMetadata,
     candidates: tuple[TrackMetadata, ...],
     required: tuple[RequiredMetadata, ...],
 ) -> TrackMetadata | None:
+    """Select the best metadata candidate using scoring.
+
+    Scores all candidates by title/artist/album match against the existing
+    metadata. Returns the highest-scoring candidate that fills required
+    fields, if its score meets the minimum threshold.
+    """
+    if not candidates:
+        return None
+
+    scored: list[tuple[int, TrackMetadata]] = []
     for candidate in candidates:
-        if _candidate_fills_required(existing, candidate, required):
-            return candidate
-    return None
+        if not _candidate_fills_required(existing, candidate, required):
+            continue
+        score = _metadata_match_score(existing, candidate)
+        scored.append((score.total, candidate))
+
+    if not scored:
+        return None
+
+    # Sort by score descending, then pick the best
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_total, best_candidate = scored[0]
+
+    if best_total < _MATCH_SCORE_THRESHOLD:
+        return None
+
+    return best_candidate
 
 
 def _candidate_fills_required(
@@ -785,14 +861,22 @@ def _best_candidate_score_text(
 
 def _metadata_match_score(existing: TrackMetadata, scraped: TrackMetadata) -> _MatchScore:
     title_score = _match_score(existing.title, scraped.title)
-    artist_score = _match_artist(existing.artist or existing.title, scraped.artist)
-    album_score = _match_score(existing.album or existing.title, scraped.album)
+    artist_score = _match_artist(existing.artist, scraped.artist)
+    album_score = _match_score(existing.album, scraped.album)
+
+    # Strong penalty: existing artist known but candidate artist doesn't match
     if existing.artist and artist_score == 0:
-        artist_score = -2
-    if not existing.artist and artist_score >= 1 and title_score >= 1:
-        title_score = 2
-    if title_score == 0:
-        return _MatchScore(title=0, artist=artist_score, album=album_score)
+        # Check if the existing artist actually had a value, not just blank
+        if existing.artist.strip():
+            artist_score = -3
+
+    # Title mismatch means the whole candidate is suspect
+    if title_score < 2 and existing.title:
+        # Even a partial title match is better than nothing for the fallback case
+        pass
+
+    # If artist is unknown but title matches, that might be OK — but
+    # a complete mismatch of everything means this candidate is wrong
     return _MatchScore(title=title_score, artist=artist_score, album=album_score)
 
 
@@ -809,7 +893,7 @@ def _match_score(left: str | None, right: str | None) -> int:
 
 
 def _match_artist(left: str | None, right: str | None) -> int:
-    if not right:
+    if not left or not right:
         return 0
     return max(_match_score(left, item) for item in re.split(r"[,，、/&]+", right))
 
@@ -817,7 +901,11 @@ def _match_artist(left: str | None, right: str | None) -> int:
 def _normalize_match_text(value: str | None) -> str:
     if not value:
         return ""
+    # Remove content in brackets/parens (version info, quality tags)
     text = re.sub(r"\[[^\]]+\]|\([^\)]*\)", " ", value)
+    # Traditional \u2192 Simplified
+    text = _t2s.convert(text)
+    # Keep only alphanumeric and CJK
     text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", text)
     return text.casefold()
 

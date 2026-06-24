@@ -483,3 +483,35 @@ class MusicLibraryTrackResponse(BaseModel):
     duration: int | None = None
     size: int | None = None
     year: int | None = None
+
+
+class ArtistAliasResponse(BaseModel):
+    alias: str
+    source: str = "manual"
+
+
+class ArtistResponse(BaseModel):
+    id: int
+    name: str
+    normalized_name: str
+    aliases: list[ArtistAliasResponse] = Field(default_factory=list)
+
+
+class BuildArtistLibraryResponse(BaseModel):
+    created: int
+
+
+class ClearArtistLibraryResponse(BaseModel):
+    deleted_artists: int
+    deleted_aliases: int
+
+
+class MergeArtistsRequest(BaseModel):
+    target_id: int
+    source_id: int
+
+
+class AddArtistAliasRequest(BaseModel):
+    artist_id: int
+    alias: str = Field(min_length=1)
+    source: str = "user"
