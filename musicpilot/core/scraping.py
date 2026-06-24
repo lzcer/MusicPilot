@@ -36,6 +36,24 @@ _AUDIO_EXTENSIONS = {
     ".wma",
 }
 
+# Patterns for stripping noise from directory/filename metadata
+# These are quality tags, format info, source info, etc.
+_DIR_NOISE_RE = re.compile(
+    r"(?:"
+    r"\[[^\]]*?(?:FLAC|MP3|WAV|ALAC|APE|AAC|DSD|SACD|Hi.?Res|"
+    r"24.?[Bb]it|96[kK][Hh]z|192[kK][Hh]z|"
+    r"320|320[kK]bps|无损|CD|BD|WEB|H.?DT?S|LP|Vinyl|"
+    r"Limited.?Edition|Deluxe|豪华版|台版|日版|欧版|引进版"
+    r")[^\]]*\]|"  # [24bit 96kHz FLAC]
+    r"\([^)]*?(?:FLAC|MP3|WAV|ALAC|APE|AAC|DSD|SACD|Hi.?Res|"
+    r"24.?[Bb]it|96[kK][Hh]z|192[kK][Hh]z|"
+    r"320|无损|CD|BD|WEB|H.?DT?S|LP|Vinyl"
+    r")[^)]*\)"  # (24bit 96kHz FLAC)
+    r")",
+    re.I,
+)
+_ARTIST_SEP_RE = re.compile(r"\s+[–—\-|/]\s+")
+
 
 @dataclass(frozen=True, slots=True)
 class ScrapingConfig:
@@ -134,6 +152,12 @@ class LocalMusicScraper:
         updated_files = 0
         moved_files = 0
         results: list[ScrapingFileResult] = []
+
+        # Batch-infer metadata from directory structure
+        dir_inferred: dict[Path, TrackMetadata] = {}
+        if audio_files:
+            dir_inferred = await asyncio.to_thread(_infer_batch_metadata, audio_files)
+
         for source_file in audio_files:
             try:
                 result, mapped, updated, moved = await self._process_file(
@@ -141,6 +165,7 @@ class LocalMusicScraper:
                     config,
                     library_tracks,
                     media_history,
+                    dir_inferred=dir_inferred,
                 )
             except Exception as exc:
                 try:
@@ -176,13 +201,15 @@ class LocalMusicScraper:
         config: ScrapingConfig,
         library_tracks: tuple[LibraryTrackSnapshot, ...],
         media_history: tuple[LibraryTrackSnapshot, ...],
+        dir_inferred: dict[Path, TrackMetadata] | None = None,
     ) -> tuple[ScrapingFileResult, int, int, int]:
         working_file = source_file
         mapped_files = 0
         updated_files = 0
         moved_files = 0
         source_metadata = await asyncio.to_thread(read_track_metadata, source_file)
-        match_metadata = _metadata_for_matching(source_metadata, source_file)
+        dir_meta = (dir_inferred or {}).get(source_file)
+        match_metadata = _metadata_for_matching(source_metadata, source_file, dir_meta=dir_meta)
         needs_update = _metadata_missing(source_metadata, config.required_metadata)
         metadata = _merge_metadata(source_metadata, match_metadata)
         candidate_count = 0
@@ -516,6 +543,131 @@ def _input_audio_files(source_files: tuple[Path, ...]) -> list[Path]:
     return files
 
 
+@dataclass(frozen=True, slots=True)
+class _DirInferredInfo:
+    """Metadata inferred from directory structure analysis."""
+    artist: str | None = None
+    album: str | None = None
+
+
+def _infer_batch_metadata(source_files: list[Path]) -> dict[Path, TrackMetadata]:
+    """Infer metadata from directory structure for a batch of source files.
+
+    Analyzes parent directory names to extract artist/album info when
+    individual file tags are empty. Supports patterns such as:
+
+      周杰伦/七里香/01. 七里香.flac
+      ArtistName/AlbumName/01 - Title.flac
+      2014 周杰伦 - 哎呦，不错哦[24bit 96kHz FLAC]/10. 聽爸爸的話.flac
+
+    Uses cross-file validation within the same directory to increase confidence.
+    """
+    # Group files by immediate parent directory
+    dir_groups: dict[Path, list[Path]] = {}
+    for f in source_files:
+        parent = f.parent
+        if parent not in dir_groups:
+            dir_groups[parent] = []
+        dir_groups[parent].append(f)
+
+    # For each directory, infer artist/album from the directory name
+    dir_info: dict[Path, _DirInferredInfo] = {}
+    for dir_path, children in dir_groups.items():
+        info = _analyze_directory(dir_path, children)
+        dir_info[dir_path] = info
+
+    # Build per-file result: merge inferred dir info with filename-derived title
+    result: dict[Path, TrackMetadata] = {}
+    for f in source_files:
+        parent = f.parent
+        info = dir_info.get(parent, _DirInferredInfo())
+
+        # Extract title from filename (with track prefix stripped)
+        stem = f.stem
+        title_no_track = _strip_track_prefix(stem)
+
+        # Check if filename also carries artist (e.g. "Artist - Title")
+        parsed = _parse_artist_title(title_no_track)
+        if parsed is not None:
+            file_artist, file_title = parsed
+            # File-level artist overrides dir-level inference
+            result[f] = TrackMetadata(
+                title=file_title,
+                artist=file_artist,
+                album=info.album,
+            )
+        else:
+            result[f] = TrackMetadata(
+                title=title_no_track or stem,
+                artist=info.artist,
+                album=info.album,
+            )
+
+    return result
+
+
+def _analyze_directory(dir_path: Path, children: list[Path]) -> _DirInferredInfo:
+    """Analyze a single directory name and its child files for metadata.
+
+    Returns inferred artist/album or None if the directory name is not
+    informative (e.g. root directories, generic names).
+    """
+    dir_name = dir_path.name.strip()
+    if not dir_name or dir_name in {".", "..", "downloads", "music", "library"}:
+        return _DirInferredInfo()
+
+    # Strip noise
+    cleaned = _DIR_NOISE_RE.sub("", dir_name).strip()
+    if not cleaned:
+        cleaned = dir_name
+
+    # Strip leading year patterns: "2014 周杰伦 - 哎呦" → "周杰伦 - 哎呦"
+    cleaned = re.sub(r"^\d{4}\s+", "", cleaned).strip()
+
+    # Try "Artist - Album" pattern
+    parts = _ARTIST_SEP_RE.split(cleaned, maxsplit=1)
+    if len(parts) == 2:
+        artist_part = parts[0].strip()
+        album_part = parts[1].strip()
+
+        # Validate: artist part shouldn't look like a generic word or noise
+        if artist_part and len(artist_part) >= 1:
+            return _DirInferredInfo(artist=artist_part, album=album_part)
+
+    # No artist separator found. Always check grandparent as potential artist,
+    # then decide whether current dir is an album or standalone artist dir.
+    grandparent = dir_path.parent.name.strip()
+    grandparent_valid = (
+        grandparent
+        and grandparent not in {".", "..", "downloads", "source", "mapped"}
+    )
+
+    if grandparent_valid:
+        gp_cleaned = _DIR_NOISE_RE.sub("", grandparent).strip()
+        gp_cleaned = re.sub(r"^\d{4}\s+", "", gp_cleaned).strip()
+        gp_parts = _ARTIST_SEP_RE.split(gp_cleaned, maxsplit=1)
+        if len(gp_parts) == 2:
+            # Grandparent has "Artist - Album"
+            return _DirInferredInfo(artist=gp_parts[0].strip(), album=cleaned)
+        elif gp_cleaned and len(gp_cleaned) >= 2:
+            # Grandparent is the artist, current dir is the album
+            return _DirInferredInfo(artist=gp_cleaned, album=cleaned)
+
+    # No grandparent or grandparent not usable. Try to determine if current
+    # dir is an artist name or album name by checking child stems.
+    child_stems = [c.stem for c in children]
+    match_count = sum(
+        1 for s in child_stems
+        if _normalize_match_text(cleaned) in _normalize_match_text(s)
+    )
+    if children and match_count / len(children) >= 0.5:
+        # Dir name matches child stems → it's an album
+        return _DirInferredInfo(artist=None, album=cleaned)
+
+    # Default: the dir name is the artist name (and also album)
+    return _DirInferredInfo(artist=cleaned, album=cleaned)
+
+
 def _audio_files(path: Path) -> list[Path]:
     if path.is_file() and path.suffix.casefold() in _AUDIO_EXTENSIONS:
         return [path]
@@ -736,23 +888,51 @@ def _metadata_missing(metadata: TrackMetadata, required: tuple[RequiredMetadata,
     return False
 
 
-def _metadata_for_matching(metadata: TrackMetadata, source_file: Path) -> TrackMetadata:
+def _metadata_for_matching(
+    metadata: TrackMetadata,
+    source_file: Path,
+    dir_meta: TrackMetadata | None = None,
+) -> TrackMetadata:
+    """Build a matching metadata by pulling info from multiple sources.
+
+    Priority:
+    1. File tags (already in `metadata`)
+    2. Directory structure inference (`dir_meta`)
+    3. Filename parsing (`Artist - Title`)
+    """
     if metadata.artist:
         return metadata
+
+    # Try filename parsing first
     parsed = _parse_artist_title(metadata.title) or _parse_artist_title(source_file.stem)
-    if parsed is None:
-        return metadata
-    artist, title = parsed
-    return TrackMetadata(
-        title=title,
-        artist=artist,
-        album=metadata.album,
-        year=metadata.year,
-        track_number=metadata.track_number,
-        lyrics=metadata.lyrics,
-        cover_url=metadata.cover_url,
-        extra=metadata.extra,
-    )
+    if parsed is not None:
+        artist, title = parsed
+        album = metadata.album or (dir_meta.album if dir_meta else None)
+        return TrackMetadata(
+            title=title,
+            artist=artist,
+            album=album,
+            year=metadata.year,
+            track_number=metadata.track_number,
+            lyrics=metadata.lyrics,
+            cover_url=metadata.cover_url,
+            extra=metadata.extra,
+        )
+
+    # Fall back to directory-inferred metadata
+    if dir_meta is not None and (dir_meta.artist or dir_meta.album):
+        return TrackMetadata(
+            title=metadata.title,
+            artist=dir_meta.artist,
+            album=dir_meta.album or metadata.album,
+            year=metadata.year,
+            track_number=metadata.track_number,
+            lyrics=metadata.lyrics,
+            cover_url=metadata.cover_url,
+            extra=metadata.extra,
+        )
+
+    return metadata
 
 
 def _parse_artist_title(value: str | None) -> tuple[str, str] | None:
