@@ -397,6 +397,12 @@ class PlaylistDownloadResponse(BaseModel):
     playlist_id: int
 
 
+class PlaylistTrackDownloadResponse(BaseModel):
+    status: str
+    playlist_id: int
+    track_id: int
+
+
 class ProxySettings(BaseModel):
     host: str = ""
     port: int = Field(default=0, ge=0, le=65535)

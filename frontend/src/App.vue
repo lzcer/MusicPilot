@@ -384,6 +384,7 @@ const playlistLoading = ref(false)
 const availablePlaylistLoading = ref(false)
 const playlistTrackLoading = ref(false)
 const playlistDownloading = ref(false)
+const playlistTrackDownloadingIds = ref<number[]>([])
 const deleting = ref(false)
 const downloadDeleting = ref(false)
 const mediaDeleting = ref(false)
@@ -1403,6 +1404,10 @@ async function viewPlaylist(playlist: Playlist) {
   selectedPlaylist.value = playlist
   playlistTracks.value = []
   playlistTracksDialog.value = true
+  await loadPlaylistTracks(playlist)
+}
+
+async function loadPlaylistTracks(playlist: Playlist) {
   playlistTrackLoading.value = true
   try {
     playlistTracks.value = await api<PlaylistTrack[]>(`/api/playlists/${playlist.id}/tracks`)
@@ -1436,6 +1441,30 @@ async function downloadPlaylist(playlist: Playlist) {
     notify(error instanceof Error ? error.message : '歌单下载失败', 'error')
   } finally {
     playlistDownloading.value = false
+  }
+}
+
+function isPlaylistTrackDownloading(trackId: number) {
+  return playlistTrackDownloadingIds.value.includes(trackId)
+}
+
+async function downloadPlaylistTrack(track: PlaylistTrack) {
+  const playlist = selectedPlaylist.value
+  if (!playlist || isPlaylistTrackDownloading(track.id)) return
+  playlistTrackDownloadingIds.value = [...playlistTrackDownloadingIds.value, track.id]
+  try {
+    await api(`/api/playlists/${playlist.id}/tracks/${track.id}/download`, {
+      method: 'POST'
+    })
+    playlistTracks.value = playlistTracks.value.map((item) =>
+      item.id === track.id ? { ...item, download_status: 'searching', last_error: null } : item
+    )
+    await Promise.all([loadPlaylistTracks(playlist), loadDownloads()])
+    notify('单曲下载任务已开始')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '单曲下载失败', 'error')
+  } finally {
+    playlistTrackDownloadingIds.value = playlistTrackDownloadingIds.value.filter((id) => id !== track.id)
   }
 }
 
@@ -2553,19 +2582,19 @@ onUnmounted(() => {
             </div>
             <v-card>
               <v-progress-linear v-if="playlistLoading" indeterminate color="primary" />
-              <v-table>
+              <v-table class="playlist-table fixed-table">
                 <thead>
                   <tr>
-                    <th>歌单</th>
-                    <th>平台</th>
-                    <th>歌曲</th>
-                    <th>已存在</th>
-                    <th>等待</th>
-                    <th>已提交</th>
-                    <th>失败</th>
-                    <th>状态</th>
-                    <th>最近同步</th>
-                    <th>操作</th>
+                    <th class="playlist-name-col">歌单</th>
+                    <th class="playlist-platform-col">平台</th>
+                    <th class="count-col">歌曲</th>
+                    <th class="count-col">已存在</th>
+                    <th class="count-col">等待</th>
+                    <th class="count-col">已提交</th>
+                    <th class="count-col">失败</th>
+                    <th class="status-col">状态</th>
+                    <th class="time-col">最近同步</th>
+                    <th class="sticky-action-col playlist-action-col">操作</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -2582,13 +2611,17 @@ onUnmounted(() => {
                           class="playlist-cover"
                           loading="lazy"
                         />
-                        <div>
-                          <div>{{ playlist.name }}</div>
-                          <div class="muted">{{ playlist.owner_name || '-' }}</div>
+                        <div class="playlist-title-text">
+                          <div class="truncate-text" :title="playlist.name">{{ playlist.name }}</div>
+                          <div class="muted truncate-text" :title="playlist.owner_name || '-'">
+                            {{ playlist.owner_name || '-' }}
+                          </div>
                         </div>
                       </div>
                     </td>
-                    <td>{{ playlistPlatformLabel(playlist.platform) }}</td>
+                    <td class="truncate-cell" :title="playlistPlatformLabel(playlist.platform)">
+                      {{ playlistPlatformLabel(playlist.platform) }}
+                    </td>
                     <td>{{ playlist.track_count }}</td>
                     <td>{{ playlist.existing_count }}</td>
                     <td>{{ playlist.waiting_count }}</td>
@@ -2599,8 +2632,10 @@ onUnmounted(() => {
                         {{ playlistStatusText(playlist.status) }}
                       </v-chip>
                     </td>
-                    <td>{{ formatOptionalTime(playlist.last_synced_at) }}</td>
-                    <td>
+                    <td class="truncate-cell" :title="formatOptionalTime(playlist.last_synced_at)">
+                      {{ formatOptionalTime(playlist.last_synced_at) }}
+                    </td>
+                    <td class="sticky-action-col playlist-action-col">
                       <v-btn
                         icon="mdi-eye-outline"
                         color="primary"
@@ -3190,30 +3225,32 @@ onUnmounted(() => {
       <v-card :title="selectedPlaylist ? selectedPlaylist.name : '歌单明细'">
         <v-card-text>
           <v-progress-linear v-if="playlistTrackLoading" indeterminate color="primary" />
-          <v-table>
+          <v-table class="playlist-track-table fixed-table">
             <thead>
               <tr>
-                <th>#</th>
-                <th>歌曲</th>
-                <th>艺人</th>
-                <th>专辑</th>
-                <th>时长</th>
-                <th>音乐库</th>
-                <th>下载状态</th>
-                <th>错误</th>
+                <th class="track-position-col">#</th>
+                <th class="track-title-col">歌曲</th>
+                <th class="track-artist-col">艺人</th>
+                <th class="track-album-col">专辑</th>
+                <th class="track-duration-col">时长</th>
+                <th class="track-error-col">错误</th>
+                <th class="sticky-track-col sticky-track-library-col">音乐库</th>
+                <th class="sticky-track-col sticky-track-status-col">下载状态</th>
+                <th class="sticky-track-col sticky-track-download-col">下载</th>
               </tr>
             </thead>
             <tbody>
               <tr v-if="!playlistTracks.length && !playlistTrackLoading">
-                <td colspan="8" class="empty-cell">暂无歌曲</td>
+                <td colspan="9" class="empty-cell">暂无歌曲</td>
               </tr>
               <tr v-for="track in playlistTracks" :key="track.id">
                 <td>{{ track.position }}</td>
-                <td>{{ track.title }}</td>
-                <td>{{ track.artist || '-' }}</td>
-                <td>{{ track.album || '-' }}</td>
+                <td class="truncate-cell" :title="track.title">{{ track.title }}</td>
+                <td class="truncate-cell" :title="track.artist || '-'">{{ track.artist || '-' }}</td>
+                <td class="truncate-cell" :title="track.album || '-'">{{ track.album || '-' }}</td>
                 <td>{{ formatDuration(track.duration ? Math.round(track.duration / 1000) : null) }}</td>
-                <td>
+                <td class="truncate-cell" :title="track.last_error || '-'">{{ track.last_error || '-' }}</td>
+                <td class="sticky-track-col sticky-track-library-col">
                   <v-icon
                     v-if="track.exists_in_library"
                     icon="mdi-check-circle"
@@ -3223,7 +3260,7 @@ onUnmounted(() => {
                   />
                   <span v-else>-</span>
                 </td>
-                <td>
+                <td class="sticky-track-col sticky-track-status-col">
                   <v-chip
                     :color="playlistTrackStatusColor(track.download_status)"
                     size="small"
@@ -3232,7 +3269,18 @@ onUnmounted(() => {
                     {{ playlistTrackStatusText(track.download_status) }}
                   </v-chip>
                 </td>
-                <td>{{ track.last_error || '-' }}</td>
+                <td class="sticky-track-col sticky-track-download-col">
+                  <v-btn
+                    icon="mdi-download"
+                    color="primary"
+                    variant="text"
+                    size="small"
+                    title="下载"
+                    :loading="isPlaylistTrackDownloading(track.id)"
+                    :disabled="track.exists_in_library"
+                    @click="downloadPlaylistTrack(track)"
+                  />
+                </td>
               </tr>
             </tbody>
           </v-table>
@@ -3547,15 +3595,20 @@ onUnmounted(() => {
   align-items: center;
   display: flex;
   gap: 12px;
-  min-width: 260px;
+  min-width: 0;
 }
 
 .playlist-cover {
+  flex: 0 0 44px;
   aspect-ratio: 1;
   border-radius: 6px;
   height: 44px;
   object-fit: cover;
   width: 44px;
+}
+
+.playlist-title-text {
+  min-width: 0;
 }
 
 .playlist-cover-placeholder {
@@ -3570,6 +3623,113 @@ onUnmounted(() => {
   color: rgba(var(--v-theme-on-surface), 0.62);
   font-size: 12px;
   line-height: 18px;
+}
+
+.fixed-table :deep(.v-table__wrapper) {
+  overflow-x: auto;
+}
+
+.fixed-table :deep(table) {
+  table-layout: fixed;
+}
+
+.fixed-table :deep(th),
+.fixed-table :deep(td) {
+  white-space: nowrap;
+}
+
+.playlist-table :deep(table) {
+  min-width: 1160px;
+}
+
+.playlist-name-col {
+  width: 300px;
+}
+
+.playlist-platform-col {
+  width: 110px;
+}
+
+.count-col {
+  width: 72px;
+}
+
+.status-col {
+  width: 96px;
+}
+
+.time-col {
+  width: 180px;
+}
+
+.playlist-action-col {
+  min-width: 220px;
+  right: 0;
+  text-align: center;
+  width: 220px;
+}
+
+.sticky-action-col,
+.sticky-track-col {
+  background: rgb(var(--v-theme-surface));
+  box-shadow: -1px 0 0 rgba(var(--v-border-color), var(--v-border-opacity));
+  position: sticky;
+  z-index: 2;
+}
+
+.fixed-table :deep(thead) .sticky-action-col,
+.fixed-table :deep(thead) .sticky-track-col {
+  z-index: 3;
+}
+
+.truncate-cell,
+.truncate-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.playlist-track-table :deep(table) {
+  min-width: 1180px;
+}
+
+.track-position-col {
+  width: 56px;
+}
+
+.track-title-col {
+  width: 260px;
+}
+
+.track-artist-col,
+.track-album-col {
+  width: 180px;
+}
+
+.track-duration-col {
+  width: 76px;
+}
+
+.track-error-col {
+  width: 230px;
+}
+
+.sticky-track-library-col {
+  right: 182px;
+  text-align: center;
+  width: 72px;
+}
+
+.sticky-track-status-col {
+  right: 72px;
+  text-align: center;
+  width: 110px;
+}
+
+.sticky-track-download-col {
+  right: 0;
+  text-align: center;
+  width: 72px;
 }
 
 .select-cell {

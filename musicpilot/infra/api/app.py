@@ -113,6 +113,7 @@ from musicpilot.infra.api.schemas import (
     PlaylistImportUrlPreviewResponse,
     PlaylistImportUrlRequest,
     PlaylistResponse,
+    PlaylistTrackDownloadResponse,
     PlaylistTrackResponse,
     QBittorrentWebhookRequest,
     SearchRequest,
@@ -281,6 +282,7 @@ class AppState:
         self.oauth_states: dict[str, str] = {}
         self.playlist_import_previews: dict[str, PublicPlaylist] = {}
         self.playlist_download_tasks: dict[int, asyncio.Task[None]] = {}
+        self.playlist_track_download_tasks: dict[int, asyncio.Task[None]] = {}
         self.scraping_metadata = MetadataCascade([MultiSourceMusicProvider()])
         self.scraper = LocalMusicScraper(
             metadata=self.scraping_metadata,
@@ -510,9 +512,13 @@ def create_app() -> FastAPI:
             state.metadata_site_search_worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await state.metadata_site_search_worker
-        for task in state.playlist_download_tasks.values():
+        playlist_tasks = (
+            *state.playlist_download_tasks.values(),
+            *state.playlist_track_download_tasks.values(),
+        )
+        for task in playlist_tasks:
             task.cancel()
-        for task in state.playlist_download_tasks.values():
+        for task in playlist_tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         for bot in state.bots:
@@ -1330,6 +1336,11 @@ def create_app() -> FastAPI:
         task = state.playlist_download_tasks.pop(playlist_id, None)
         if task is not None:
             task.cancel()
+        tracks = await state.repository.list_playlist_tracks(playlist_id)
+        for track in tracks:
+            track_task = state.playlist_track_download_tasks.pop(track.id, None)
+            if track_task is not None:
+                track_task.cancel()
         deleted = await state.repository.delete_playlist(playlist_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Playlist not found.")
@@ -1398,6 +1409,38 @@ def create_app() -> FastAPI:
         )
         state.playlist_download_tasks[playlist_id] = task
         return PlaylistDownloadResponse(status="started", playlist_id=playlist_id)
+
+    @app.post(
+        "/api/playlists/{playlist_id}/tracks/{track_id}/download",
+        response_model=PlaylistTrackDownloadResponse,
+    )
+    async def download_playlist_track(
+        playlist_id: int,
+        track_id: int,
+    ) -> PlaylistTrackDownloadResponse:
+        playlist = await state.repository.get_playlist(playlist_id)
+        if playlist is None:
+            raise HTTPException(status_code=404, detail="Playlist not found.")
+        track = await state.repository.get_playlist_track(track_id)
+        if track is None or track.playlist_id != playlist_id:
+            raise HTTPException(status_code=404, detail="Playlist track not found.")
+        current = state.playlist_track_download_tasks.get(track_id)
+        if current is not None and not current.done():
+            return PlaylistTrackDownloadResponse(
+                status="running",
+                playlist_id=playlist_id,
+                track_id=track_id,
+            )
+        task = asyncio.create_task(
+            _download_single_playlist_track(state, playlist_id, track_id),
+            name=f"musicpilot-playlist-track-download-{track_id}",
+        )
+        state.playlist_track_download_tasks[track_id] = task
+        return PlaylistTrackDownloadResponse(
+            status="started",
+            playlist_id=playlist_id,
+            track_id=track_id,
+        )
 
     @app.get("/api/logs", response_model=list[LogEntryResponse])
     async def logs(limit: int = 200) -> list[LogEntryResponse]:
@@ -2040,6 +2083,18 @@ async def _download_playlist_tracks(state: AppState, playlist_id: int) -> None:
         state.playlist_download_tasks.pop(playlist_id, None)
 
 
+async def _download_single_playlist_track(
+    state: AppState,
+    playlist_id: int,
+    track_id: int,
+) -> None:
+    try:
+        await _download_playlist_track(state, track_id)
+        await _refresh_playlist_library_matches(state, playlist_id)
+    finally:
+        state.playlist_track_download_tasks.pop(track_id, None)
+
+
 async def _download_playlist_track(state: AppState, track_id: int) -> None:
     track = await state.repository.get_playlist_track(track_id)
     if track is None:
@@ -2066,18 +2121,19 @@ async def _download_playlist_track(state: AppState, track_id: int) -> None:
             last_download_attempt_at=datetime.now(UTC),
             last_error=None,
         )
-        result = await _best_playlist_download_result(state, track)
-        if result is None:
+        matched = await _best_playlist_download_result(state, track)
+        if matched is None:
             await state.repository.update_playlist_track(
                 track.id,
                 download_status="not_found",
                 last_error="No artist-matched torrent result found.",
             )
             return
+        result, media = matched
         task = await _create_and_submit_download_task(
             state,
             resource=_search_result_response(result).model_dump(),
-            media_metadata=_playlist_media_metadata(track),
+            media_metadata=media.model_dump(),
             selected_site_ids=[],
             category="MusicPilot",
         )
@@ -2098,20 +2154,64 @@ async def _download_playlist_track(state: AppState, track_id: int) -> None:
 async def _best_playlist_download_result(
     state: AppState,
     track: PlaylistTrack,
-) -> SearchResult | None:
+) -> tuple[SearchResult, MediaCandidateResponse] | None:
     if not state.indexers:
         return None
-    groups = await asyncio.gather(
-        *(_search_indexer(indexer, track.title, 50) for indexer in state.indexers),
-        return_exceptions=True,
-    )
-    raw_results: list[SearchResult] = []
-    for group in groups:
-        if isinstance(group, Exception):
-            state.add_log("playlist", f"Playlist track search failed: {group}", "WARNING")
+    candidates = await _playlist_media_candidates(state, track)
+    for media in candidates:
+        result = await _best_metadata_download_result(state, media)
+        if result is not None:
+            return result, media
+    return None
+
+
+async def _playlist_media_candidates(
+    state: AppState,
+    track: PlaylistTrack,
+) -> list[MediaCandidateResponse]:
+    query = " ".join(part for part in (track.title, track.artist) if part).strip()
+    candidates: list[MediaCandidate] = []
+    for provider in state.metadata.providers:
+        search = getattr(provider, "search", None)
+        if search is None:
             continue
-        raw_results.extend(group[1])
-    filtered = _filter_by_artist(_dedupe_results(raw_results), track.artist)
+        try:
+            provider_candidates = await search(query, limit=25)
+        except Exception as exc:  # noqa: BLE001
+            state.add_log("playlist", f"Playlist metadata search failed: {exc}", "WARNING")
+            continue
+        candidates.extend(provider_candidates)
+        if len(candidates) >= 25:
+            break
+    aggregated = _aggregate_media_candidates(candidates, limit=10)
+    matched = [
+        candidate
+        for candidate in aggregated
+        if _artist_matches(candidate.artist, track.artist)
+    ]
+    fallback = _playlist_media_candidate(track)
+    return (matched or aggregated or [fallback])[:10]
+
+
+async def _best_metadata_download_result(
+    state: AppState,
+    media: MediaCandidateResponse,
+) -> SearchResult | None:
+    keywords = _metadata_search_keywords(media)
+    if not keywords:
+        return None
+    raw_results: list[SearchResult] = []
+    for keyword in keywords:
+        groups = await asyncio.gather(
+            *(_search_indexer(indexer, keyword, 50) for indexer in state.indexers),
+            return_exceptions=True,
+        )
+        for group in groups:
+            if isinstance(group, Exception):
+                state.add_log("playlist", f"Playlist track search failed: {group}", "WARNING")
+                continue
+            raw_results.extend(group[1])
+    filtered = _filter_by_artist(_dedupe_results(raw_results), media.artist)
     ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)
     return ranked[0] if ranked else None
 
@@ -2157,14 +2257,15 @@ async def _create_and_submit_download_task(
     return updated or task
 
 
-def _playlist_media_metadata(track: PlaylistTrack) -> dict[str, Any]:
-    return {
-        "title": track.title,
-        "artist": track.artist,
-        "album": track.album,
-        "source": track.platform,
-        "external_id": track.external_id,
-    }
+def _playlist_media_candidate(track: PlaylistTrack) -> MediaCandidateResponse:
+    return MediaCandidateResponse(
+        title=track.title,
+        artist=track.artist,
+        album=track.album,
+        albums=[track.album] if track.album else [],
+        source=track.platform,
+        external_id=track.external_id,
+    )
 
 
 def _oauth_html(title: str, message: str, *, status_code: int = 200) -> HTMLResponse:
@@ -2530,6 +2631,23 @@ def _filter_by_artist(results: list[SearchResult], artist: str | None) -> list[S
         for item in results
         if _normalized_contains(_resource_text(item), needle, compact_needle)
     ]
+
+
+def _artist_matches(value: str | None, artist: str | None) -> bool:
+    if not artist:
+        return True
+    if not value:
+        return False
+    needle = normalize_search_text(artist)
+    haystack = normalize_search_text(value)
+    return (
+        _normalized_contains(haystack, needle, _compact_search_text(needle))
+        or _normalized_contains(
+            needle,
+            haystack,
+            _compact_search_text(haystack),
+        )
+    )
 
 
 def _resource_text(result: SearchResult) -> str:
