@@ -9,6 +9,7 @@ FROM python:3.12-slim AS runtime
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PYTHONMALLOC=malloc \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     MP_DATABASE_URL=sqlite+aiosqlite:////data/musicpilot.db \

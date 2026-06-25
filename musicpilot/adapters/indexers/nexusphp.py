@@ -57,6 +57,11 @@ class NexusPHPCrawler:
     def name(self) -> str:
         return self.config.name
 
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
     async def search(self, query: str, *, limit: int = 20) -> tuple[SearchResult, ...]:
         headers = self._headers()
 

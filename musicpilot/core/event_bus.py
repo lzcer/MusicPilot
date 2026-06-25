@@ -9,11 +9,20 @@ from musicpilot.core.events import Event
 class EventBus:
     """Single-process async event bus backed by asyncio.Queue."""
 
-    def __init__(self, maxsize: int = 0) -> None:
+    def __init__(self, maxsize: int = 1000) -> None:
         self._queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=maxsize)
 
     async def publish(self, event: Event) -> None:
-        await self._queue.put(event)
+        try:
+            self._queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # Queue is at capacity — discard oldest event to make room
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+            except asyncio.QueueEmpty:
+                pass
+            self._queue.put_nowait(event)
 
     async def next(self) -> Event:
         return await self._queue.get()

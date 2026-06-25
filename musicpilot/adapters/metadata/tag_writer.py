@@ -29,6 +29,7 @@ def _write_tags_sync(
         if audio.tags is None:
             audio.add_tags()
     except Exception:
+        audio.close()
         return
 
     _set_tag(audio, "title", metadata.title)
@@ -45,6 +46,7 @@ def _write_tags_sync(
     if metadata.lyrics:
         _set_tag(audio, "lyrics", metadata.lyrics)
     audio.save()
+    audio.close()
     if metadata.lyrics:
         _write_lyrics_sync(path, metadata.lyrics)
     if cover is not None:
@@ -102,27 +104,26 @@ def _write_cover_sync(path: Path, cover_data: bytes, mime: str) -> None:
     audio = MutagenFile(path)
     if audio is None:
         return
-    if isinstance(audio, MP3):
-        if audio.tags is None:
-            audio.add_tags()
-        audio.tags.delall("APIC")
-        audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=cover_data))
+    try:
+        if isinstance(audio, MP3):
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags.delall("APIC")
+            audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=cover_data))
+        elif isinstance(audio, FLAC):
+            picture = Picture()
+            picture.type = 3
+            picture.mime = mime
+            picture.desc = "Cover"
+            picture.data = cover_data
+            audio.clear_pictures()
+            audio.add_picture(picture)
+        elif isinstance(audio, MP4):
+            image_format = MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
+            audio["covr"] = [MP4Cover(cover_data, imageformat=image_format)]
         audio.save()
-        return
-    if isinstance(audio, FLAC):
-        picture = Picture()
-        picture.type = 3
-        picture.mime = mime
-        picture.desc = "Cover"
-        picture.data = cover_data
-        audio.clear_pictures()
-        audio.add_picture(picture)
-        audio.save()
-        return
-    if isinstance(audio, MP4):
-        image_format = MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
-        audio["covr"] = [MP4Cover(cover_data, imageformat=image_format)]
-        audio.save()
+    finally:
+        audio.close()
 
 
 def _write_lyrics_sync(path: Path, lyrics: str) -> None:
@@ -137,17 +138,16 @@ def _write_lyrics_sync(path: Path, lyrics: str) -> None:
     audio = MutagenFile(path)
     if audio is None:
         return
-    if isinstance(audio, MP3):
-        if audio.tags is None:
-            audio.add_tags()
-        audio.tags.delall("USLT")
-        audio.tags.add(USLT(encoding=3, lang="eng", desc="", text=lyrics))
+    try:
+        if isinstance(audio, MP3):
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags.delall("USLT")
+            audio.tags.add(USLT(encoding=3, lang="eng", desc="", text=lyrics))
+        elif isinstance(audio, FLAC | OggVorbis | OggOpus):
+            audio["LYRICS"] = [lyrics]
+        elif isinstance(audio, MP4):
+            audio["\xa9lyr"] = [lyrics]
         audio.save()
-        return
-    if isinstance(audio, FLAC | OggVorbis | OggOpus):
-        audio["LYRICS"] = [lyrics]
-        audio.save()
-        return
-    if isinstance(audio, MP4):
-        audio["\xa9lyr"] = [lyrics]
-        audio.save()
+    finally:
+        audio.close()

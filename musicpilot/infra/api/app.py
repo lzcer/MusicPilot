@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import unicodedata
 from collections import deque
 from collections.abc import AsyncIterator
@@ -392,7 +393,9 @@ class AppState:
         self.spotify = SpotifyClient()
         self.public_playlist_importer = PublicPlaylistImporter()
         self.oauth_states: dict[str, str] = {}
+        self._oauth_state_ttl: dict[str, float] = {}
         self.playlist_import_previews: dict[str, PublicPlaylist] = {}
+        self._preview_ttl: dict[str, float] = {}
         self.playlist_download_tasks: dict[int, asyncio.Task[None]] = {}
         self.playlist_track_download_tasks: dict[int, asyncio.Task[None]] = {}
         self.artist_build_lock = asyncio.Lock()
@@ -571,6 +574,18 @@ class AppState:
                 "category": category,
             }
         )
+
+    @staticmethod
+    def _prune_expired(
+        data: dict[str, object],
+        ttl_map: dict[str, float],
+        ttl_seconds: float,
+    ) -> None:
+        now = time.time()
+        expired = [k for k, t in ttl_map.items() if now - t > ttl_seconds]
+        for k in expired:
+            data.pop(k, None)
+            ttl_map.pop(k, None)
 
 
 class AppLogHandler(logging.Handler):
@@ -1255,7 +1270,9 @@ def create_app() -> FastAPI:
             scopes=list(SPOTIFY_PLAYLIST_SCOPES),
         )
         oauth_state = token_urlsafe(24)
+        AppState._prune_expired(state.oauth_states, state._oauth_state_ttl, 600)
         state.oauth_states[oauth_state] = connection.id
+        state._oauth_state_ttl[oauth_state] = time.time()
         authorization_url = state.spotify.authorization_url(
             client_id=connection.client_id,
             redirect_uri=connection.redirect_uri,
@@ -1280,7 +1297,9 @@ def create_app() -> FastAPI:
         if connection.platform != "spotify":
             raise HTTPException(status_code=422, detail="Unsupported music platform.")
         oauth_state = token_urlsafe(24)
+        AppState._prune_expired(state.oauth_states, state._oauth_state_ttl, 600)
         state.oauth_states[oauth_state] = connection.id
+        state._oauth_state_ttl[oauth_state] = time.time()
         authorization_url = state.spotify.authorization_url(
             client_id=connection.client_id,
             redirect_uri=connection.redirect_uri,
@@ -1307,6 +1326,7 @@ def create_app() -> FastAPI:
                 status_code=400,
             )
         connection_id = state.oauth_states.pop(oauth_state, None)
+        state._oauth_state_ttl.pop(oauth_state, None)
         if connection_id is None:
             return _oauth_html(
                 "Spotify authorization failed",
@@ -1451,13 +1471,17 @@ def create_app() -> FastAPI:
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"歌单页面请求失败：{exc}") from exc
         import_token = token_urlsafe(24)
+        AppState._prune_expired(state.playlist_import_previews, state._preview_ttl, 1800)
         state.playlist_import_previews[import_token] = parsed
+        state._preview_ttl[import_token] = time.time()
         return [_playlist_url_preview_response(import_token, parsed)]
 
     @app.post("/api/playlists/import-url", response_model=PlaylistImportResponse, status_code=201)
     async def import_playlist_url(payload: PlaylistImportUrlRequest) -> PlaylistImportResponse:
         import_token = payload.import_token.strip()
         parsed = state.playlist_import_previews.pop(import_token, None) if import_token else None
+        if parsed is not None:
+            state._preview_ttl.pop(import_token, None)
         if parsed is None:
             url = payload.url.strip()
             if not url:
@@ -4371,10 +4395,12 @@ async def _refresh_library_for_task(state: AppState, task: TorrentRecord) -> Non
     if refreshed is not None:
         await _sync_playlist_tracks_for_download_task(state, refreshed)
     state.add_log("library", f"Media library refresh requested: {task.name}")
-    asyncio.create_task(
+    _fire_sync = asyncio.create_task(
         _sync_music_library_after_refresh(state),
         name="musicpilot-music-library-sync-after-refresh",
     )
+    state._background_tasks.add(_fire_sync)
+    _fire_sync.add_done_callback(state._background_tasks.discard)
     await _send_event_notifications(state, "library", refreshed or task)
 
 
