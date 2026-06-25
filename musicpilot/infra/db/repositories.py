@@ -115,7 +115,7 @@ class SqlAlchemyMediaRepository:
         *,
         torrent_hash: str,
         save_path: Path | None,
-    ) -> None:
+    ) -> TorrentRecord:
         async with self.database.session() as session:
             result = await session.execute(
                 select(TorrentRecord).where(TorrentRecord.torrent_hash == torrent_hash)
@@ -132,6 +132,8 @@ class SqlAlchemyMediaRepository:
             record.progress = 1.0
             record.save_path = str(save_path) if save_path is not None else None
             await session.commit()
+            await session.refresh(record)
+            return record
 
     async def list_downloaders(self) -> list[DownloaderConfig]:
         async with self.database.session() as session:
@@ -693,6 +695,18 @@ class SqlAlchemyMediaRepository:
             await session.refresh(row)
             return row
 
+    async def list_playlist_tracks_by_torrent_record(
+        self,
+        task_id: int,
+    ) -> list[PlaylistTrack]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(PlaylistTrack)
+                .where(PlaylistTrack.torrent_record_id == task_id)
+                .order_by(PlaylistTrack.playlist_id, PlaylistTrack.position, PlaylistTrack.id)
+            )
+            return list(result.scalars().all())
+
     async def playlist_track_counts(self, playlist_id: int) -> dict[str, int]:
         tracks = await self.list_playlist_tracks(playlist_id)
         counts: dict[str, int] = {
@@ -705,11 +719,17 @@ class SqlAlchemyMediaRepository:
         for track in tracks:
             if track.exists_in_library or track.download_status == "existing":
                 counts["existing_count"] += 1
-            if track.download_status == "waiting":
+            if track.download_status in {"waiting", "queue"}:
                 counts["waiting_count"] += 1
-            if track.download_status == "submitted":
+            if track.download_status in {
+                "submitted",
+                "downloading",
+                "completed",
+                "refreshing_library",
+                "library_refreshed",
+            }:
                 counts["submitted_count"] += 1
-            if track.download_status in {"failed", "not_found"}:
+            if track.download_status in {"failed", "not_found", "deleted"}:
                 counts["failed_count"] += 1
         return counts
 

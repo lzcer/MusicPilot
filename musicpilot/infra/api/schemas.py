@@ -441,14 +441,20 @@ class ScrapingSettings(BaseModel):
     duplicate_handling: Literal["ignore", "overwrite", "keep_largest"] = "ignore"
 
 
+class SearchSettings(BaseModel):
+    exclude_keywords: str = ""
+
+
 class SystemSettingsRequest(BaseModel):
     proxy: ProxySettings = Field(default_factory=ProxySettings)
     scraping: ScrapingSettings = Field(default_factory=ScrapingSettings)
+    search: SearchSettings = Field(default_factory=SearchSettings)
 
 
 class SystemSettingsResponse(BaseModel):
     proxy: ProxySettings = Field(default_factory=ProxySettings)
     scraping: ScrapingSettings = Field(default_factory=ScrapingSettings)
+    search: SearchSettings = Field(default_factory=SearchSettings)
 
 
 class LogEntryResponse(BaseModel):

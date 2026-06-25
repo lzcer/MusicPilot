@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
 from secrets import compare_digest, token_urlsafe
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import quote, unquote, urlparse
 from uuid import uuid4
 
@@ -55,7 +55,7 @@ from musicpilot.adapters.music_platforms.spotify import (
     refresh_token_expiry,
     token_expiry,
 )
-from musicpilot.core.artist import ArtistService
+from musicpilot.core.artist import ArtistService, normalize_artist_name
 from musicpilot.core.event_bus import EventBus
 from musicpilot.core.events import NotifyEvent, SearchEvent, SearchResult
 from musicpilot.core.metadata import MetadataCascade
@@ -284,11 +284,96 @@ class MetadataSiteSearchTask:
             queue.put_nowait((event, payload))
 
 
+@dataclasses.dataclass(slots=True)
+class ArtistDownloadJob:
+    label: str
+    runner: Callable[[], Awaitable[str]]
+    future: asyncio.Future[str]
+
+
+class ArtistDownloadQueue:
+    def __init__(self, log: Callable[[str, str, str], None]) -> None:
+        self._log = log
+        self._queues: dict[str, deque[ArtistDownloadJob]] = {}
+        self._workers: dict[str, asyncio.Task[None]] = {}
+
+    async def submit(
+        self,
+        artist_key: str,
+        label: str,
+        runner: Callable[[], Awaitable[str]],
+    ) -> str:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        queue = self._queues.setdefault(artist_key, deque())
+        queue.append(ArtistDownloadJob(label=label, runner=runner, future=future))
+        self._log(
+            "playlist",
+            f"Artist queue enqueued: artist_key={artist_key}, position={len(queue)}, job={label}",
+            "INFO",
+        )
+        if artist_key not in self._workers or self._workers[artist_key].done():
+            self._workers[artist_key] = asyncio.create_task(
+                self._run_artist_queue(artist_key),
+                name=f"musicpilot-artist-download-{artist_key}",
+            )
+        return await future
+
+    async def stop(self) -> None:
+        workers = tuple(self._workers.values())
+        for worker in workers:
+            worker.cancel()
+        for worker in workers:
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
+        self._queues.clear()
+        self._workers.clear()
+
+    async def _run_artist_queue(self, artist_key: str) -> None:
+        try:
+            while True:
+                queue = self._queues.get(artist_key)
+                if not queue:
+                    return
+                job = queue.popleft()
+                if job.future.cancelled():
+                    continue
+                self._log(
+                    "playlist",
+                    f"Artist queue started: artist_key={artist_key}, remaining={len(queue)}, job={job.label}",
+                    "INFO",
+                )
+                try:
+                    result = await job.runner()
+                except Exception as exc:  # noqa: BLE001
+                    if not job.future.done():
+                        job.future.set_exception(exc)
+                    self._log(
+                        "playlist",
+                        f"Artist download job failed: artist={artist_key}, job={job.label}, error={exc}",
+                        "ERROR",
+                    )
+                else:
+                    if not job.future.done():
+                        job.future.set_result(result)
+                    self._log(
+                        "playlist",
+                        f"Artist queue finished: artist_key={artist_key}, status={result}, remaining={len(queue)}, job={job.label}",
+                        "INFO",
+                    )
+        finally:
+            if not self._queues.get(artist_key):
+                self._queues.pop(artist_key, None)
+            if self._workers.get(artist_key) is asyncio.current_task():
+                self._workers.pop(artist_key, None)
+
+
 class AppState:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.logs: deque[dict[str, str]] = deque(maxlen=500)
         self.log_handler = AppLogHandler(self.logs)
+        self.artist_download_queue = ArtistDownloadQueue(self.add_log)
         self.event_bus = EventBus()
         self.database = Database(settings.database_url)
         self.parser_catalog = load_parser_catalog(settings.indexer_parser_config)
@@ -543,6 +628,7 @@ def create_app() -> FastAPI:
         await state.reload_indexers()
         await state.reload_downloader()
         await state.reload_notifiers()
+        await _restore_playlist_download_tasks(state)
         state.pipeline.start()
         state.start_download_polling()
         state.start_music_library_sync()
@@ -567,6 +653,7 @@ def create_app() -> FastAPI:
         for task in playlist_tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        await state.artist_download_queue.stop()
         for bot in state.bots:
             await bot.stop()
         state.scheduler.stop()
@@ -605,6 +692,8 @@ def create_app() -> FastAPI:
     async def search(payload: SearchRequest) -> SearchResponse:
         state.add_log("search", f"Search started: {payload.query}")
         results = await state.pipeline.search(SearchEvent(payload.query, limit=payload.limit))
+        exclude = await _get_exclude_keywords(state)
+        results = _filter_by_exclude_keywords(results, exclude)
         state.add_log("search", f"Search completed: {payload.query}, {len(results)} result(s)")
         return SearchResponse(
             query=payload.query,
@@ -670,6 +759,8 @@ def create_app() -> FastAPI:
                     continue
                 raw_results.extend(group[1])
         merged = _dedupe_results(raw_results)
+        exclude = await _get_exclude_keywords(state)
+        merged = _filter_by_exclude_keywords(merged, exclude)
         filtered = _filter_by_artist(merged, payload.media.artist)
         ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[: payload.limit]
         state.add_log(
@@ -870,6 +961,8 @@ def create_app() -> FastAPI:
                     status_code=502,
                     detail=f"Download task external delete failed: {exc}",
                 ) from exc
+        _cancel_download_task_item_scraping(state, task_id)
+        await _mark_playlist_tracks_for_deleted_download_task(state, task_id)
         deleted = await state.repository.delete_download_task(task_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Download task not found.")
@@ -1456,12 +1549,17 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Playlist not found.")
         current = state.playlist_download_tasks.get(playlist_id)
         if current is not None and not current.done():
+            state.add_log("playlist", f"Playlist download already running: playlist_id={playlist_id}")
             return PlaylistDownloadResponse(status="running", playlist_id=playlist_id)
         await state.repository.update_playlist(
             playlist_id,
             status="downloading",
             last_download_started_at=datetime.now(UTC),
             last_error=None,
+        )
+        state.add_log(
+            "playlist",
+            f"Playlist download requested: playlist_id={playlist_id}, name={playlist.name}",
         )
         task = asyncio.create_task(
             _download_playlist_tracks(state, playlist_id),
@@ -1486,11 +1584,19 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Playlist track not found.")
         current = state.playlist_track_download_tasks.get(track_id)
         if current is not None and not current.done():
+            state.add_log(
+                "playlist",
+                f"Playlist track download already running: playlist_id={playlist_id}, track={_playlist_track_log_text(track)}",
+            )
             return PlaylistTrackDownloadResponse(
                 status="running",
                 playlist_id=playlist_id,
                 track_id=track_id,
             )
+        state.add_log(
+            "playlist",
+            f"Playlist track download requested: playlist_id={playlist_id}, track={_playlist_track_log_text(track)}",
+        )
         task = asyncio.create_task(
             _download_single_playlist_track(state, playlist_id, track_id),
             name=f"musicpilot-playlist-track-download-{track_id}",
@@ -1809,10 +1915,11 @@ def create_app() -> FastAPI:
             if payload is None or payload.download_path is None
             else Path(payload.download_path)
         )
-        await state.repository.mark_torrent_completed(
+        task = await state.repository.mark_torrent_completed(
             torrent_hash=torrent_hash,
             save_path=download_path,
         )
+        await _sync_playlist_tracks_for_download_task(state, task)
         state.add_log("transfer", f"Download completed webhook accepted: {torrent_hash}")
         return {"status": "accepted", "torrent_hash": torrent_hash}
 
@@ -2184,6 +2291,24 @@ async def _refresh_playlist_library_matches(
     return updated
 
 
+async def _restore_playlist_download_tasks(state: AppState) -> None:
+    restored = 0
+    for playlist in await state.repository.list_playlists():
+        if playlist.status != "downloading":
+            continue
+        current = state.playlist_download_tasks.get(playlist.id)
+        if current is not None and not current.done():
+            continue
+        task = asyncio.create_task(
+            _download_playlist_tracks(state, playlist.id),
+            name=f"musicpilot-playlist-download-restore-{playlist.id}",
+        )
+        state.playlist_download_tasks[playlist.id] = task
+        restored += 1
+    if restored:
+        state.add_log("playlist", f"Restored {restored} playlist download queue(s).")
+
+
 def _match_library_track(
     title: str,
     artist: str | None,
@@ -2241,30 +2366,86 @@ def _download_task_item_titles(item: TorrentRecordItem) -> list[str]:
     return [value for value in values if value]
 
 
+def _playlist_track_log_text(track: PlaylistTrack) -> str:
+    return (
+        "{"
+        f"id={track.id}, title={track.title!r}, artist={track.artist!r}, "
+        f"album={track.album!r}, status={track.download_status!r}, "
+        f"torrent_record_id={track.torrent_record_id!r}"
+        "}"
+    )
+
+
+def _media_candidate_log_text(media: MediaCandidateResponse) -> str:
+    return (
+        "{"
+        f"title={media.title!r}, artist={media.artist!r}, "
+        f"album={media.album!r}, source={media.source!r}"
+        "}"
+    )
+
+
+def _search_result_log_text(result: SearchResult) -> str:
+    return (
+        "{"
+        f"title={result.title!r}, source={result.source!r}, "
+        f"seeders={result.seeders}, size_bytes={result.size_bytes}"
+        "}"
+    )
+
+
 async def _download_playlist_tracks(state: AppState, playlist_id: int) -> None:
     try:
+        playlist = await state.repository.get_playlist(playlist_id)
+        playlist_name = playlist.name if playlist is not None else str(playlist_id)
+        state.add_log(
+            "playlist",
+            f"Playlist download started: playlist_id={playlist_id}, name={playlist_name}",
+        )
         await _refresh_playlist_library_matches(state, playlist_id)
         tracks = await state.repository.list_playlist_tracks(playlist_id)
+        state.add_log(
+            "playlist",
+            f"Playlist tracks checked: playlist_id={playlist_id}, total={len(tracks)}",
+        )
         for track in tracks:
             if track.exists_in_library:
                 await state.repository.update_playlist_track(
-                    track.id,
-                    download_status="existing",
-                    last_error=None,
+                    track.id, download_status="existing", last_error=None,
                 )
-            else:
+                state.add_log(
+                    "playlist",
+                    f"Playlist track skipped, already in library: {_playlist_track_log_text(track)}",
+                )
+            elif track.download_status not in (
+                "submitted",
+                "downloading",
+                "completed",
+                "refreshing_library",
+                "library_refreshed",
+            ):
                 await state.repository.update_playlist_track(
-                    track.id,
-                    download_status="waiting",
-                    last_error=None,
+                    track.id, download_status="waiting", last_error=None,
                 )
 
         waiting_tracks = await state.repository.list_playlist_tracks(playlist_id)
-        for track in waiting_tracks:
-            if track.download_status != "waiting":
-                continue
-            await _download_playlist_track(state, track.id)
+        waiting_count = sum(1 for track in waiting_tracks if track.download_status == "waiting")
+        state.add_log(
+            "playlist",
+            f"Playlist tracks enqueueing: playlist_id={playlist_id}, waiting={waiting_count}",
+        )
+        jobs = [
+            _enqueue_playlist_track_download(state, playlist_id, track.id)
+            for track in waiting_tracks
+            if track.download_status == "waiting"
+        ]
+        if jobs:
+            await asyncio.gather(*jobs)
         await state.repository.update_playlist(playlist_id, status="synced", last_error=None)
+        state.add_log(
+            "playlist",
+            f"Playlist download finished: playlist_id={playlist_id}, name={playlist_name}",
+        )
     except Exception as exc:  # noqa: BLE001
         await state.repository.update_playlist(playlist_id, status="failed", last_error=str(exc))
         state.add_log("playlist", f"Playlist download failed: {playlist_id}, {exc}", "ERROR")
@@ -2278,16 +2459,64 @@ async def _download_single_playlist_track(
     track_id: int,
 ) -> None:
     try:
-        await _download_playlist_track(state, track_id)
+        await _enqueue_playlist_track_download(state, playlist_id, track_id)
         await _refresh_playlist_library_matches(state, playlist_id)
     finally:
         state.playlist_track_download_tasks.pop(track_id, None)
 
 
-async def _download_playlist_track(state: AppState, track_id: int) -> None:
+async def _enqueue_playlist_track_download(
+    state: AppState,
+    playlist_id: int,
+    track_id: int,
+) -> str:
     track = await state.repository.get_playlist_track(track_id)
     if track is None:
-        return
+        return "failed"
+    state.add_log("playlist", f"Playlist track preparing queue: {_playlist_track_log_text(track)}")
+    if not track.exists_in_library and track.download_status not in {
+        "submitted",
+        "downloading",
+        "completed",
+        "refreshing_library",
+        "library_refreshed",
+    }:
+        await state.repository.update_playlist_track(
+            track.id,
+            download_status="queue",
+            last_checked_at=datetime.now(UTC),
+            last_error=None,
+        )
+    artist_key = await _playlist_track_artist_queue_key(state, track)
+    state.add_log(
+        "playlist",
+        f"Playlist track queued: artist_key={artist_key}, playlist_id={playlist_id}, track={_playlist_track_log_text(track)}",
+    )
+    return await state.artist_download_queue.submit(
+        artist_key,
+        f"playlist={playlist_id}, track={track_id}, title={track.title}, artist={track.artist or ''}",
+        lambda: _check_and_download_playlist_track(state, track_id),
+    )
+
+
+async def _playlist_track_artist_queue_key(state: AppState, track: PlaylistTrack) -> str:
+    artist = (track.artist or "").strip()
+    if not artist:
+        return f"track:{track.id}"
+    canonical = await state.artist_service.get_canonical_name(artist)
+    normalized = normalize_artist_name(canonical or artist)
+    compact = _compact_search_text(normalized)
+    return compact or f"track:{track.id}"
+
+
+async def _check_and_download_playlist_track(
+    state: AppState, track_id: int,
+) -> str:
+    track = await state.repository.get_playlist_track(track_id)
+    if track is None:
+        return "failed"
+    state.add_log("playlist", f"Playlist track processing: {_playlist_track_log_text(track)}")
+
     library_tracks = await state.repository.list_music_library_tracks()
     match = _match_library_track(track.title, track.artist, library_tracks)
     if match is not None:
@@ -2299,73 +2528,124 @@ async def _download_playlist_track(state: AppState, track_id: int) -> None:
             last_checked_at=datetime.now(UTC),
             last_error=None,
         )
-        return
+        state.add_log(
+            "playlist",
+            f"Playlist track exists in library: track={_playlist_track_log_text(track)}, library_id={match.id}",
+        )
+        return "existing"
+
     active_item = await _match_active_download_task_item(state, track.title, track.artist)
     if active_item is not None:
-        await state.repository.update_playlist_track(
-            track.id,
-            exists_in_library=False,
-            matched_library_track_id=None,
-            download_status="submitted",
-            torrent_record_id=active_item.torrent_record_id,
-            last_checked_at=datetime.now(UTC),
-            last_download_attempt_at=datetime.now(UTC),
-            last_error=f"Already downloading in task #{active_item.torrent_record_id}.",
-        )
-        return
+        task = await state.repository.get_download_task(active_item.torrent_record_id)
+        if task is not None:
+            await _bind_playlist_track_to_task(
+                state,
+                track.id,
+                task,
+                last_error=f"已绑定到下载任务 #{task.id}。",
+            )
+            state.add_log(
+                "playlist",
+                f"Playlist track bound to existing task: track={_playlist_track_log_text(track)}, task_id={task.id}, item_id={active_item.id}, task_status={task.status}",
+            )
+            return _playlist_download_status_for_task(task)
+
+    return await _execute_playlist_download(state, track)
+
+
+async def _execute_playlist_download(
+    state: AppState, track: PlaylistTrack,
+) -> str:
     try:
         await state.repository.update_playlist_track(
             track.id,
-            exists_in_library=False,
-            matched_library_track_id=None,
             download_status="searching",
             last_checked_at=datetime.now(UTC),
             last_download_attempt_at=datetime.now(UTC),
             last_error=None,
         )
-        matched = await _best_playlist_download_result(state, track)
-        if matched is None:
+        state.add_log("playlist", f"Playlist track search started: {_playlist_track_log_text(track)}")
+        candidates = await _playlist_download_results(state, track)
+        state.add_log(
+            "playlist",
+            f"Playlist track search completed: track={_playlist_track_log_text(track)}, candidates={len(candidates)}",
+        )
+        if not candidates:
             await state.repository.update_playlist_track(
                 track.id,
                 download_status="not_found",
                 last_error="No artist-matched torrent result found.",
             )
-            return
-        result, media = matched
-        task = await _create_and_submit_download_task(
-            state,
-            resource=_search_result_response(result).model_dump(),
-            media_metadata=media.model_dump(),
-            selected_site_ids=[],
-            category="MusicPilot",
-            playlist_track_id=track.id,
-        )
+            state.add_log(
+                "playlist",
+                f"Playlist track not found, no torrent candidates: {_playlist_track_log_text(track)}",
+                "WARNING",
+            )
+            return "not_found"
+        last_error: str | None = None
+        for index, (result, media) in enumerate(candidates, start=1):
+            state.add_log(
+                "playlist",
+                f"Playlist candidate trying: track={_playlist_track_log_text(track)}, index={index}/{len(candidates)}, media={_media_candidate_log_text(media)}, result={_search_result_log_text(result)}",
+            )
+            try:
+                task = await _try_playlist_candidate_download(state, track, result, media)
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+                state.add_log(
+                    "playlist",
+                    f"Playlist candidate skipped for {track.title}: {exc}",
+                    "WARNING",
+                )
+                continue
+            if task is not None:
+                return _playlist_download_status_for_task(task)
         await state.repository.update_playlist_track(
             track.id,
-            download_status="submitted",
-            torrent_record_id=task.id,
-            last_error=None,
+            download_status="not_found",
+            last_error=last_error or "No candidate torrent contains the target track.",
         )
+        state.add_log(
+            "playlist",
+            f"Playlist track not found in candidate torrents: track={_playlist_track_log_text(track)}, tried={len(candidates)}, last_error={last_error or ''}",
+            "WARNING",
+        )
+        return "not_found"
     except Exception as exc:  # noqa: BLE001
         await state.repository.update_playlist_track(
             track.id,
             download_status="failed",
             last_error=str(exc),
         )
+        state.add_log(
+            "playlist",
+            f"Playlist track download failed: track={_playlist_track_log_text(track)}, error={exc}",
+            "ERROR",
+        )
+        return "failed"
 
 
-async def _best_playlist_download_result(
+async def _playlist_download_results(
     state: AppState,
     track: PlaylistTrack,
-) -> tuple[SearchResult, MediaCandidateResponse] | None:
+) -> list[tuple[SearchResult, MediaCandidateResponse]]:
     if not state.indexers:
-        return None
-    candidates = await _playlist_media_candidates(state, track)
-    for media in candidates:
-        result = await _best_metadata_download_result(state, media)
-        if result is not None:
-            return result, media
-    return None
+        return []
+    results: list[tuple[SearchResult, MediaCandidateResponse]] = []
+    seen: set[tuple[str, str]] = set()
+    for media in await _playlist_media_candidates(state, track):
+        media_results = await _metadata_download_results(state, media)
+        state.add_log(
+            "playlist",
+            f"Playlist media candidate results: track={_playlist_track_log_text(track)}, media={_media_candidate_log_text(media)}, results={len(media_results)}",
+        )
+        for result in media_results:
+            key = result.identity_key
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append((result, media))
+    return results
 
 
 async def _playlist_media_candidates(
@@ -2393,18 +2673,23 @@ async def _playlist_media_candidates(
         if _artist_matches(candidate.artist, track.artist)
     ]
     fallback = _playlist_media_candidate(track)
+    state.add_log(
+        "playlist",
+        f"Playlist metadata candidates: track={_playlist_track_log_text(track)}, raw={len(candidates)}, aggregated={len(aggregated)}, artist_matched={len(matched)}",
+    )
     return (matched or aggregated or [fallback])[:10]
 
 
-async def _best_metadata_download_result(
+async def _metadata_download_results(
     state: AppState,
     media: MediaCandidateResponse,
-) -> SearchResult | None:
+) -> list[SearchResult]:
     keywords = _metadata_search_keywords(media)
     if not keywords:
-        return None
+        return []
     raw_results: list[SearchResult] = []
     for keyword in keywords:
+        keyword_count = 0
         groups = await asyncio.gather(
             *(_search_indexer(indexer, keyword, 50) for indexer in state.indexers),
             return_exceptions=True,
@@ -2413,59 +2698,287 @@ async def _best_metadata_download_result(
             if isinstance(group, Exception):
                 state.add_log("playlist", f"Playlist track search failed: {group}", "WARNING")
                 continue
+            keyword_count += len(group[1])
             raw_results.extend(group[1])
-    filtered = _filter_by_artist(_dedupe_results(raw_results), media.artist)
+        state.add_log(
+            "search",
+            f"Playlist site search keyword completed: media={_media_candidate_log_text(media)}, keyword={keyword}, raw={keyword_count}",
+        )
+    deduped = _dedupe_results(raw_results)
+    exclude = await _get_exclude_keywords(state)
+    deduped = _filter_by_exclude_keywords(deduped, exclude)
+    filtered = _filter_by_artist(deduped, media.artist)
     ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)
-    return ranked[0] if ranked else None
+    state.add_log(
+        "search",
+        f"Playlist site search completed: media={_media_candidate_log_text(media)}, raw={len(raw_results)}, deduped={len(deduped)}, artist_filtered={len(filtered)}",
+    )
+    return ranked
 
 
-async def _create_and_submit_download_task(
+async def _try_playlist_candidate_download(
     state: AppState,
-    *,
+    track: PlaylistTrack,
+    result: SearchResult,
+    media: MediaCandidateResponse,
+) -> TorrentRecord | None:
+    resource = _search_result_response(result).model_dump()
+    state.add_log(
+        "playlist",
+        f"Playlist candidate task creating: track={_playlist_track_log_text(track)}, result={_search_result_log_text(result)}",
+    )
+    task = await state.repository.create_download_task(
+        resource=resource,
+        media_metadata=media.model_dump(),
+        selected_site_ids=[],
+        category="MusicPilot",
+    )
+    try:
+        torrent_data = await _download_playlist_candidate_torrent_file(state, resource)
+        state.add_log(
+            "playlist",
+            f"Playlist candidate torrent downloaded: task={task.id}, bytes={len(torrent_data)}, title={task.name}",
+        )
+        item_ids = await _record_submitted_torrent_items(
+            state,
+            task.id,
+            torrent_data,
+            playlist_track_id=None,
+        )
+        state.add_log(
+            "playlist",
+            f"Playlist candidate torrent parsed: task={task.id}, audio_items={len(item_ids)}, track={_playlist_track_log_text(track)}",
+        )
+        if not item_ids:
+            state.add_log(
+                "playlist",
+                f"Playlist candidate has no audio items: task={task.id}, title={task.name}",
+                "WARNING",
+            )
+            await state.repository.delete_download_task(task.id)
+            return None
+        submitted = await _scrape_playlist_candidate_items(
+            state,
+            task,
+            track,
+            resource,
+            torrent_data,
+            item_ids,
+        )
+        if submitted is None:
+            state.add_log(
+                "playlist",
+                f"Playlist candidate rejected: task={task.id}, track={track.title}",
+            )
+            await state.repository.delete_download_task(task.id)
+        return submitted
+    except Exception:
+        await state.repository.delete_download_task(task.id)
+        raise
+
+
+async def _download_playlist_candidate_torrent_file(
+    state: AppState,
     resource: dict[str, Any],
-    media_metadata: dict[str, Any],
-    selected_site_ids: list[str],
-    category: str,
-    playlist_track_id: int | None = None,
+) -> bytes:
+    download_url = str(resource.get("download_url") or "")
+    site = await _match_torrent_site(state, resource, [])
+    if site is None:
+        raise RuntimeError("Playlist download requires a parsable torrent file.")
+    state.add_log(
+        "playlist",
+        f"Playlist candidate torrent downloading: site={site.name}, title={resource.get('title') or ''}",
+    )
+    return await _download_torrent_file(download_url, site)
+
+
+async def _scrape_playlist_candidate_items(
+    state: AppState,
+    task: TorrentRecord,
+    track: PlaylistTrack,
+    resource: dict[str, Any],
+    torrent_data: bytes,
+    item_ids: list[int],
+) -> TorrentRecord | None:
+    submitted_task: TorrentRecord | None = None
+    submit_lock = asyncio.Lock()
+    state.add_log(
+        "playlist",
+        f"Playlist candidate pre-scraping started: task={task.id}, items={len(item_ids)}, track={_playlist_track_log_text(track)}",
+    )
+
+    async def scrape_one(item_id: int) -> None:
+        nonlocal submitted_task
+        item = await _scrape_download_task_item(state, item_id)
+        if item is None or not _download_task_item_matches_playlist_track(item, track):
+            return
+        state.add_log(
+            "playlist",
+            f"Playlist candidate target matched: task={task.id}, item_id={item.id}, track={_playlist_track_log_text(track)}, item_title={item.metadata_title or item.parsed_title or item.file_name}",
+        )
+        async with submit_lock:
+            if submitted_task is not None:
+                return
+            updated_item = await state.repository.update_download_task_item(
+                item.id,
+                playlist_track_id=track.id,
+            )
+            submitted_task = await _submit_playlist_candidate_to_downloader(
+                state,
+                task,
+                resource,
+                torrent_data,
+            )
+            await _bind_playlist_track_to_task(state, track.id, submitted_task, last_error=None)
+            state.add_log(
+                "playlist",
+                "Playlist candidate accepted: "
+                f"task={submitted_task.id}, track={track.title}, item={updated_item.id if updated_item else item.id}",
+            )
+
+    results = await asyncio.gather(
+        *(scrape_one(item_id) for item_id in item_ids),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, Exception):
+            state.add_log(
+                "playlist",
+                f"Playlist candidate item scrape failed: task={task.id}, error={result}",
+                "WARNING",
+            )
+    if submitted_task is None:
+        state.add_log(
+            "playlist",
+            f"Playlist candidate pre-scraping completed without target: task={task.id}, track={_playlist_track_log_text(track)}",
+        )
+    return submitted_task
+
+
+async def _submit_playlist_candidate_to_downloader(
+    state: AppState,
+    task: TorrentRecord,
+    resource: dict[str, Any],
+    torrent_data: bytes,
 ) -> TorrentRecord:
     if state.downloader is None:
         await state.reload_downloader()
     if state.downloader is None:
         raise RuntimeError("No downloader is configured.")
-    task = await state.repository.create_download_task(
-        resource=resource,
-        media_metadata=media_metadata,
-        selected_site_ids=selected_site_ids,
+    category = str((task.payload or {}).get("category") or "MusicPilot")
+    state.add_log(
+        "playlist",
+        f"Playlist candidate submitting to downloader: task={task.id}, category={category}, title={task.name}",
+    )
+    torrent_hash = await state.downloader.add_torrent_file(
+        torrent_data,
+        filename=_torrent_filename(resource, str(resource.get("download_url") or "")),
         category=category,
     )
-    try:
-        submitted = await _submit_torrent_to_downloader(
-            state,
-            resource,
-            selected_site_ids,
-            category,
-        )
-    except Exception as exc:  # noqa: BLE001
-        await state.repository.update_download_task(task.id, status="failed", last_error=str(exc))
-        raise
     default_downloader = await state.repository.default_downloader()
-    changes: dict[str, object] = {
-        "status": "submitted",
-        "downloader_id": default_downloader.id if default_downloader else None,
-        "submitted_at": datetime.now(UTC),
-    }
-    if submitted.torrent_hash:
-        changes["torrent_hash"] = submitted.torrent_hash
-    updated = await state.repository.update_download_task(task.id, **changes)
-    item_ids = await _record_submitted_torrent_items(
-        state,
-        (updated or task).id,
-        submitted.torrent_data,
-        playlist_track_id=playlist_track_id,
+    updated = await state.repository.update_download_task(
+        task.id,
+        status="submitted",
+        downloader_id=default_downloader.id if default_downloader else None,
+        submitted_at=datetime.now(UTC),
+        torrent_hash=torrent_hash,
     )
-    _schedule_download_task_item_scraping(state, (updated or task).id, item_ids)
     await _send_event_notifications(state, "download", updated or task)
+    state.add_log(
+        "playlist",
+        f"Playlist candidate submitted to downloader: task={task.id}, torrent_hash={torrent_hash}",
+    )
     return updated or task
+
+
+def _download_task_item_matches_playlist_track(
+    item: TorrentRecordItem,
+    track: PlaylistTrack,
+) -> bool:
+    if not _artist_matches(item.metadata_artist or item.artist, track.artist):
+        return False
+    normalized_title = normalize_search_text(track.title)
+    if not normalized_title:
+        return False
+    compact_title = _compact_search_text(normalized_title)
+    for candidate in _download_task_item_titles(item):
+        candidate_title = normalize_search_text(candidate)
+        if not candidate_title:
+            continue
+        if candidate_title == normalized_title:
+            return True
+        if _normalized_contains(candidate_title, normalized_title, compact_title):
+            return True
+    return False
+
+
+async def _bind_playlist_track_to_task(
+    state: AppState,
+    track_id: int,
+    task: TorrentRecord,
+    *,
+    last_error: str | None,
+) -> None:
+    await state.repository.update_playlist_track(
+        track_id,
+        exists_in_library=False,
+        matched_library_track_id=None,
+        download_status=_playlist_download_status_for_task(task),
+        torrent_record_id=task.id,
+        last_checked_at=datetime.now(UTC),
+        last_download_attempt_at=datetime.now(UTC),
+        last_error=last_error,
+    )
+
+
+def _playlist_download_status_for_task(task: TorrentRecord) -> str:
+    if task.status in {
+        "submitted",
+        "downloading",
+        "completed",
+        "refreshing_library",
+        "library_refreshed",
+        "failed",
+        "deleted",
+    }:
+        return task.status
+    return "submitted" if task.status == "queued" else task.status
+
+
+async def _sync_playlist_tracks_for_download_task(
+    state: AppState,
+    task: TorrentRecord,
+) -> None:
+    tracks = await state.repository.list_playlist_tracks_by_torrent_record(task.id)
+    if not tracks:
+        return
+    status = _playlist_download_status_for_task(task)
+    last_error = task.last_error if status in {"failed", "deleted"} else None
+    for track in tracks:
+        if track.exists_in_library or track.download_status == "existing":
+            continue
+        await state.repository.update_playlist_track(
+            track.id,
+            download_status=status,
+            last_checked_at=datetime.now(UTC),
+            last_error=last_error,
+        )
+
+
+async def _mark_playlist_tracks_for_deleted_download_task(
+    state: AppState,
+    task_id: int,
+) -> None:
+    tracks = await state.repository.list_playlist_tracks_by_torrent_record(task_id)
+    for track in tracks:
+        if track.exists_in_library or track.download_status == "existing":
+            continue
+        await state.repository.update_playlist_track(
+            track.id,
+            download_status="deleted",
+            last_checked_at=datetime.now(UTC),
+            last_error="下载任务已删除。",
+        )
 
 
 def _playlist_media_candidate(track: PlaylistTrack) -> MediaCandidateResponse:
@@ -2652,10 +3165,10 @@ async def _scrape_download_task_items(state: AppState, item_ids: list[int]) -> N
         await _scrape_download_task_item(state, item_id)
 
 
-async def _scrape_download_task_item(state: AppState, item_id: int) -> None:
+async def _scrape_download_task_item(state: AppState, item_id: int) -> TorrentRecordItem | None:
     item = await state.repository.get_download_task_item(item_id)
     if item is None:
-        return
+        return None
     reference = _download_task_item_reference_metadata(item)
     title = reference.title.strip()
     if not title:
@@ -2664,7 +3177,7 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> None:
             status="metadata_not_found",
             last_error="No title parsed from torrent file.",
         )
-        return
+        return await state.repository.get_download_task_item(item_id)
     await state.repository.update_download_task_item(
         item_id,
         status="metadata_searching",
@@ -2695,7 +3208,7 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> None:
             f"reference={_track_metadata_log_text(reference)}, error={error_message}",
             "WARNING",
         )
-        return
+        return await state.repository.get_download_task_item(item_id)
     if metadata is None:
         await state.repository.update_download_task_item(
             item_id,
@@ -2709,7 +3222,12 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> None:
             f"candidates={len(candidates)}, error={failure_message}",
             "WARNING",
         )
-        return
+        return await state.repository.get_download_task_item(item_id)
+    await _ensure_artist_from_metadata(
+        state,
+        metadata,
+        context=f"download item {item_id}",
+    )
     await state.repository.update_download_task_item(
         item_id,
         status="metadata_found",
@@ -2726,10 +3244,30 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> None:
         f"metadata={_track_metadata_log_text(metadata)}, "
         f"candidates={len(candidates)}",
     )
+    return await state.repository.get_download_task_item(item_id)
 
 
 def _track_metadata_payload(metadata: TrackMetadata) -> dict[str, object]:
     return dataclasses.asdict(metadata)
+
+
+async def _ensure_artist_from_metadata(
+    state: AppState,
+    metadata: TrackMetadata,
+    *,
+    context: str,
+) -> None:
+    artist = (metadata.artist or "").strip()
+    if not artist:
+        return
+    try:
+        await state.artist_service.ensure_artist(artist, source="scraping")
+    except Exception as exc:  # noqa: BLE001
+        state.add_log(
+            "artist",
+            f"Artist library update skipped for {context}: artist={artist}, error={exc}",
+            "WARNING",
+        )
 
 
 def _track_metadata_log_text(metadata: TrackMetadata | None) -> str:
@@ -3119,6 +3657,28 @@ def _dedupe_results(results: list[SearchResult]) -> list[SearchResult]:
         if current is None or result.seeders > current.seeders:
             by_key[result.identity_key] = result
     return list(by_key.values())
+
+
+def _filter_by_exclude_keywords(
+    results: list[SearchResult],
+    exclude_keywords: str,
+) -> list[SearchResult]:
+    if not exclude_keywords or not exclude_keywords.strip():
+        return results
+    keywords = [kw.strip().casefold() for kw in exclude_keywords.split("|") if kw.strip()]
+    if not keywords:
+        return results
+    return [
+        result
+        for result in results
+        if not any(kw in (result.title or "").casefold() for kw in keywords)
+    ]
+
+
+async def _get_exclude_keywords(state: AppState) -> str:
+    settings = await state.repository.get_system_settings()
+    search_settings = settings.get("search") or {}
+    return str(search_settings.get("exclude_keywords") or "")
 
 
 def _metadata_search_keywords(media: MediaCandidateResponse) -> list[str]:
@@ -3537,6 +4097,12 @@ async def _scrape_manual_source_files(
         media_history=media_history,
     )
     for item in summary.results:
+        if item.status in {"success", "skipped"}:
+            await _ensure_artist_from_metadata(
+                state,
+                item.metadata,
+                context=f"manual scraping {item.source_path}",
+            )
         await state.repository.record_scraping_result(
             torrent_hash=None,
             source_path=item.source_path,
@@ -3593,17 +4159,21 @@ async def _poll_download_tasks_once(state: AppState) -> None:
         if status is None and not has_real_hash:
             status = _match_status_by_name(statuses, task)
             if status is not None:
-                await state.repository.update_download_task(
+                resolved = await state.repository.update_download_task(
                     task.id,
                     torrent_hash=status.torrent_hash,
                 )
+                if resolved is not None:
+                    await _sync_playlist_tracks_for_download_task(state, resolved)
         if status is None:
             if has_real_hash:
-                await state.repository.update_download_task(
+                deleted = await state.repository.update_download_task(
                     task.id,
                     status="deleted",
                     last_error="qBittorrent 中未找到该任务，可能已被删除。",
                 )
+                if deleted is not None:
+                    await _sync_playlist_tracks_for_download_task(state, deleted)
             continue
         changes: dict[str, object] = {
             "progress": status.progress,
@@ -3615,7 +4185,9 @@ async def _poll_download_tasks_once(state: AppState) -> None:
             changes["status"] = "downloading"
             if task.download_started_at is None:
                 changes["download_started_at"] = datetime.now(UTC)
-        await state.repository.update_download_task(task.id, **changes)
+        updated = await state.repository.update_download_task(task.id, **changes)
+        if updated is not None:
+            await _sync_playlist_tracks_for_download_task(state, updated)
 
 
 def _match_status_by_name(statuses: tuple[object, ...], task: TorrentRecord) -> object | None:
@@ -3657,15 +4229,33 @@ def _match_tokens(value: str) -> set[str]:
 
 async def _refresh_library_for_task(state: AppState, task: TorrentRecord) -> None:
     if task.status != "refreshing_library":
-        await state.repository.update_download_task(task.id, status="refreshing_library")
-    await _scrape_download_for_task(state, task)
+        refreshing = await state.repository.update_download_task(task.id, status="refreshing_library")
+        if refreshing is not None:
+            await _sync_playlist_tracks_for_download_task(state, refreshing)
+    summary = await _scrape_download_for_task(state, task)
+    if summary is not None and not summary.mapped_files and not summary.updated_files and not summary.moved_files:
+        state.add_log(
+            "library",
+            f"Library refresh skipped for {task.name}: no files transferred.",
+        )
+        refreshed = await state.repository.update_download_task(
+            task.id,
+            status="library_refreshed",
+            library_refreshed_at=datetime.now(UTC),
+        )
+        if refreshed is not None:
+            await _sync_playlist_tracks_for_download_task(state, refreshed)
+        await _send_event_notifications(state, "library", refreshed or task)
+        return
     server = await state.repository.default_media_server()
     if server is None:
-        await state.repository.update_download_task(
+        failed = await state.repository.update_download_task(
             task.id,
             status="failed",
             last_error="No enabled default media server is configured.",
         )
+        if failed is not None:
+            await _sync_playlist_tracks_for_download_task(state, failed)
         state.add_log(
             "library",
             f"Library refresh failed for {task.name}: no media server",
@@ -3678,7 +4268,9 @@ async def _refresh_library_for_task(state: AppState, task: TorrentRecord) -> Non
             response = await client.get("/rest/startScan.view", params=_navidrome_params(server))
             _validate_navidrome_scan_response(response)
     except Exception as exc:  # noqa: BLE001
-        await state.repository.update_download_task(task.id, status="failed", last_error=str(exc))
+        failed = await state.repository.update_download_task(task.id, status="failed", last_error=str(exc))
+        if failed is not None:
+            await _sync_playlist_tracks_for_download_task(state, failed)
         state.add_log("library", f"Library refresh failed for {task.name}: {exc}", "ERROR")
         return
     refreshed = await state.repository.update_download_task(
@@ -3686,6 +4278,8 @@ async def _refresh_library_for_task(state: AppState, task: TorrentRecord) -> Non
         status="library_refreshed",
         library_refreshed_at=datetime.now(UTC),
     )
+    if refreshed is not None:
+        await _sync_playlist_tracks_for_download_task(state, refreshed)
     state.add_log("library", f"Media library refresh requested: {task.name}")
     asyncio.create_task(
         _sync_music_library_after_refresh(state),
@@ -3694,8 +4288,7 @@ async def _refresh_library_for_task(state: AppState, task: TorrentRecord) -> Non
     await _send_event_notifications(state, "library", refreshed or task)
 
 
-async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> None:
-    _cancel_download_task_item_scraping(state, task.id)
+async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> ScrapingSummary | None:
     settings_payload = await state.repository.get_system_settings()
     config = scraping_config_from_payload(settings_payload)
     if not config.enabled:
@@ -3752,6 +4345,12 @@ async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> Non
     payload["scraping_completed"] = True
     await state.repository.update_download_task(task.id, payload=payload)
     for item in summary.results:
+        if item.status in {"success", "skipped"}:
+            await _ensure_artist_from_metadata(
+                state,
+                item.metadata,
+                context=f"download scraping {task.name}",
+            )
         await state.repository.record_scraping_result(
             torrent_hash=task.torrent_hash,
             source_path=item.source_path,
@@ -3773,6 +4372,7 @@ async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> Non
         f"failed={summary.failed_files}, "
         f"skipped={sum(1 for item in summary.results if item.status == 'skipped')}",
     )
+    return summary
 
 
 async def _scraping_source_files_for_task(

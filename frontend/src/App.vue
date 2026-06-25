@@ -302,6 +302,9 @@ type SystemSettings = {
     classify_by: 'artist' | 'album'
     duplicate_handling: 'ignore' | 'overwrite' | 'keep_largest'
   }
+  search: {
+    exclude_keywords: string
+  }
 }
 
 type LogEntry = {
@@ -529,6 +532,9 @@ const systemForm = ref<SystemSettings>({
     auto_classify: false,
     classify_by: 'artist',
     duplicate_handling: 'ignore'
+  },
+  search: {
+    exclude_keywords: ''
   }
 })
 
@@ -2027,6 +2033,10 @@ async function loadSystemSettings() {
     scraping: {
       ...systemForm.value.scraping,
       ...(settings.scraping ?? {})
+    },
+    search: {
+      ...systemForm.value.search,
+      ...(settings.search ?? {})
     }
   }
 }
@@ -2133,8 +2143,14 @@ function playlistTrackStatusText(status: string) {
     waiting: '等待',
     searching: '搜索中',
     submitted: '已提交',
+    queue: '排队中',
+    downloading: '下载中',
+    completed: '下载完成',
+    refreshing_library: '刷新曲库',
+    library_refreshed: '曲库已刷新',
     not_found: '未找到',
-    failed: '失败'
+    failed: '失败',
+    deleted: '已删除'
   }[status] ?? status
 }
 
@@ -2144,8 +2160,14 @@ function playlistTrackStatusColor(status: string) {
     waiting: 'warning',
     searching: 'info',
     submitted: 'primary',
+    queue: 'warning',
+    downloading: 'info',
+    completed: 'success',
+    refreshing_library: 'info',
+    library_refreshed: 'success',
     not_found: 'error',
-    failed: 'error'
+    failed: 'error',
+    deleted: 'error'
   }[status] ?? 'secondary'
 }
 
@@ -3273,6 +3295,29 @@ onUnmounted(() => {
                     </v-btn>
                   </v-card-actions>
                 </v-card>
+
+                <v-card class="settings-card mt-4">
+                  <v-card-title>搜索设置</v-card-title>
+                  <v-card-text>
+                    <div class="settings-grid">
+                      <v-textarea
+                        v-model="systemForm.search.exclude_keywords"
+                        label="排除关键词"
+                        placeholder="试听|sample|preview|acoustic"
+                        hint="用 | 分隔多个关键词。标题中包含任一关键词的种子会被过滤掉。"
+                        persistent-hint
+                        auto-grow
+                        rows="2"
+                      />
+                    </div>
+                  </v-card-text>
+                  <v-card-actions>
+                    <v-spacer />
+                    <v-btn color="primary" :loading="systemSaving" @click="saveSystemSettings">
+                      保存搜索设置
+                    </v-btn>
+                  </v-card-actions>
+                </v-card>
               </v-window-item>
             </v-window>
           </section>
@@ -3507,7 +3552,20 @@ onUnmounted(() => {
     </v-dialog>
 
     <v-dialog v-model="playlistTracksDialog" max-width="980">
-      <v-card :title="selectedPlaylist ? selectedPlaylist.name : '歌单明细'">
+      <v-card>
+        <v-card-title class="d-flex align-center ga-2">
+          <span class="text-truncate">{{ selectedPlaylist ? selectedPlaylist.name : '歌单明细' }}</span>
+          <v-spacer />
+          <v-btn
+            icon="mdi-refresh"
+            variant="text"
+            size="small"
+            title="刷新"
+            :loading="playlistTrackLoading"
+            :disabled="!selectedPlaylist"
+            @click="selectedPlaylist && loadPlaylistTracks(selectedPlaylist)"
+          />
+        </v-card-title>
         <v-card-text>
           <v-progress-linear v-if="playlistTrackLoading" indeterminate color="primary" />
           <v-table class="playlist-track-table fixed-table">
