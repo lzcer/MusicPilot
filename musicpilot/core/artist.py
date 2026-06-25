@@ -263,8 +263,6 @@ class ArtistService:
             group_count = len(norm_groups)
 
             for i, (normalized, names) in enumerate(norm_groups.items()):
-                if i > 0:
-                    await asyncio.sleep(1)
 
                 logger.info(
                     "Artist build [%d/%d]: processing %s",
@@ -288,7 +286,9 @@ class ArtistService:
                     skipped += 1
                     continue
 
-                # New artist -- fetch MusicBrainz aliases
+                # New artist -- rate-limit before MusicBrainz API calls
+                if i > 0:
+                    await asyncio.sleep(1)
                 search_name = max(names, key=len)
                 mb_aliases = await _fetch_musicbrainz_aliases(
                     client, search_name, user_agent, seen_mb_artists,
