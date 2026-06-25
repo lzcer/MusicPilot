@@ -1005,7 +1005,7 @@ class SqlAlchemyMediaRepository:
             return len(aliases), len(artists)
 
     async def list_distinct_artists(self) -> list[str]:
-        """Return all unique artist names from media_files and music_library_tracks."""
+        """Return all unique artist names from media_files, music_library_tracks, and playlist_tracks."""
         async with self.database.session() as session:
             media_result = await session.execute(
                 select(MediaFile.artist).where(
@@ -1019,6 +1019,12 @@ class SqlAlchemyMediaRepository:
                     MusicLibraryTrack.artist != "",
                 ).distinct()
             )
+            playlist_result = await session.execute(
+                select(PlaylistTrack.artist).where(
+                    PlaylistTrack.artist.isnot(None),
+                    PlaylistTrack.artist != "",
+                ).distinct()
+            )
             seen: set[str] = set()
             all_names: list[str] = []
             for (name,) in media_result.fetchall():
@@ -1026,6 +1032,10 @@ class SqlAlchemyMediaRepository:
                     seen.add(name)
                     all_names.append(name)
             for (name,) in library_result.fetchall():
+                if name and name not in seen:
+                    seen.add(name)
+                    all_names.append(name)
+            for (name,) in playlist_result.fetchall():
                 if name and name not in seen:
                     seen.add(name)
                     all_names.append(name)
