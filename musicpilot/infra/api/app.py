@@ -1811,18 +1811,14 @@ def create_app() -> FastAPI:
     async def build_artist_library() -> BuildArtistLibraryResponse:
         if state.artist_build_lock.locked():
             raise HTTPException(status_code=409, detail="歌手库正在构建中，请稍后重试")
-        async with state.artist_build_lock:
-            try:
-                created = await state.artist_service.build_library_from_media_files()
-                state.add_log(
-                    "artist",
-                    f"已从曲库自动构建歌手库，共 {created} 个歌手组。",
-                    "INFO",
-                )
-                return BuildArtistLibraryResponse(created=created)
-            except Exception as exc:  # noqa: BLE001
-                state.add_log("artist", f"构建歌手库失败：{exc}", "ERROR")
-                raise HTTPException(status_code=502, detail=f"构建失败：{exc}") from exc
+        # Run build in background so it doesn't block shutdown
+        task = asyncio.create_task(
+            _run_artist_build(state),
+            name="musicpilot-artist-build",
+        )
+        state._background_tasks.add(task)
+        task.add_done_callback(state._background_tasks.discard)
+        return BuildArtistLibraryResponse(created=-1)
 
     @app.delete("/api/artists", response_model=ClearArtistLibraryResponse)
     async def clear_artist_library() -> ClearArtistLibraryResponse:
@@ -3292,6 +3288,22 @@ async def _auto_build_artist_library(state: AppState) -> None:
             state.add_log("artist", "自动构建歌手库超时（可稍后手动构建）", "WARNING")
         except Exception as exc:  # noqa: BLE001
             state.add_log("artist", f"自动构建歌手库失败（可稍后手动构建）：{exc}", "WARNING")
+
+
+async def _run_artist_build(state: AppState) -> None:
+    """Run artist library build in background."""
+    async with state.artist_build_lock:
+        try:
+            created = await state.artist_service.build_library_from_media_files()
+            state.add_log(
+                "artist",
+                f"歌手库构建完成：共 {created} 个歌手组。" if created else "歌手库构建完成：没有新增歌手组。",
+                "INFO",
+            )
+        except asyncio.CancelledError:
+            state.add_log("artist", "歌手库构建已被取消", "WARNING")
+        except Exception as exc:  # noqa: BLE001
+            state.add_log("artist", f"歌手库构建失败：{exc}", "ERROR")
 
 
 async def _ensure_artist_from_metadata(

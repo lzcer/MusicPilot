@@ -1319,11 +1319,10 @@ async function loadArtists() {
 async function buildArtistLibrary() {
   artistBuilding.value = true
   try {
-    const result = await api<BuildArtistLibraryResponse>('/api/artists/build-library', {
+    await api('/api/artists/build-library', {
       method: 'POST'
     })
-    await loadArtists()
-    notify(`歌手库已构建：${result.created} 个歌手组`)
+    notify('歌手库构建已开始，完成后将通过日志通知')
   } catch (error) {
     notify(error instanceof Error ? error.message : '构建歌手库失败', 'error')
   } finally {
@@ -1340,11 +1339,8 @@ async function confirmClearAndRebuildArtistLibrary() {
   artistBuilding.value = true
   try {
     await api('/api/artists', { method: 'DELETE' })
-    const result = await api<BuildArtistLibraryResponse>('/api/artists/build-library', {
-      method: 'POST'
-    })
-    await loadArtists()
-    notify(`歌手库已清空并重建：${result.created} 个歌手组`)
+    await api('/api/artists/build-library', { method: 'POST' })
+    notify('歌手库已清空，后台重建中…')
   } catch (error) {
     notify(error instanceof Error ? error.message : '清空重建失败', 'error')
   } finally {
