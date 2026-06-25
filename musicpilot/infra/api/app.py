@@ -396,6 +396,7 @@ class AppState:
         self.playlist_download_tasks: dict[int, asyncio.Task[None]] = {}
         self.playlist_track_download_tasks: dict[int, asyncio.Task[None]] = {}
         self.download_item_scraping_tasks: dict[int, asyncio.Task[None]] = {}
+        self._background_tasks: set[asyncio.Task[None]] = set()
         self.scraping_metadata = MetadataCascade([MultiSourceMusicProvider()])
         self.scraper = LocalMusicScraper(
             metadata=self.scraping_metadata,
@@ -608,19 +609,17 @@ def create_app() -> FastAPI:
         await state.database.create_all()
         await state.database.migrate_phase_one_schema()
         await state.migrate_legacy_runtime_config()
-        # Auto-build artist library from existing media files if empty
+        # Auto-build artist library from existing media files if empty (background,
+        # so startup does not block on MusicBrainz API calls)
         artists = await state.repository.list_all_artists()
         if not artists:
-            try:
-                created = await state.artist_service.build_library_from_media_files()
-                if created:
-                    state.add_log(
-                        "artist",
-                        f"启动时自动构建歌手库：已创建 {created} 个歌手组。",
-                        "INFO",
-                    )
-            except Exception as exc:  # noqa: BLE001
-                state.add_log("artist", f"自动构建歌手库失败（可稍后手动构建）：{exc}", "WARNING")
+            state.add_log("artist", "歌手库为空，后台自动构建中…", "INFO")
+            task = asyncio.create_task(
+                _auto_build_artist_library(state),
+                name="musicpilot-startup-artist-build",
+            )
+            state._background_tasks.add(task)
+            task.add_done_callback(state._background_tasks.discard)
         await state.reload_indexers()
         await state.reload_downloader()
         await state.reload_notifiers()
@@ -647,6 +646,11 @@ def create_app() -> FastAPI:
         for task in playlist_tasks:
             task.cancel()
         for task in playlist_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        for task in state._background_tasks:
+            task.cancel()
+        for task in state._background_tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         await state.artist_download_queue.stop()
@@ -3261,6 +3265,25 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> TorrentRe
 
 def _track_metadata_payload(metadata: TrackMetadata) -> dict[str, object]:
     return dataclasses.asdict(metadata)
+
+
+async def _auto_build_artist_library(state: AppState) -> None:
+    """Build artist library in background with a timeout."""
+    try:
+        created = await asyncio.wait_for(
+            state.artist_service.build_library_from_media_files(),
+            timeout=300,
+        )
+        if created:
+            state.add_log(
+                "artist",
+                f"启动时自动构建歌手库：已创建 {created} 个歌手组。",
+                "INFO",
+            )
+    except asyncio.TimeoutError:
+        state.add_log("artist", "自动构建歌手库超时（可稍后手动构建）", "WARNING")
+    except Exception as exc:  # noqa: BLE001
+        state.add_log("artist", f"自动构建歌手库失败（可稍后手动构建）：{exc}", "WARNING")
 
 
 async def _ensure_artist_from_metadata(

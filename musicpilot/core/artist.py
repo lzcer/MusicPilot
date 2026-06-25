@@ -257,7 +257,7 @@ class ArtistService:
         musicbrainz_aliases: dict[str, set[str]] = {}
         seen_mb_artists: set[str] = set()
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
             for i, (normalized, names) in enumerate(norm_groups.items()):
                 # Rate limit: 1 request per second (MusicBrainz policy)
                 if i > 0:
