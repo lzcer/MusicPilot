@@ -205,7 +205,6 @@ class ArtistService:
         # Phase 1: Initial grouping by normalization
         # Also collect MusicBrainz aliases for each name
         norm_groups: dict[str, set[str]] = {}
-        mb_aliases_per_name: dict[str, set[str]] = {}
 
         for raw in raw_names:
             if not raw:
@@ -250,8 +249,11 @@ class ArtistService:
                     continue
                 mb_set_b = musicbrainz_aliases.get(other_key, set())
                 # Merge if either normalization overlaps or MusicBrainz aliases overlap
-                if (normalize_artist_name(next(iter(other_names))) == normalize_artist_name(next(iter(names)))
-                        or (mb_set_a and mb_set_b and mb_set_a & mb_set_b)):
+                same_normalized_name = normalize_artist_name(
+                    next(iter(other_names))
+                ) == normalize_artist_name(next(iter(names)))
+                has_shared_musicbrainz_alias = bool(mb_set_a and mb_set_b and mb_set_a & mb_set_b)
+                if same_normalized_name or has_shared_musicbrainz_alias:
                     cluster.update(other_names)
                     used.add(other_key)
 

@@ -116,6 +116,24 @@ class DownloadTaskResponse(BaseModel):
     last_error: str | None = None
 
 
+class DownloadTaskItemResponse(BaseModel):
+    id: int
+    torrent_record_id: int
+    file_name: str
+    file_path: str
+    artist: str | None = None
+    parsed_title: str | None = None
+    metadata_title: str | None = None
+    metadata_artist: str | None = None
+    metadata_album: str | None = None
+    playlist_track_id: int | None = None
+    status: str
+    last_error: str | None = None
+    metadata_payload: dict[str, object] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
 class FileEntryResponse(BaseModel):
     name: str
     path: str

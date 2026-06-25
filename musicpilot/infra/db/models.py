@@ -59,6 +59,29 @@ class TorrentRecord(TimestampMixin, Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class TorrentRecordItem(TimestampMixin, Base):
+    __tablename__ = "torrent_record_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    torrent_record_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("torrent_records.id", ondelete="CASCADE"),
+        index=True,
+    )
+    file_name: Mapped[str] = mapped_column(String(512))
+    file_path: Mapped[str] = mapped_column(Text)
+    artist: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    parsed_title: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    metadata_title: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    metadata_artist: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    metadata_album: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    playlist_track_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(64), default="pending")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 class MediaFile(TimestampMixin, Base):
     __tablename__ = "media_files"
 

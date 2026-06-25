@@ -10,7 +10,7 @@ from typing import Literal
 
 from opencc import OpenCC
 
-from musicpilot.core.artist import ArtistService, normalize_artist_name
+from musicpilot.core.artist import ArtistService
 from musicpilot.core.metadata import MetadataCascade
 from musicpilot.ports.metadata import TrackMetadata
 from musicpilot.ports.tag_writer import TagWriter

@@ -76,6 +76,24 @@ type DownloadTask = {
   last_error?: string | null
 }
 
+type DownloadTaskItem = {
+  id: number
+  torrent_record_id: number
+  file_name: string
+  file_path: string
+  artist?: string | null
+  parsed_title?: string | null
+  metadata_title?: string | null
+  metadata_artist?: string | null
+  metadata_album?: string | null
+  playlist_track_id?: number | null
+  status: string
+  last_error?: string | null
+  metadata_payload: Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
 type DownloadDeleteMode = 'record_only' | 'all'
 type MediaDeleteMode = 'record_only' | 'media_file' | 'all'
 
@@ -354,6 +372,8 @@ let downloadTimer: number | undefined
 let metadataSearchStream: EventSource | undefined
 
 const downloads = ref<DownloadTask[]>([])
+const downloadTaskItems = ref<DownloadTaskItem[]>([])
+const selectedDownloadTask = ref<DownloadTask | null>(null)
 const selectedDownloadIds = ref<number[]>([])
 const mediaFiles = ref<MediaFile[]>([])
 const selectedMediaIds = ref<number[]>([])
@@ -387,6 +407,7 @@ const musicPlatformDialog = ref(false)
 const playlistImportDialog = ref(false)
 const playlistTracksDialog = ref(false)
 const deleteDialog = ref(false)
+const downloadItemsDialog = ref(false)
 const downloadDeleteDialog = ref(false)
 const mediaDeleteDialog = ref(false)
 const fileOrganizeDialog = ref(false)
@@ -399,6 +420,7 @@ const musicPlatformConnecting = ref(false)
 const playlistLoading = ref(false)
 const availablePlaylistLoading = ref(false)
 const playlistTrackLoading = ref(false)
+const downloadItemsLoading = ref(false)
 const playlistDownloading = ref(false)
 const playlistTrackDownloadingIds = ref<number[]>([])
 const deleting = ref(false)
@@ -1009,6 +1031,21 @@ async function loadDownloads() {
   downloads.value = await api<DownloadTask[]>('/api/downloads')
   const existingIds = new Set(downloadableTaskIds.value)
   selectedDownloadIds.value = selectedDownloadIds.value.filter((id) => existingIds.has(id))
+}
+
+async function viewDownloadItems(task: DownloadTask) {
+  if (typeof task.id !== 'number') return
+  selectedDownloadTask.value = task
+  downloadItemsDialog.value = true
+  downloadItemsLoading.value = true
+  try {
+    downloadTaskItems.value = await api<DownloadTaskItem[]>(`/api/downloads/${task.id}/items`)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '下载明细加载失败', 'error')
+    downloadTaskItems.value = []
+  } finally {
+    downloadItemsLoading.value = false
+  }
 }
 
 function deleteDownloadTask(task: DownloadTask) {
@@ -2110,6 +2147,26 @@ function playlistTrackStatusColor(status: string) {
   }[status] ?? 'secondary'
 }
 
+function downloadTaskItemStatusText(status: string) {
+  return {
+    pending: '待查询',
+    metadata_searching: '查询中',
+    metadata_found: '已匹配',
+    metadata_not_found: '未匹配',
+    failed: '失败'
+  }[status] ?? status
+}
+
+function downloadTaskItemStatusColor(status: string) {
+  return {
+    pending: 'secondary',
+    metadata_searching: 'info',
+    metadata_found: 'success',
+    metadata_not_found: 'warning',
+    failed: 'error'
+  }[status] ?? 'secondary'
+}
+
 function mediaStatusColor(status: string) {
   if (status === 'failed') return 'error'
   if (status === 'skipped') return 'warning'
@@ -2386,7 +2443,16 @@ onUnmounted(() => {
                     <td><v-chip size="small" variant="tonal">{{ row.state }}</v-chip></td>
                     <td><v-progress-linear :model-value="progressPercent(row.progress)" height="8" rounded /></td>
                     <td class="path-cell">{{ row.save_path || '-' }}</td>
-                    <td>
+                    <td class="table-actions">
+                      <v-btn
+                        icon="mdi-format-list-bulleted"
+                        color="primary"
+                        variant="text"
+                        size="small"
+                        title="查看明细"
+                        :disabled="typeof row.id !== 'number'"
+                        @click="viewDownloadItems(row)"
+                      />
                       <v-btn
                         icon="mdi-delete"
                         color="error"
@@ -3612,6 +3678,55 @@ onUnmounted(() => {
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="downloadItemsDialog" max-width="1120">
+      <v-card :title="`下载明细${selectedDownloadTask?.name ? ` - ${selectedDownloadTask.name}` : ''}`">
+        <v-card-text>
+          <v-progress-linear v-if="downloadItemsLoading" indeterminate class="mb-4" />
+          <v-table class="fixed-table">
+            <thead>
+              <tr>
+                <th class="download-item-file-col">文件名</th>
+                <th class="download-item-title-col">解析标题</th>
+                <th class="download-item-artist-col">任务艺术家</th>
+                <th class="download-item-title-col">匹配标题</th>
+                <th class="download-item-artist-col">匹配艺术家</th>
+                <th class="download-item-album-col">专辑</th>
+                <th class="download-item-status-col">状态</th>
+                <th class="download-item-error-col">错误</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="!downloadTaskItems.length">
+                <td colspan="8" class="empty-cell">暂无明细</td>
+              </tr>
+              <tr v-for="item in downloadTaskItems" :key="item.id">
+                <td class="truncate-cell" :title="item.file_path">{{ item.file_name }}</td>
+                <td class="truncate-cell" :title="item.parsed_title || '-'">{{ item.parsed_title || '-' }}</td>
+                <td class="truncate-cell" :title="item.artist || '-'">{{ item.artist || '-' }}</td>
+                <td class="truncate-cell" :title="item.metadata_title || '-'">{{ item.metadata_title || '-' }}</td>
+                <td class="truncate-cell" :title="item.metadata_artist || '-'">{{ item.metadata_artist || '-' }}</td>
+                <td class="truncate-cell" :title="item.metadata_album || '-'">{{ item.metadata_album || '-' }}</td>
+                <td>
+                  <v-chip
+                    :color="downloadTaskItemStatusColor(item.status)"
+                    size="small"
+                    variant="tonal"
+                  >
+                    {{ downloadTaskItemStatusText(item.status) }}
+                  </v-chip>
+                </td>
+                <td class="truncate-cell" :title="item.last_error || '-'">{{ item.last_error || '-' }}</td>
+              </tr>
+            </tbody>
+          </v-table>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="downloadItemsDialog = false">关闭</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="downloadDeleteDialog" max-width="420">
       <v-card title="确认删除">
         <v-card-text>
@@ -3908,6 +4023,32 @@ onUnmounted(() => {
 .fixed-table :deep(th),
 .fixed-table :deep(td) {
   white-space: nowrap;
+}
+
+.table-actions {
+  min-width: 96px;
+  white-space: nowrap;
+}
+
+.download-item-file-col {
+  width: 260px;
+}
+
+.download-item-title-col {
+  width: 170px;
+}
+
+.download-item-artist-col,
+.download-item-album-col {
+  width: 150px;
+}
+
+.download-item-status-col {
+  width: 100px;
+}
+
+.download-item-error-col {
+  width: 220px;
 }
 
 .playlist-table :deep(table) {

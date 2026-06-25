@@ -23,6 +23,7 @@ from musicpilot.infra.db.models import (
     Subscription,
     SystemSetting,
     TorrentRecord,
+    TorrentRecordItem,
 )
 from musicpilot.infra.db.session import Database
 from musicpilot.ports.metadata import TrackMetadata
@@ -370,6 +371,82 @@ class SqlAlchemyMediaRepository:
             await session.commit()
             await session.refresh(row)
             return row
+
+    async def list_download_task_items(self, task_id: int) -> list[TorrentRecordItem]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(TorrentRecordItem)
+                .where(TorrentRecordItem.torrent_record_id == task_id)
+                .order_by(TorrentRecordItem.id)
+            )
+            return list(result.scalars().all())
+
+    async def get_download_task_item(self, item_id: int) -> TorrentRecordItem | None:
+        async with self.database.session() as session:
+            return await session.get(TorrentRecordItem, item_id)
+
+    async def replace_download_task_items(
+        self,
+        task_id: int,
+        items: list[dict[str, Any]],
+    ) -> list[TorrentRecordItem]:
+        async with self.database.session() as session:
+            await session.execute(
+                delete(TorrentRecordItem).where(TorrentRecordItem.torrent_record_id == task_id)
+            )
+            rows: list[TorrentRecordItem] = []
+            for item in items:
+                row = TorrentRecordItem(
+                    torrent_record_id=task_id,
+                    file_name=str(item["file_name"]),
+                    file_path=str(item["file_path"]),
+                    artist=_optional_string(item.get("artist")),
+                    parsed_title=_optional_string(item.get("parsed_title")),
+                    playlist_track_id=_optional_int(item.get("playlist_track_id")),
+                    status=str(item.get("status") or "pending"),
+                    raw_payload=dict(item.get("raw_payload") or {}),
+                )
+                session.add(row)
+                rows.append(row)
+            await session.commit()
+            for row in rows:
+                await session.refresh(row)
+            return rows
+
+    async def update_download_task_item(
+        self,
+        item_id: int,
+        **changes: Any,
+    ) -> TorrentRecordItem | None:
+        async with self.database.session() as session:
+            row = await session.get(TorrentRecordItem, item_id)
+            if row is None:
+                return None
+            for key, value in changes.items():
+                setattr(row, key, value)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def list_active_download_task_items(self) -> list[TorrentRecordItem]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(TorrentRecordItem)
+                .join(TorrentRecord, TorrentRecordItem.torrent_record_id == TorrentRecord.id)
+                .where(
+                    TorrentRecord.status.in_(
+                        (
+                            "queued",
+                            "submitted",
+                            "downloading",
+                            "completed",
+                            "refreshing_library",
+                        )
+                    )
+                )
+                .order_by(TorrentRecordItem.id.desc())
+            )
+            return list(result.scalars().all())
 
     async def delete_download_task(self, task_id: int) -> bool:
         async with self.database.session() as session:
@@ -865,7 +942,8 @@ class SqlAlchemyMediaRepository:
             rows = result.scalars().all()
             artist = await session.get(Artist, artist_id)
             aliases = [artist.name] if artist else []
-            aliases.extend(row.alias for row in rows if row.alias != (artist.name if artist else None))
+            artist_name = artist.name if artist else None
+            aliases.extend(row.alias for row in rows if row.alias != artist_name)
             # Deduplicate while preserving order
             seen: set[str] = set()
             unique: list[str] = []
@@ -909,8 +987,6 @@ class SqlAlchemyMediaRepository:
     async def list_distinct_artists(self) -> list[str]:
         """Return all unique artist names from media_files and music_library_tracks."""
         async with self.database.session() as session:
-            from sqlalchemy import func as sa_func
-
             media_result = await session.execute(
                 select(MediaFile.artist).where(
                     MediaFile.artist.isnot(None),

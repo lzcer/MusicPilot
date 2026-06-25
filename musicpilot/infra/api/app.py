@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -79,6 +80,7 @@ from musicpilot.infra.api.schemas import (
     DownloaderResponse,
     DownloadRequest,
     DownloadResponse,
+    DownloadTaskItemResponse,
     DownloadTaskResponse,
     FileBulkDeleteFailure,
     FileBulkDeleteRequest,
@@ -148,15 +150,35 @@ from musicpilot.infra.db.models import (
     Playlist,
     PlaylistTrack,
     TorrentRecord,
+    TorrentRecordItem,
 )
 from musicpilot.infra.scheduler import SubscriptionScheduler
 from musicpilot.ports.downloader import DownloadStatus, TorrentFile
-from musicpilot.ports.metadata import MediaCandidate
+from musicpilot.ports.metadata import MediaCandidate, TrackMetadata
 
 _OPENCC_T2S = OpenCC("t2s")
+_TORRENT_AUDIO_EXTENSIONS = {
+    ".aac",
+    ".aiff",
+    ".alac",
+    ".ape",
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".wma",
+}
 DOWNLOAD_POLL_INTERVAL_SECONDS = 5
 MUSIC_LIBRARY_SYNC_INTERVAL_SECONDS = 3600
 MUSIC_LIBRARY_SYNC_AFTER_REFRESH_DELAY_SECONDS = 5
+
+
+@dataclasses.dataclass(frozen=True)
+class SubmittedTorrent:
+    torrent_hash: str
+    torrent_data: bytes | None = None
 
 
 class MetadataSiteSearchTask:
@@ -509,7 +531,11 @@ def create_app() -> FastAPI:
             try:
                 created = await state.artist_service.build_library_from_media_files()
                 if created:
-                    state.add_log("artist", f"启动时自动构建歌手库：已创建 {created} 个歌手组。", "INFO")
+                    state.add_log(
+                        "artist",
+                        f"启动时自动构建歌手库：已创建 {created} 个歌手组。",
+                        "INFO",
+                    )
             except Exception as exc:  # noqa: BLE001
                 state.add_log("artist", f"自动构建歌手库失败（可稍后手动构建）：{exc}", "WARNING")
         await state.reload_indexers()
@@ -780,7 +806,7 @@ def create_app() -> FastAPI:
             category=payload.category,
         )
         try:
-            torrent_hash = await _submit_torrent_to_downloader(
+            submitted = await _submit_torrent_to_downloader(
                 state,
                 resource,
                 payload.selected_site_ids,
@@ -799,21 +825,35 @@ def create_app() -> FastAPI:
             "downloader_id": default_downloader.id if default_downloader else None,
             "submitted_at": datetime.now(UTC),
         }
-        if torrent_hash:
-            task_changes["torrent_hash"] = torrent_hash
+        if submitted.torrent_hash:
+            task_changes["torrent_hash"] = submitted.torrent_hash
         task = await state.repository.update_download_task(task.id, **task_changes)
+        item_ids = await _record_submitted_torrent_items(
+            state,
+            task.id if task else None,
+            submitted.torrent_data,
+        )
+        _schedule_download_task_item_scraping(state, item_ids)
         await _send_event_notifications(state, "download", task)
         state.add_log("download", f"Download submitted: {payload.title}")
         return DownloadResponse(
             status="submitted",
             task_id=task.id if task else None,
-            torrent_hash=torrent_hash or None,
+            torrent_hash=submitted.torrent_hash or None,
         )
 
     @app.get("/api/downloads", response_model=list[DownloadTaskResponse])
     async def downloads() -> list[DownloadTaskResponse]:
         tasks = await state.repository.list_download_tasks()
         return [_download_task_response(item) for item in tasks]
+
+    @app.get("/api/downloads/{task_id}/items", response_model=list[DownloadTaskItemResponse])
+    async def download_items(task_id: int) -> list[DownloadTaskItemResponse]:
+        task = await state.repository.get_download_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Download task not found.")
+        items = await state.repository.list_download_task_items(task_id)
+        return [_download_task_item_response(item) for item in items]
 
     @app.delete("/api/downloads/{task_id}", status_code=204)
     async def delete_download(task_id: int, mode: DownloadDeleteMode = "record_only") -> None:
@@ -2164,6 +2204,41 @@ def _match_library_track(
     return None
 
 
+async def _match_active_download_task_item(
+    state: AppState,
+    title: str,
+    artist: str | None,
+) -> TorrentRecordItem | None:
+    normalized_title = normalize_search_text(title)
+    if not normalized_title:
+        return None
+    compact_title = _compact_search_text(normalized_title)
+    for item in await state.repository.list_active_download_task_items():
+        if not _artist_matches(item.metadata_artist or item.artist, artist):
+            continue
+        for candidate in _download_task_item_titles(item):
+            candidate_title = normalize_search_text(candidate)
+            if not candidate_title:
+                continue
+            if candidate_title == normalized_title:
+                return item
+            if _normalized_contains(candidate_title, normalized_title, compact_title):
+                return item
+            candidate_compact = _compact_search_text(candidate_title)
+            if _normalized_contains(normalized_title, candidate_title, candidate_compact):
+                return item
+    return None
+
+
+def _download_task_item_titles(item: TorrentRecordItem) -> list[str]:
+    values = [
+        item.metadata_title,
+        item.parsed_title,
+        Path(item.file_name).stem,
+    ]
+    return [value for value in values if value]
+
+
 async def _download_playlist_tracks(state: AppState, playlist_id: int) -> None:
     try:
         await _refresh_playlist_library_matches(state, playlist_id)
@@ -2223,6 +2298,19 @@ async def _download_playlist_track(state: AppState, track_id: int) -> None:
             last_error=None,
         )
         return
+    active_item = await _match_active_download_task_item(state, track.title, track.artist)
+    if active_item is not None:
+        await state.repository.update_playlist_track(
+            track.id,
+            exists_in_library=False,
+            matched_library_track_id=None,
+            download_status="submitted",
+            torrent_record_id=active_item.torrent_record_id,
+            last_checked_at=datetime.now(UTC),
+            last_download_attempt_at=datetime.now(UTC),
+            last_error=f"Already downloading in task #{active_item.torrent_record_id}.",
+        )
+        return
     try:
         await state.repository.update_playlist_track(
             track.id,
@@ -2248,6 +2336,7 @@ async def _download_playlist_track(state: AppState, track_id: int) -> None:
             media_metadata=media.model_dump(),
             selected_site_ids=[],
             category="MusicPilot",
+            playlist_track_id=track.id,
         )
         await state.repository.update_playlist_track(
             track.id,
@@ -2335,6 +2424,7 @@ async def _create_and_submit_download_task(
     media_metadata: dict[str, Any],
     selected_site_ids: list[str],
     category: str,
+    playlist_track_id: int | None = None,
 ) -> TorrentRecord:
     if state.downloader is None:
         await state.reload_downloader()
@@ -2347,7 +2437,7 @@ async def _create_and_submit_download_task(
         category=category,
     )
     try:
-        torrent_hash = await _submit_torrent_to_downloader(
+        submitted = await _submit_torrent_to_downloader(
             state,
             resource,
             selected_site_ids,
@@ -2362,9 +2452,16 @@ async def _create_and_submit_download_task(
         "downloader_id": default_downloader.id if default_downloader else None,
         "submitted_at": datetime.now(UTC),
     }
-    if torrent_hash:
-        changes["torrent_hash"] = torrent_hash
+    if submitted.torrent_hash:
+        changes["torrent_hash"] = submitted.torrent_hash
     updated = await state.repository.update_download_task(task.id, **changes)
+    item_ids = await _record_submitted_torrent_items(
+        state,
+        (updated or task).id,
+        submitted.torrent_data,
+        playlist_track_id=playlist_track_id,
+    )
+    _schedule_download_task_item_scraping(state, item_ids)
     await _send_event_notifications(state, "download", updated or task)
     return updated or task
 
@@ -2405,19 +2502,21 @@ async def _submit_torrent_to_downloader(
     resource: dict[str, Any],
     selected_site_ids: list[str],
     category: str,
-) -> str:
+) -> SubmittedTorrent:
     if state.downloader is None:
         raise RuntimeError("No downloader is configured.")
     download_url = str(resource.get("download_url") or "")
     site = await _match_torrent_site(state, resource, selected_site_ids)
     if site is None:
-        return await state.downloader.add_torrent(download_url, category=category)
+        torrent_hash = await state.downloader.add_torrent(download_url, category=category)
+        return SubmittedTorrent(torrent_hash=torrent_hash)
     torrent_data = await _download_torrent_file(download_url, site)
-    return await state.downloader.add_torrent_file(
+    torrent_hash = await state.downloader.add_torrent_file(
         torrent_data,
         filename=_torrent_filename(resource, download_url),
         category=category,
     )
+    return SubmittedTorrent(torrent_hash=torrent_hash, torrent_data=torrent_data)
 
 
 async def _match_torrent_site(
@@ -2476,6 +2575,214 @@ def _torrent_filename(resource: dict[str, Any], download_url: str) -> str:
     title = str(resource.get("title") or "musicpilot").strip()
     safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', " ", title).strip(" .")
     return f"{safe_title or 'musicpilot'}.torrent"
+
+
+async def _record_submitted_torrent_items(
+    state: AppState,
+    task_id: int | None,
+    torrent_data: bytes | None,
+    *,
+    playlist_track_id: int | None = None,
+) -> list[int]:
+    if task_id is None or not torrent_data:
+        return []
+    task = await state.repository.get_download_task(task_id)
+    if task is None:
+        return []
+    try:
+        parsed_items = _torrent_audio_items(torrent_data)
+        if not parsed_items:
+            return []
+        media_metadata = task.media_metadata or {}
+        artist = _optional_string(media_metadata.get("artist"))
+        rows = await state.repository.replace_download_task_items(
+            task_id,
+            [
+                {
+                    "file_name": item["file_name"],
+                    "file_path": item["file_path"],
+                    "artist": artist,
+                    "parsed_title": item["parsed_title"],
+                    "playlist_track_id": playlist_track_id,
+                    "status": "pending",
+                    "raw_payload": {"size": item.get("size")},
+                }
+                for item in parsed_items
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001
+        state.add_log("download", f"Torrent item parse failed for task={task_id}: {exc}", "WARNING")
+        return []
+    return [row.id for row in rows]
+
+
+def _schedule_download_task_item_scraping(state: AppState, item_ids: list[int]) -> None:
+    if not item_ids:
+        return
+    asyncio.create_task(
+        _scrape_download_task_items(state, item_ids),
+        name=f"musicpilot-download-item-scrape-{item_ids[0]}",
+    )
+
+
+async def _scrape_download_task_items(state: AppState, item_ids: list[int]) -> None:
+    for item_id in item_ids:
+        await _scrape_download_task_item(state, item_id)
+
+
+async def _scrape_download_task_item(state: AppState, item_id: int) -> None:
+    item = await state.repository.get_download_task_item(item_id)
+    if item is None:
+        return
+    title = (item.parsed_title or Path(item.file_name).stem).strip()
+    if not title:
+        await state.repository.update_download_task_item(
+            item_id,
+            status="metadata_not_found",
+            last_error="No title parsed from torrent file.",
+        )
+        return
+    await state.repository.update_download_task_item(
+        item_id,
+        status="metadata_searching",
+        last_error=None,
+    )
+    try:
+        metadata = await state.metadata.lookup(title=title, artist=item.artist)
+    except Exception as exc:  # noqa: BLE001
+        await state.repository.update_download_task_item(
+            item_id,
+            status="failed",
+            last_error=str(exc),
+        )
+        return
+    if metadata is None:
+        await state.repository.update_download_task_item(
+            item_id,
+            status="metadata_not_found",
+            last_error="No metadata matched.",
+        )
+        return
+    await state.repository.update_download_task_item(
+        item_id,
+        status="metadata_found",
+        metadata_title=metadata.title,
+        metadata_artist=metadata.artist,
+        metadata_album=metadata.album,
+        metadata_payload=_track_metadata_payload(metadata),
+        last_error=None,
+    )
+
+
+def _track_metadata_payload(metadata: TrackMetadata) -> dict[str, object]:
+    return dataclasses.asdict(metadata)
+
+
+def _torrent_audio_items(torrent_data: bytes) -> list[dict[str, object]]:
+    payload = _bdecode(torrent_data)
+    if not isinstance(payload, dict):
+        return []
+    info = payload.get(b"info")
+    if not isinstance(info, dict):
+        return []
+    items: list[dict[str, object]] = []
+    root_name = _decode_torrent_text(info.get(b"name.utf-8") or info.get(b"name") or b"")
+    files = info.get(b"files")
+    if isinstance(files, list):
+        for file_info in files:
+            if not isinstance(file_info, dict):
+                continue
+            path_value = file_info.get(b"path.utf-8") or file_info.get(b"path")
+            if not isinstance(path_value, list):
+                continue
+            parts = [_decode_torrent_text(part) for part in path_value]
+            file_path = "/".join(part for part in [root_name, *parts] if part)
+            _append_torrent_audio_item(items, file_path, file_info.get(b"length"))
+        return items
+
+    single_name = root_name
+    _append_torrent_audio_item(items, single_name, info.get(b"length"))
+    return items
+
+
+def _append_torrent_audio_item(
+    items: list[dict[str, object]],
+    file_path: str,
+    size: object,
+) -> None:
+    if not file_path:
+        return
+    file_name = Path(file_path).name
+    if Path(file_name).suffix.lower() not in _TORRENT_AUDIO_EXTENSIONS:
+        return
+    items.append(
+        {
+            "file_name": file_name,
+            "file_path": file_path,
+            "parsed_title": _title_from_audio_filename(file_name),
+            "size": size if isinstance(size, int) else None,
+        }
+    )
+
+
+def _title_from_audio_filename(file_name: str) -> str:
+    title = Path(file_name).stem
+    title = re.sub(r"^\s*(?:cd\s*\d+\s*[-_. ]*)?\d{1,3}\s*[-_. ]+", "", title, flags=re.I)
+    title = re.sub(r"\s+", " ", title.replace("_", " ")).strip()
+    return title or Path(file_name).stem
+
+
+def _decode_torrent_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, bytes):
+        return ""
+    for encoding in ("utf-8", "gb18030", "big5"):
+        try:
+            return value.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return value.decode("utf-8", errors="replace")
+
+
+def _bdecode(data: bytes) -> object:
+    value, offset = _bdecode_at(data, 0)
+    if offset != len(data):
+        raise ValueError("Invalid trailing data in torrent file.")
+    return value
+
+
+def _bdecode_at(data: bytes, offset: int) -> tuple[object, int]:
+    if offset >= len(data):
+        raise ValueError("Unexpected end of torrent file.")
+    token = data[offset : offset + 1]
+    if token == b"i":
+        end = data.index(b"e", offset)
+        return int(data[offset + 1 : end]), end + 1
+    if token == b"l":
+        values: list[object] = []
+        offset += 1
+        while data[offset : offset + 1] != b"e":
+            value, offset = _bdecode_at(data, offset)
+            values.append(value)
+        return values, offset + 1
+    if token == b"d":
+        values: dict[bytes, object] = {}
+        offset += 1
+        while data[offset : offset + 1] != b"e":
+            key, offset = _bdecode_at(data, offset)
+            if not isinstance(key, bytes):
+                raise ValueError("Invalid torrent dictionary key.")
+            value, offset = _bdecode_at(data, offset)
+            values[key] = value
+        return values, offset + 1
+    if token.isdigit():
+        separator = data.index(b":", offset)
+        length = int(data[offset:separator])
+        start = separator + 1
+        end = start + length
+        return data[start:end], end
+    raise ValueError("Invalid bencode token.")
 
 
 async def _run_metadata_site_search_stream(
@@ -2659,6 +2966,26 @@ def _download_task_response(item: TorrentRecord) -> DownloadTaskResponse:
         save_path=item.save_path,
         source=item.source,
         last_error=item.last_error,
+    )
+
+
+def _download_task_item_response(item: TorrentRecordItem) -> DownloadTaskItemResponse:
+    return DownloadTaskItemResponse(
+        id=item.id,
+        torrent_record_id=item.torrent_record_id,
+        file_name=item.file_name,
+        file_path=item.file_path,
+        artist=item.artist,
+        parsed_title=item.parsed_title,
+        metadata_title=item.metadata_title,
+        metadata_artist=item.metadata_artist,
+        metadata_album=item.metadata_album,
+        playlist_track_id=item.playlist_track_id,
+        status=item.status,
+        last_error=item.last_error,
+        metadata_payload=item.metadata_payload,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
     )
 
 
