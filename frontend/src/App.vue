@@ -163,6 +163,16 @@ type MusicLibraryTrack = {
   year?: number | null
 }
 
+type MusicLibraryStats = {
+  songs: number
+  albums: number
+  artists: number
+}
+
+type MusicLibraryTrackPageResponse = PageResponse<MusicLibraryTrack> & {
+  stats: MusicLibraryStats
+}
+
 type Site = {
   id?: string | null
   name: string
@@ -283,6 +293,13 @@ type PlaylistTrack = {
   last_error?: string | null
 }
 
+type PageResponse<T> = {
+  items: T[]
+  total: number
+  page: number
+  page_size: number
+}
+
 type SystemSettings = {
   proxy: {
     host: string
@@ -370,6 +387,10 @@ const logPaused = ref(false)
 const logLevel = ref('ALL')
 const logQuery = ref('')
 const musicLibraryQuery = ref('')
+const musicLibraryPage = ref(1)
+const musicLibraryPageSize = ref(20)
+const musicLibraryTotal = ref(0)
+const musicLibraryStats = ref<MusicLibraryStats>({ songs: 0, albums: 0, artists: 0 })
 const musicLibraryLoading = ref(false)
 let logTimer: number | undefined
 let downloadTimer: number | undefined
@@ -381,6 +402,10 @@ const downloadTaskItems = ref<DownloadTaskItem[]>([])
 const selectedDownloadTask = ref<DownloadTask | null>(null)
 const selectedDownloadIds = ref<number[]>([])
 const mediaFiles = ref<MediaFile[]>([])
+const mediaQuery = ref('')
+const mediaPage = ref(1)
+const mediaPageSize = ref(20)
+const mediaTotal = ref(0)
 const selectedMediaIds = ref<number[]>([])
 const fileEntries = ref<FileEntry[]>([])
 const selectedFilePaths = ref<string[]>([])
@@ -403,6 +428,13 @@ const selectedPlaylistConnectionId = ref<string | null>(null)
 const playlistImportUrl = ref('')
 const selectedPlaylist = ref<Playlist | null>(null)
 const playlistTracks = ref<PlaylistTrack[]>([])
+const playlistTrackTitleQuery = ref('')
+const playlistTrackArtistQuery = ref('')
+const playlistTrackDownloadStatus = ref('')
+const playlistTrackLibraryStatus = ref<'all' | 'yes' | 'no'>('all')
+const playlistTrackPage = ref(1)
+const playlistTrackPageSize = ref(20)
+const playlistTrackTotal = ref(0)
 
 const siteDialog = ref(false)
 const downloaderDialog = ref(false)
@@ -437,6 +469,10 @@ const activeDownloadDeleteMode = ref<DownloadDeleteMode | null>(null)
 const activeMediaDeleteMode = ref<MediaDeleteMode | null>(null)
 const systemSaving = ref(false)
 const artists = ref<Artist[]>([])
+const artistQuery = ref('')
+const artistPage = ref(1)
+const artistPageSize = ref(20)
+const artistTotal = ref(0)
 const artistLoading = ref(false)
 const artistBuilding = ref(false)
 const artistAliasDialog = ref(false)
@@ -562,6 +598,28 @@ const duplicateHandlingOptions = [
   { title: '保留最大文件', value: 'keep_largest' }
 ]
 
+const playlistTrackDownloadStatusOptions = [
+  { title: '全部下载状态', value: '' },
+  { title: '等待', value: 'waiting' },
+  { title: '队列中', value: 'queue' },
+  { title: '搜索中', value: 'searching' },
+  { title: '已提交', value: 'submitted' },
+  { title: '下载中', value: 'downloading' },
+  { title: '已完成', value: 'completed' },
+  { title: '刷新中', value: 'refreshing_library' },
+  { title: '已入库', value: 'library_refreshed' },
+  { title: '已存在', value: 'existing' },
+  { title: '未找到', value: 'not_found' },
+  { title: '失败', value: 'failed' },
+  { title: '已删除', value: 'deleted' }
+]
+
+const playlistTrackLibraryStatusOptions = [
+  { title: '全部在库状态', value: 'all' },
+  { title: '已在库', value: 'yes' },
+  { title: '未在库', value: 'no' }
+]
+
 const navItems = [
   { title: '搜索', value: 'search', icon: 'mdi-magnify' },
   { title: '下载', value: 'downloads', icon: 'mdi-download' },
@@ -599,34 +657,6 @@ const filteredLogs = computed(() => {
     const text = `${entry.timestamp} ${entry.category} ${entry.level} ${entry.message}`.toLowerCase()
     return levelMatches && (!keyword || text.includes(keyword))
   })
-})
-
-const filteredMusicLibraryTracks = computed(() => {
-  const keyword = musicLibraryQuery.value.trim().toLowerCase()
-  if (!keyword) return musicLibraryTracks.value
-  return musicLibraryTracks.value.filter((track) =>
-    [track.title, track.artist, track.album, track.year?.toString()]
-      .filter(Boolean)
-      .join(' ')
-      .toLowerCase()
-      .includes(keyword)
-  )
-})
-
-const musicLibraryStats = computed(() => {
-  const albums = new Set<string>()
-  const artists = new Set<string>()
-  for (const track of musicLibraryTracks.value) {
-    const album = track.album?.trim()
-    const artist = track.artist?.trim()
-    if (album) albums.add(album.toLowerCase())
-    if (artist) artists.add(artist.toLowerCase())
-  }
-  return {
-    songs: musicLibraryTracks.value.length,
-    albums: albums.size,
-    artists: artists.size
-  }
 })
 
 const connectedMusicPlatforms = computed(() =>
@@ -671,6 +701,13 @@ const someDownloadsSelected = computed(
 )
 
 const mediaFileIds = computed(() => mediaFiles.value.map((item) => item.id))
+const mediaPageLength = computed(() =>
+  Math.max(1, Math.ceil(mediaTotal.value / mediaPageSize.value))
+)
+
+const musicLibraryPageLength = computed(() =>
+  Math.max(1, Math.ceil(musicLibraryTotal.value / musicLibraryPageSize.value))
+)
 
 const allMediaSelected = computed({
   get: () =>
@@ -685,6 +722,14 @@ const someMediaSelected = computed(
   () =>
     selectedMediaIds.value.length > 0 &&
     !mediaFileIds.value.every((id) => selectedMediaIds.value.includes(id))
+)
+
+const artistPageLength = computed(() =>
+  Math.max(1, Math.ceil(artistTotal.value / artistPageSize.value))
+)
+
+const playlistTrackPageLength = computed(() =>
+  Math.max(1, Math.ceil(playlistTrackTotal.value / playlistTrackPageSize.value))
 )
 
 const fileEntryPaths = computed(() => fileEntries.value.map((item) => item.path))
@@ -750,6 +795,10 @@ function notify(text: string, color = 'success') {
   snackbar.value = { show: true, color, text }
 }
 
+function trimmedInput(value: string | null | undefined) {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
 async function login() {
   loginLoading.value = true
   try {
@@ -780,8 +829,7 @@ async function loadInitialData() {
     loadMediaServers(),
     loadNotifiers(),
     loadPlaylists(),
-    loadSystemSettings(),
-    loadMedia()
+    loadSystemSettings()
   ])
   syncPagePolling()
   subscribeMetadataSiteSearch()
@@ -997,6 +1045,9 @@ function switchPage(page: string) {
   if (page === 'files' && !fileEntries.value.length && !fileLoading.value) {
     void loadFiles('')
   }
+  if (page === 'media' && !mediaFiles.value.length) {
+    void loadMedia()
+  }
   if (page === 'playlists' && !playlists.value.length && !playlistLoading.value) {
     void loadPlaylists()
   }
@@ -1101,9 +1152,24 @@ async function confirmDeleteDownloads(mode: DownloadDeleteMode) {
 }
 
 async function loadMedia() {
-  mediaFiles.value = await api<MediaFile[]>('/api/media')
+  const params = new URLSearchParams({
+    page: String(mediaPage.value),
+    page_size: String(mediaPageSize.value)
+  })
+  const query = trimmedInput(mediaQuery.value)
+  if (query) params.set('q', query)
+  const response = await api<PageResponse<MediaFile>>(`/api/media?${params.toString()}`)
+  mediaFiles.value = response.items
+  mediaTotal.value = response.total
+  mediaPage.value = response.page
+  mediaPageSize.value = response.page_size
   const existingIds = new Set(mediaFileIds.value)
   selectedMediaIds.value = selectedMediaIds.value.filter((id) => existingIds.has(id))
+}
+
+function applyMediaFilters() {
+  mediaPage.value = 1
+  void loadMedia()
 }
 
 function deleteMediaFile(row: MediaFile) {
@@ -1172,7 +1238,7 @@ async function loadFiles(path = filePath.value) {
   fileLoading.value = true
   fileError.value = ''
   try {
-    const search = fileSearchQuery.value.trim()
+    const search = trimmedInput(fileSearchQuery.value)
     const params = new URLSearchParams()
     if (path) params.set('path', path)
     if (search) {
@@ -1295,7 +1361,16 @@ async function confirmFileOrganize() {
 async function loadMusicLibrary() {
   musicLibraryLoading.value = true
   try {
-    musicLibraryTracks.value = await api<MusicLibraryTrack[]>('/api/music-library')
+    const params = new URLSearchParams({
+      page: String(musicLibraryPage.value),
+      page_size: String(musicLibraryPageSize.value)
+    })
+    const query = trimmedInput(musicLibraryQuery.value)
+    if (query) params.set('q', query)
+    const response = await api<MusicLibraryTrackPageResponse>(
+      `/api/music-library?${params.toString()}`
+    )
+    applyMusicLibraryResponse(response)
   } catch (error) {
     notify(error instanceof Error ? error.message : '音乐库加载失败', 'error')
   } finally {
@@ -1303,12 +1378,35 @@ async function loadMusicLibrary() {
   }
 }
 
+function applyMusicLibraryResponse(response: MusicLibraryTrackPageResponse) {
+  musicLibraryTracks.value = response.items
+  musicLibraryTotal.value = response.total
+  musicLibraryPage.value = response.page
+  musicLibraryPageSize.value = response.page_size
+  musicLibraryStats.value = response.stats
+}
+
+function applyMusicLibraryFilters() {
+  musicLibraryPage.value = 1
+  void loadMusicLibrary()
+}
+
 async function syncMusicLibrary() {
   musicLibraryLoading.value = true
   try {
-    musicLibraryTracks.value = await api<MusicLibraryTrack[]>('/api/music-library/sync', {
-      method: 'POST'
+    const params = new URLSearchParams({
+      page: String(musicLibraryPage.value),
+      page_size: String(musicLibraryPageSize.value)
     })
+    const query = trimmedInput(musicLibraryQuery.value)
+    if (query) params.set('q', query)
+    const response = await api<MusicLibraryTrackPageResponse>(
+      `/api/music-library/sync?${params.toString()}`,
+      {
+        method: 'POST'
+      }
+    )
+    applyMusicLibraryResponse(response)
     notify('音乐库已同步')
   } catch (error) {
     notify(error instanceof Error ? error.message : '音乐库同步失败', 'error')
@@ -1318,7 +1416,27 @@ async function syncMusicLibrary() {
 }
 
 async function loadArtists() {
-  artists.value = await api<Artist[]>('/api/artists')
+  artistLoading.value = true
+  try {
+    const params = new URLSearchParams({
+      page: String(artistPage.value),
+      page_size: String(artistPageSize.value)
+    })
+    const query = trimmedInput(artistQuery.value)
+    if (query) params.set('q', query)
+    const response = await api<PageResponse<Artist>>(`/api/artists?${params.toString()}`)
+    artists.value = response.items
+    artistTotal.value = response.total
+    artistPage.value = response.page
+    artistPageSize.value = response.page_size
+  } finally {
+    artistLoading.value = false
+  }
+}
+
+function applyArtistFilters() {
+  artistPage.value = 1
+  void loadArtists()
 }
 
 async function loadArtistBuildStatus() {
@@ -1570,6 +1688,12 @@ async function importSelectedPlaylists() {
 async function viewPlaylist(playlist: Playlist) {
   selectedPlaylist.value = playlist
   playlistTracks.value = []
+  playlistTrackTitleQuery.value = ''
+  playlistTrackArtistQuery.value = ''
+  playlistTrackDownloadStatus.value = ''
+  playlistTrackLibraryStatus.value = 'all'
+  playlistTrackPage.value = 1
+  playlistTrackTotal.value = 0
   playlistTracksDialog.value = true
   await loadPlaylistTracks(playlist)
 }
@@ -1577,11 +1701,42 @@ async function viewPlaylist(playlist: Playlist) {
 async function loadPlaylistTracks(playlist: Playlist) {
   playlistTrackLoading.value = true
   try {
-    playlistTracks.value = await api<PlaylistTrack[]>(`/api/playlists/${playlist.id}/tracks`)
+    const params = new URLSearchParams({
+      page: String(playlistTrackPage.value),
+      page_size: String(playlistTrackPageSize.value)
+    })
+    const titleQuery = trimmedInput(playlistTrackTitleQuery.value)
+    const artistQuery = trimmedInput(playlistTrackArtistQuery.value)
+    if (titleQuery) {
+      params.set('title', titleQuery)
+    }
+    if (artistQuery) {
+      params.set('artist', artistQuery)
+    }
+    if (playlistTrackDownloadStatus.value) {
+      params.set('download_status', playlistTrackDownloadStatus.value)
+    }
+    if (playlistTrackLibraryStatus.value !== 'all') {
+      params.set('exists_in_library', playlistTrackLibraryStatus.value === 'yes' ? 'true' : 'false')
+    }
+    const response = await api<PageResponse<PlaylistTrack>>(
+      `/api/playlists/${playlist.id}/tracks?${params.toString()}`
+    )
+    playlistTracks.value = response.items
+    playlistTrackTotal.value = response.total
+    playlistTrackPage.value = response.page
+    playlistTrackPageSize.value = response.page_size
   } catch (error) {
     notify(error instanceof Error ? error.message : '歌单明细加载失败', 'error')
   } finally {
     playlistTrackLoading.value = false
+  }
+}
+
+function applyPlaylistTrackFilters() {
+  playlistTrackPage.value = 1
+  if (selectedPlaylist.value) {
+    void loadPlaylistTracks(selectedPlaylist.value)
   }
 }
 
@@ -2545,6 +2700,19 @@ onUnmounted(() => {
               >
                 删除
               </v-btn>
+              <v-text-field
+                v-model="mediaQuery"
+                label="搜索整理记录"
+                prepend-inner-icon="mdi-magnify"
+                hide-details
+                clearable
+                class="table-search"
+                @keyup.enter="applyMediaFilters"
+                @click:clear="applyMediaFilters"
+              />
+              <v-btn prepend-icon="mdi-magnify" variant="tonal" @click="applyMediaFilters">
+                搜索
+              </v-btn>
             </div>
             <v-card>
               <v-table>
@@ -2607,6 +2775,25 @@ onUnmounted(() => {
                   </tr>
                 </tbody>
               </v-table>
+              <div class="pagination-row">
+                <v-select
+                  v-model="mediaPageSize"
+                  :items="[20, 50, 100]"
+                  label="每页"
+                  density="compact"
+                  hide-details
+                  class="page-size-select"
+                  @update:model-value="applyMediaFilters"
+                />
+                <v-pagination
+                  v-model="mediaPage"
+                  :length="mediaPageLength"
+                  density="comfortable"
+                  total-visible="7"
+                  @update:model-value="loadMedia"
+                />
+                <v-chip color="secondary" variant="tonal">共 {{ mediaTotal }} 条</v-chip>
+              </div>
             </v-card>
           </section>
 
@@ -2698,7 +2885,7 @@ onUnmounted(() => {
                   </tr>
                   <tr v-else-if="!fileEntries.length && !fileLoading">
                     <td colspan="6" class="empty-cell">
-                      {{ fileSearchQuery.trim() ? '没有匹配文件' : '目录为空' }}
+                      {{ trimmedInput(fileSearchQuery) ? '没有匹配文件' : '目录为空' }}
                     </td>
                   </tr>
                   <tr
@@ -2778,10 +2965,16 @@ onUnmounted(() => {
                 prepend-inner-icon="mdi-magnify"
                 hide-details
                 clearable
-                class="music-library-search"
+                class="table-search"
+                @keydown.enter="applyMusicLibraryFilters"
+                @click:clear="applyMusicLibraryFilters"
               />
+              <v-btn prepend-icon="mdi-magnify" variant="tonal" @click="applyMusicLibraryFilters">
+                查询
+              </v-btn>
             </div>
             <v-card>
+              <v-progress-linear v-if="musicLibraryLoading" indeterminate color="primary" />
               <v-table>
                 <thead>
                   <tr>
@@ -2794,10 +2987,10 @@ onUnmounted(() => {
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-if="!filteredMusicLibraryTracks.length">
+                  <tr v-if="!musicLibraryTracks.length">
                     <td colspan="6" class="empty-cell">暂无音乐库记录</td>
                   </tr>
-                  <tr v-for="track in filteredMusicLibraryTracks" :key="track.id">
+                  <tr v-for="track in musicLibraryTracks" :key="track.id">
                     <td>{{ track.title || '-' }}</td>
                     <td>{{ track.artist || '-' }}</td>
                     <td>{{ track.album || '-' }}</td>
@@ -2807,6 +3000,25 @@ onUnmounted(() => {
                   </tr>
                 </tbody>
               </v-table>
+              <div class="pagination-row">
+                <v-select
+                  v-model="musicLibraryPageSize"
+                  :items="[10, 20, 50, 100]"
+                  density="comfortable"
+                  hide-details
+                  label="每页"
+                  class="page-size-select"
+                  @update:model-value="applyMusicLibraryFilters"
+                />
+                <v-pagination
+                  v-model="musicLibraryPage"
+                  :length="musicLibraryPageLength"
+                  density="comfortable"
+                  total-visible="5"
+                  @update:model-value="loadMusicLibrary"
+                />
+                <v-chip color="secondary" variant="tonal">共 {{ musicLibraryTotal }} 条</v-chip>
+              </div>
             </v-card>
           </section>
 
@@ -2946,11 +3158,25 @@ onUnmounted(() => {
               >
                 清空并重建
               </v-btn>
-              <v-chip v-if="artists.length" color="primary" variant="tonal">
-                共 {{ artists.length }} 个歌手
+              <v-text-field
+                v-model="artistQuery"
+                label="搜索歌手或别名"
+                prepend-inner-icon="mdi-magnify"
+                hide-details
+                clearable
+                class="table-search"
+                @keyup.enter="applyArtistFilters"
+                @click:clear="applyArtistFilters"
+              />
+              <v-btn prepend-icon="mdi-magnify" variant="tonal" @click="applyArtistFilters">
+                搜索
+              </v-btn>
+              <v-chip v-if="artistTotal" color="primary" variant="tonal">
+                共 {{ artistTotal }} 个歌手
               </v-chip>
             </div>
             <v-card>
+              <v-progress-linear v-if="artistLoading" indeterminate color="primary" />
               <v-table>
                 <thead>
                   <tr>
@@ -3006,6 +3232,24 @@ onUnmounted(() => {
                   </tr>
                 </tbody>
               </v-table>
+              <div class="pagination-row">
+                <v-select
+                  v-model="artistPageSize"
+                  :items="[20, 50, 100]"
+                  label="每页"
+                  density="compact"
+                  hide-details
+                  class="page-size-select"
+                  @update:model-value="applyArtistFilters"
+                />
+                <v-pagination
+                  v-model="artistPage"
+                  :length="artistPageLength"
+                  density="comfortable"
+                  total-visible="7"
+                  @update:model-value="loadArtists"
+                />
+              </div>
             </v-card>
           </section>
 
@@ -3607,6 +3851,47 @@ onUnmounted(() => {
           />
         </v-card-title>
         <v-card-text>
+          <div class="toolbar-row dialog-filter-row">
+            <v-text-field
+              v-model="playlistTrackTitleQuery"
+              label="歌名"
+              prepend-inner-icon="mdi-magnify"
+              density="compact"
+              hide-details
+              clearable
+              @keyup.enter="applyPlaylistTrackFilters"
+              @click:clear="applyPlaylistTrackFilters"
+            />
+            <v-text-field
+              v-model="playlistTrackArtistQuery"
+              label="歌手"
+              prepend-inner-icon="mdi-account-music-outline"
+              density="compact"
+              hide-details
+              clearable
+              @keyup.enter="applyPlaylistTrackFilters"
+              @click:clear="applyPlaylistTrackFilters"
+            />
+            <v-select
+              v-model="playlistTrackDownloadStatus"
+              :items="playlistTrackDownloadStatusOptions"
+              label="下载状态"
+              density="compact"
+              hide-details
+              @update:model-value="applyPlaylistTrackFilters"
+            />
+            <v-select
+              v-model="playlistTrackLibraryStatus"
+              :items="playlistTrackLibraryStatusOptions"
+              label="在库状态"
+              density="compact"
+              hide-details
+              @update:model-value="applyPlaylistTrackFilters"
+            />
+            <v-btn prepend-icon="mdi-magnify" variant="tonal" @click="applyPlaylistTrackFilters">
+              查询
+            </v-btn>
+          </div>
           <v-progress-linear v-if="playlistTrackLoading" indeterminate color="primary" />
           <v-table class="playlist-track-table fixed-table">
             <thead>
@@ -3667,6 +3952,25 @@ onUnmounted(() => {
               </tr>
             </tbody>
           </v-table>
+          <div class="pagination-row">
+            <v-select
+              v-model="playlistTrackPageSize"
+              :items="[20, 50, 100]"
+              label="每页"
+              density="compact"
+              hide-details
+              class="page-size-select"
+              @update:model-value="applyPlaylistTrackFilters"
+            />
+            <v-pagination
+              v-model="playlistTrackPage"
+              :length="playlistTrackPageLength"
+              density="comfortable"
+              total-visible="7"
+              @update:model-value="selectedPlaylist && loadPlaylistTracks(selectedPlaylist)"
+            />
+            <v-chip color="secondary" variant="tonal">共 {{ playlistTrackTotal }} 首</v-chip>
+          </div>
         </v-card-text>
         <v-card-actions>
           <v-spacer />
@@ -4082,9 +4386,31 @@ onUnmounted(() => {
   background: rgba(var(--v-theme-error), 0.08);
 }
 
-.music-library-search {
+.table-search {
   max-width: 360px;
   min-width: 240px;
+}
+
+.page-size-select {
+  max-width: 120px;
+  min-width: 96px;
+}
+
+.pagination-row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: flex-end;
+  padding: 12px 16px 16px;
+}
+
+.dialog-filter-row {
+  margin-bottom: 12px;
+}
+
+.dialog-filter-row > * {
+  min-width: 160px;
 }
 
 .platform-select {

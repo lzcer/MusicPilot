@@ -406,6 +406,13 @@ class PlaylistTrackResponse(BaseModel):
     last_error: str | None = None
 
 
+class PlaylistTrackPageResponse(BaseModel):
+    items: list[PlaylistTrackResponse]
+    total: int
+    page: int
+    page_size: int
+
+
 class PlaylistImportResponse(BaseModel):
     playlists: list[PlaylistResponse]
 
@@ -500,6 +507,13 @@ class MediaFileResponse(BaseModel):
     track_number: int | None
 
 
+class MediaFilePageResponse(BaseModel):
+    items: list[MediaFileResponse]
+    total: int
+    page: int
+    page_size: int
+
+
 class MusicLibraryTrackResponse(BaseModel):
     id: str
     title: str
@@ -508,6 +522,20 @@ class MusicLibraryTrackResponse(BaseModel):
     duration: int | None = None
     size: int | None = None
     year: int | None = None
+
+
+class MusicLibraryStatsResponse(BaseModel):
+    songs: int
+    albums: int
+    artists: int
+
+
+class MusicLibraryTrackPageResponse(BaseModel):
+    items: list[MusicLibraryTrackResponse]
+    total: int
+    page: int
+    page_size: int
+    stats: MusicLibraryStatsResponse
 
 
 class ArtistAliasResponse(BaseModel):
@@ -520,6 +548,13 @@ class ArtistResponse(BaseModel):
     name: str
     normalized_name: str
     aliases: list[ArtistAliasResponse] = Field(default_factory=list)
+
+
+class ArtistPageResponse(BaseModel):
+    items: list[ArtistResponse]
+    total: int
+    page: int
+    page_size: int
 
 
 class BuildArtistLibraryResponse(BaseModel):

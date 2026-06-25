@@ -75,6 +75,7 @@ from musicpilot.infra.api.schemas import (
     AddArtistAliasRequest,
     ArtistAliasResponse,
     ArtistBuildStatusResponse,
+    ArtistPageResponse,
     ArtistResponse,
     BuildArtistLibraryResponse,
     ClearArtistLibraryResponse,
@@ -102,6 +103,7 @@ from musicpilot.infra.api.schemas import (
     MediaBulkDeleteResponse,
     MediaCandidateResponse,
     MediaDeleteMode,
+    MediaFilePageResponse,
     MediaFileResponse,
     MediaServerCreateRequest,
     MediaServerResponse,
@@ -109,6 +111,8 @@ from musicpilot.infra.api.schemas import (
     MetadataSearchResponse,
     MetadataSiteSearchRequest,
     MetadataSiteSearchResponse,
+    MusicLibraryStatsResponse,
+    MusicLibraryTrackPageResponse,
     MusicLibraryTrackResponse,
     MusicPlatformConnectRequest,
     MusicPlatformConnectResponse,
@@ -126,6 +130,7 @@ from musicpilot.infra.api.schemas import (
     PlaylistImportUrlRequest,
     PlaylistResponse,
     PlaylistTrackDownloadResponse,
+    PlaylistTrackPageResponse,
     PlaylistTrackResponse,
     QBittorrentWebhookRequest,
     SearchRequest,
@@ -143,6 +148,7 @@ from musicpilot.infra.auth import issue_session, require_session
 from musicpilot.infra.config import Settings
 from musicpilot.infra.db import Database, SqlAlchemyMediaRepository
 from musicpilot.infra.db.models import (
+    Artist,
     DownloaderConfig,
     IndexerSite,
     MediaFile,
@@ -1505,13 +1511,34 @@ def create_app() -> FastAPI:
         playlist = await _import_public_playlist(state, parsed)
         return PlaylistImportResponse(playlists=[await _playlist_response(state, playlist)])
 
-    @app.get("/api/playlists/{playlist_id}/tracks", response_model=list[PlaylistTrackResponse])
-    async def playlist_tracks(playlist_id: int) -> list[PlaylistTrackResponse]:
+    @app.get("/api/playlists/{playlist_id}/tracks", response_model=PlaylistTrackPageResponse)
+    async def playlist_tracks(
+        playlist_id: int,
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, ge=1, le=100),
+        title: str | None = Query(default=None),
+        artist: str | None = Query(default=None),
+        download_status: str | None = Query(default=None),
+        exists_in_library: bool | None = Query(default=None),
+    ) -> PlaylistTrackPageResponse:
         playlist = await state.repository.get_playlist(playlist_id)
         if playlist is None:
             raise HTTPException(status_code=404, detail="Playlist not found.")
-        tracks = await state.repository.list_playlist_tracks(playlist_id)
-        return [_playlist_track_response(item) for item in tracks]
+        tracks, total = await state.repository.list_playlist_tracks_page(
+            playlist_id,
+            offset=_page_offset(page, page_size),
+            limit=page_size,
+            title=_optional_string(title),
+            artist=_optional_string(artist),
+            download_status=_optional_string(download_status),
+            exists_in_library=exists_in_library,
+        )
+        return PlaylistTrackPageResponse(
+            items=[_playlist_track_response(item) for item in tracks],
+            total=total,
+            page=page,
+            page_size=page_size,
+        )
 
     @app.delete("/api/playlists/{playlist_id}", status_code=204)
     async def delete_playlist(playlist_id: int) -> None:
@@ -1724,27 +1751,23 @@ def create_app() -> FastAPI:
             skipped_files=sum(1 for item in summary.results if item.status == "skipped"),
         )
 
-    @app.get("/api/media", response_model=list[MediaFileResponse])
-    async def media_files() -> list[MediaFileResponse]:
-        rows = await state.repository.list_media_files()
-        return [
-            MediaFileResponse(
-                id=row.id,
-                torrent_hash=row.torrent_hash,
-                source_path=row.source_path,
-                library_path=row.library_path,
-                status=row.status,
-                operation_time=row.updated_at,
-                remark=row.error_message,
-                error_message=row.error_message,
-                title=row.title,
-                artist=row.artist,
-                album=row.album,
-                year=row.year,
-                track_number=row.track_number,
-            )
-            for row in rows
-        ]
+    @app.get("/api/media", response_model=MediaFilePageResponse)
+    async def media_files(
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, ge=1, le=100),
+        q: str | None = Query(default=None),
+    ) -> MediaFilePageResponse:
+        rows, total = await state.repository.list_media_files_page(
+            offset=_page_offset(page, page_size),
+            limit=page_size,
+            query=_optional_string(q),
+        )
+        return MediaFilePageResponse(
+            items=[_media_file_response(row) for row in rows],
+            total=total,
+            page=page,
+            page_size=page_size,
+        )
 
     @app.delete("/api/media", response_model=MediaBulkDeleteResponse)
     async def delete_media_files(payload: MediaBulkDeleteRequest) -> MediaBulkDeleteResponse:
@@ -1790,50 +1813,75 @@ def create_app() -> FastAPI:
         if not deleted:
             raise HTTPException(status_code=404, detail="Media record not found.")
 
-    @app.get("/api/music-library", response_model=list[MusicLibraryTrackResponse])
-    async def music_library() -> list[MusicLibraryTrackResponse]:
-        return [
-            _music_library_track_response(item)
-            for item in await state.repository.list_music_library_tracks()
-        ]
+    @app.get("/api/music-library", response_model=MusicLibraryTrackPageResponse)
+    async def music_library(
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, ge=1, le=100),
+        q: str | None = Query(default=None),
+    ) -> MusicLibraryTrackPageResponse:
+        rows, total, albums, artists = await state.repository.list_music_library_tracks_page(
+            offset=_page_offset(page, page_size),
+            limit=page_size,
+            query=_optional_string(q),
+        )
+        return MusicLibraryTrackPageResponse(
+            items=[_music_library_track_response(item) for item in rows],
+            total=total,
+            page=page,
+            page_size=page_size,
+            stats=MusicLibraryStatsResponse(
+                songs=total,
+                albums=albums,
+                artists=artists,
+            ),
+        )
 
-    @app.post("/api/music-library/sync", response_model=list[MusicLibraryTrackResponse])
-    async def sync_music_library() -> list[MusicLibraryTrackResponse]:
+    @app.post("/api/music-library/sync", response_model=MusicLibraryTrackPageResponse)
+    async def sync_music_library(
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, ge=1, le=100),
+        q: str | None = Query(default=None),
+    ) -> MusicLibraryTrackPageResponse:
         try:
             await _sync_music_library_from_navidrome(state)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"Navidrome 音乐库同步失败：{exc}") from exc
-        return [
-            _music_library_track_response(item)
-            for item in await state.repository.list_music_library_tracks()
-        ]
+        rows, total, albums, artists = await state.repository.list_music_library_tracks_page(
+            offset=_page_offset(page, page_size),
+            limit=page_size,
+            query=_optional_string(q),
+        )
+        return MusicLibraryTrackPageResponse(
+            items=[_music_library_track_response(item) for item in rows],
+            total=total,
+            page=page,
+            page_size=page_size,
+            stats=MusicLibraryStatsResponse(
+                songs=total,
+                albums=albums,
+                artists=artists,
+            ),
+        )
 
     # ── Artist API ──────────────────────────────────────────────
 
-    @app.get("/api/artists", response_model=list[ArtistResponse])
-    async def list_artists() -> list[ArtistResponse]:
-        artists = await state.artist_service.list_artists()
-        result = []
-        for artist_info in artists:
-            # Get aliases with sources from DB
-            raw_aliases = await state.repository.list_artist_aliases(artist_info.id)
-            aliases_resp = []
-            seen: set[str] = set()
-            for alias_name in raw_aliases:
-                if alias_name != artist_info.name and alias_name not in seen:
-                    seen.add(alias_name)
-                    aliases_resp.append(
-                        ArtistAliasResponse(alias=alias_name, source="merged")
-                    )
-            result.append(
-                ArtistResponse(
-                    id=artist_info.id,
-                    name=artist_info.name,
-                    normalized_name=artist_info.normalized_name,
-                    aliases=aliases_resp,
-                )
-            )
-        return result
+    @app.get("/api/artists", response_model=ArtistPageResponse)
+    async def list_artists(
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, ge=1, le=100),
+        q: str | None = Query(default=None),
+    ) -> ArtistPageResponse:
+        artists, total = await state.repository.list_artists_page(
+            offset=_page_offset(page, page_size),
+            limit=page_size,
+            query=_optional_string(q),
+        )
+        return ArtistPageResponse(
+            items=[await _artist_response(state, item) for item in artists],
+            total=total,
+            page=page,
+            page_size=page_size,
+        )
 
     @app.get("/api/artists/build-status", response_model=ArtistBuildStatusResponse)
     async def artist_build_status() -> ArtistBuildStatusResponse:
@@ -2159,6 +2207,44 @@ def _playlist_track_response(item: PlaylistTrack) -> PlaylistTrackResponse:
         last_download_attempt_at=item.last_download_attempt_at,
         last_error=item.last_error,
     )
+
+
+def _media_file_response(row: MediaFile) -> MediaFileResponse:
+    return MediaFileResponse(
+        id=row.id,
+        torrent_hash=row.torrent_hash,
+        source_path=row.source_path,
+        library_path=row.library_path,
+        status=row.status,
+        operation_time=row.updated_at,
+        remark=row.error_message,
+        error_message=row.error_message,
+        title=row.title,
+        artist=row.artist,
+        album=row.album,
+        year=row.year,
+        track_number=row.track_number,
+    )
+
+
+async def _artist_response(state: AppState, artist: Artist) -> ArtistResponse:
+    raw_aliases = await state.repository.list_artist_aliases(artist.id)
+    aliases_resp: list[ArtistAliasResponse] = []
+    seen: set[str] = set()
+    for alias_name in raw_aliases:
+        if alias_name != artist.name and alias_name not in seen:
+            seen.add(alias_name)
+            aliases_resp.append(ArtistAliasResponse(alias=alias_name, source="merged"))
+    return ArtistResponse(
+        id=artist.id,
+        name=artist.name,
+        normalized_name=artist.normalized_name,
+        aliases=aliases_resp,
+    )
+
+
+def _page_offset(page: int, page_size: int) -> int:
+    return (page - 1) * page_size
 
 
 async def _import_spotify_playlist(

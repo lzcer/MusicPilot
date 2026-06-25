@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import delete, select
+from sqlalchemy import String, delete, func, or_, select
 
 from musicpilot.infra.db.models import (
     Artist,
@@ -631,6 +631,39 @@ class SqlAlchemyMediaRepository:
             )
             return list(result.scalars().all())
 
+    async def list_playlist_tracks_page(
+        self,
+        playlist_id: int,
+        *,
+        offset: int,
+        limit: int,
+        title: str | None = None,
+        artist: str | None = None,
+        download_status: str | None = None,
+        exists_in_library: bool | None = None,
+    ) -> tuple[list[PlaylistTrack], int]:
+        conditions = [PlaylistTrack.playlist_id == playlist_id]
+        if title:
+            conditions.append(PlaylistTrack.title.ilike(f"%{title}%"))
+        if artist:
+            conditions.append(PlaylistTrack.artist.ilike(f"%{artist}%"))
+        if download_status:
+            conditions.append(PlaylistTrack.download_status == download_status)
+        if exists_in_library is not None:
+            conditions.append(PlaylistTrack.exists_in_library.is_(exists_in_library))
+        async with self.database.session() as session:
+            total_result = await session.execute(
+                select(func.count()).select_from(PlaylistTrack).where(*conditions)
+            )
+            result = await session.execute(
+                select(PlaylistTrack)
+                .where(*conditions)
+                .order_by(PlaylistTrack.position, PlaylistTrack.id)
+                .offset(offset)
+                .limit(limit)
+            )
+            return list(result.scalars().all()), int(total_result.scalar_one())
+
     async def list_all_playlist_tracks(self) -> list[PlaylistTrack]:
         async with self.database.session() as session:
             result = await session.execute(
@@ -743,6 +776,40 @@ class SqlAlchemyMediaRepository:
             result = await session.execute(select(MediaFile).order_by(MediaFile.id.desc()))
             return list(result.scalars().all())
 
+    async def list_media_files_page(
+        self,
+        *,
+        offset: int,
+        limit: int,
+        query: str | None = None,
+    ) -> tuple[list[MediaFile], int]:
+        conditions = []
+        if query:
+            pattern = f"%{query}%"
+            conditions.append(
+                or_(
+                    MediaFile.title.ilike(pattern),
+                    MediaFile.artist.ilike(pattern),
+                    MediaFile.album.ilike(pattern),
+                    MediaFile.source_path.ilike(pattern),
+                    MediaFile.library_path.ilike(pattern),
+                    MediaFile.status.ilike(pattern),
+                    MediaFile.error_message.ilike(pattern),
+                )
+            )
+        async with self.database.session() as session:
+            total_result = await session.execute(
+                select(func.count()).select_from(MediaFile).where(*conditions)
+            )
+            result = await session.execute(
+                select(MediaFile)
+                .where(*conditions)
+                .order_by(MediaFile.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+            return list(result.scalars().all()), int(total_result.scalar_one())
+
     async def get_media_file(self, media_id: int) -> MediaFile | None:
         async with self.database.session() as session:
             return await session.get(MediaFile, media_id)
@@ -766,6 +833,64 @@ class SqlAlchemyMediaRepository:
                 )
             )
             return list(result.scalars().all())
+
+    async def list_music_library_tracks_page(
+        self,
+        offset: int,
+        limit: int,
+        query: str | None = None,
+    ) -> tuple[list[MusicLibraryTrack], int, int, int]:
+        conditions = []
+        if query:
+            pattern = f"%{query}%"
+            conditions.append(
+                or_(
+                    MusicLibraryTrack.title.ilike(pattern),
+                    MusicLibraryTrack.artist.ilike(pattern),
+                    MusicLibraryTrack.album.ilike(pattern),
+                    MusicLibraryTrack.path.ilike(pattern),
+                    MusicLibraryTrack.year.cast(String).ilike(pattern),
+                )
+            )
+        async with self.database.session() as session:
+            total_result = await session.execute(
+                select(func.count()).select_from(MusicLibraryTrack).where(*conditions)
+            )
+            album_result = await session.execute(
+                select(func.count(func.distinct(func.lower(func.trim(MusicLibraryTrack.album)))))
+                .select_from(MusicLibraryTrack)
+                .where(
+                    *conditions,
+                    MusicLibraryTrack.album.isnot(None),
+                    func.trim(MusicLibraryTrack.album) != "",
+                )
+            )
+            artist_result = await session.execute(
+                select(func.count(func.distinct(func.lower(func.trim(MusicLibraryTrack.artist)))))
+                .select_from(MusicLibraryTrack)
+                .where(
+                    *conditions,
+                    MusicLibraryTrack.artist.isnot(None),
+                    func.trim(MusicLibraryTrack.artist) != "",
+                )
+            )
+            result = await session.execute(
+                select(MusicLibraryTrack)
+                .where(*conditions)
+                .order_by(
+                    MusicLibraryTrack.artist,
+                    MusicLibraryTrack.album,
+                    MusicLibraryTrack.title,
+                )
+                .offset(offset)
+                .limit(limit)
+            )
+            return (
+                list(result.scalars().all()),
+                int(total_result.scalar_one()),
+                int(album_result.scalar_one()),
+                int(artist_result.scalar_one()),
+            )
 
     async def sync_music_library_tracks(self, tracks: list[dict[str, Any]]) -> int:
         synced_at = datetime.now(UTC)
@@ -1010,6 +1135,37 @@ class SqlAlchemyMediaRepository:
         async with self.database.session() as session:
             result = await session.execute(select(Artist).order_by(Artist.name))
             return list(result.scalars().all())
+
+    async def list_artists_page(
+        self,
+        *,
+        offset: int,
+        limit: int,
+        query: str | None = None,
+    ) -> tuple[list[Artist], int]:
+        conditions = []
+        if query:
+            pattern = f"%{query}%"
+            alias_artist_ids = select(ArtistAlias.artist_id).where(ArtistAlias.alias.ilike(pattern))
+            conditions.append(
+                or_(
+                    Artist.name.ilike(pattern),
+                    Artist.normalized_name.ilike(pattern),
+                    Artist.id.in_(alias_artist_ids),
+                )
+            )
+        async with self.database.session() as session:
+            total_result = await session.execute(
+                select(func.count()).select_from(Artist).where(*conditions)
+            )
+            result = await session.execute(
+                select(Artist)
+                .where(*conditions)
+                .order_by(Artist.name)
+                .offset(offset)
+                .limit(limit)
+            )
+            return list(result.scalars().all()), int(total_result.scalar_one())
 
     async def clear_all_artists(self) -> tuple[int, int]:
         """Delete all artists and aliases. Returns (deleted_aliases, deleted_artists)."""
