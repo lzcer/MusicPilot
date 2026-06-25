@@ -145,6 +145,18 @@ class ArtistService:
 
         return name
 
+    async def has_artist_name(self, name: str | None) -> bool:
+        if not name:
+            return False
+        name = name.strip()
+        if not name:
+            return False
+        artist_id = await self._repo.find_artist_id_by_alias(name)
+        if artist_id is not None:
+            return True
+        normalized = normalize_artist_name(name)
+        return await self._repo.find_artist_by_normalized(normalized) is not None
+
     async def ensure_artist(
         self,
         name: str,
@@ -279,10 +291,12 @@ class ArtistService:
                             break
 
                 if existing_artist is not None:
-                    # Already exists -- add any new aliases, then skip MB lookup
-                    for alias in names:
-                        if alias != existing_artist.name:
-                            await self._repo.add_alias(existing_artist.id, alias, "media_file")
+                    aliases = tuple(
+                        (alias, "media_file")
+                        for alias in names
+                        if alias != existing_artist.name
+                    )
+                    await self._repo.add_aliases(existing_artist.id, aliases)
                     skipped += 1
                     continue
 
@@ -301,12 +315,15 @@ class ArtistService:
                     normalized_name=normalized,
                     external_ids={},
                 )
-                for alias in names:
-                    src = "primary" if alias == canonical else "media_file"
-                    await self._repo.add_alias(artist.id, alias, src)
-                for mb_alias in mb_aliases:
-                    if mb_alias != canonical:
-                        await self._repo.add_alias(artist.id, mb_alias, "musicbrainz")
+                aliases = tuple(
+                    (alias, "primary" if alias == canonical else "media_file")
+                    for alias in names
+                ) + tuple(
+                    (mb_alias, "musicbrainz")
+                    for mb_alias in mb_aliases
+                    if mb_alias != canonical
+                )
+                await self._repo.add_aliases(artist.id, aliases)
                 created += 1
 
         logger.info(

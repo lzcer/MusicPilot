@@ -954,6 +954,27 @@ class SqlAlchemyMediaRepository:
             session.add(row)
             await session.commit()
 
+    async def add_aliases(self, artist_id: int, aliases: tuple[tuple[str, str], ...]) -> None:
+        if not aliases:
+            return
+        names = tuple(dict.fromkeys(alias for alias, _source in aliases if alias))
+        if not names:
+            return
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(ArtistAlias.alias).where(
+                    ArtistAlias.artist_id == artist_id,
+                    ArtistAlias.alias.in_(names),
+                )
+            )
+            existing = set(result.scalars().all())
+            for alias, source in aliases:
+                if not alias or alias in existing:
+                    continue
+                session.add(ArtistAlias(artist_id=artist_id, alias=alias, source=source))
+                existing.add(alias)
+            await session.commit()
+
     async def list_artist_aliases(self, artist_id: int) -> list[str]:
         async with self.database.session() as session:
             result = await session.execute(
@@ -1005,7 +1026,7 @@ class SqlAlchemyMediaRepository:
             return len(aliases), len(artists)
 
     async def list_distinct_artists(self) -> list[str]:
-        """Return all unique artist names from media_files, music_library_tracks, and playlist_tracks."""
+        """Return unique artist names from media files, library tracks, and playlists."""
         async with self.database.session() as session:
             media_result = await session.execute(
                 select(MediaFile.artist).where(

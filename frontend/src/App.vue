@@ -1,5 +1,5 @@
 ﻿<script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
 type ParserField = {
   selector: string
@@ -781,14 +781,9 @@ async function loadInitialData() {
     loadNotifiers(),
     loadPlaylists(),
     loadSystemSettings(),
-    loadMedia(),
-    loadDownloads(),
-    loadLogs()
+    loadMedia()
   ])
-  startLogPolling()
-  startDownloadPolling()
-  startArtistBuildPolling()
-  void loadArtistBuildStatus()
+  syncPagePolling()
   subscribeMetadataSiteSearch()
 }
 
@@ -1005,8 +1000,15 @@ function switchPage(page: string) {
   if (page === 'playlists' && !playlists.value.length && !playlistLoading.value) {
     void loadPlaylists()
   }
+  if (page === 'downloads') {
+    void loadDownloads().catch(() => undefined)
+  }
+  if (page === 'logs') {
+    void loadLogs()
+  }
   if (page === 'artists') {
     void loadArtists()
+    void loadArtistBuildStatus()
   }
 }
 
@@ -1337,7 +1339,6 @@ async function buildArtistLibrary() {
     notify('歌手库构建已开始，完成后将通过日志通知')
   } catch (error) {
     notify(error instanceof Error ? error.message : '构建歌手库失败', 'error')
-  } finally {
     artistBuilding.value = false
   }
 }
@@ -1355,7 +1356,6 @@ async function confirmClearAndRebuildArtistLibrary() {
     notify('歌手库已清空，后台重建中…')
   } catch (error) {
     notify(error instanceof Error ? error.message : '清空重建失败', 'error')
-  } finally {
     artistBuilding.value = false
   }
 }
@@ -1671,6 +1671,30 @@ function startArtistBuildPolling() {
     void loadArtistBuildStatus()
   }, 5000)
 }
+
+function syncPagePolling() {
+  if (activePage.value === 'logs') {
+    startLogPolling()
+  } else {
+    window.clearInterval(logTimer)
+  }
+
+  if (activePage.value === 'downloads') {
+    startDownloadPolling()
+  } else {
+    window.clearInterval(downloadTimer)
+  }
+
+  if (activePage.value === 'artists') {
+    startArtistBuildPolling()
+  } else {
+    window.clearInterval(artistBuildTimer)
+  }
+}
+
+watch(activePage, () => {
+  syncPagePolling()
+})
 
 function openNewSiteDialog() {
   editingSiteId.value = null

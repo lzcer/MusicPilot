@@ -236,6 +236,7 @@ class LocalMusicScraper:
         moved_files = 0
         source_metadata = await asyncio.to_thread(read_track_metadata, source_file)
         dir_meta = (dir_inferred or {}).get(source_file)
+        dir_meta = await self._resolve_known_artist_directory(source_metadata, dir_meta)
         match_metadata = _metadata_for_matching(source_metadata, source_file, dir_meta=dir_meta)
         scrape_fields = _metadata_fields_union(
             config.scrape_when_missing,
@@ -646,6 +647,32 @@ class LocalMusicScraper:
                 candidates.append(candidate)
         return tuple(candidates)
 
+    async def _resolve_known_artist_directory(
+        self,
+        source_metadata: TrackMetadata,
+        dir_meta: TrackMetadata | None,
+    ) -> TrackMetadata | None:
+        if (
+            self.artist_service is None
+            or dir_meta is None
+            or source_metadata.artist
+            or dir_meta.artist
+            or not dir_meta.album
+        ):
+            return dir_meta
+        if not await self.artist_service.has_artist_name(dir_meta.album):
+            return dir_meta
+        return TrackMetadata(
+            title=dir_meta.title,
+            artist=dir_meta.album,
+            album=source_metadata.album,
+            year=dir_meta.year,
+            track_number=dir_meta.track_number,
+            lyrics=dir_meta.lyrics,
+            cover_url=dir_meta.cover_url,
+            extra=dir_meta.extra,
+        )
+
 
 def scraping_config_from_payload(payload: dict[str, object]) -> ScrapingConfig:
     scraping = payload.get("scraping")
@@ -886,8 +913,8 @@ def _analyze_directory(dir_path: Path, children: list[Path]) -> _DirInferredInfo
                 year=year,
             )
 
-    # No grandparent or grandparent not usable. Try to determine if current
-    # dir is an artist name or album name by checking child stems.
+    # No grandparent or grandparent not usable. Treat the current directory as
+    # album-only unless an explicit artist signal was found above.
     child_stems = [c.stem for c in children]
     match_count = sum(
         1 for s in child_stems
@@ -896,7 +923,7 @@ def _analyze_directory(dir_path: Path, children: list[Path]) -> _DirInferredInfo
     if children and match_count / len(children) >= 0.5:
         return _DirInferredInfo(artist=None, album=_clean_album_name(cleaned), year=year)
 
-    return _DirInferredInfo(artist=cleaned, album=_clean_album_name(cleaned), year=year)
+    return _DirInferredInfo(artist=None, album=_clean_album_name(cleaned), year=year)
 
 
 def _audio_files(path: Path) -> list[Path]:
@@ -1431,36 +1458,6 @@ def _match_score(left: str | None, right: str | None) -> int:
     if left_normalized in right_normalized or right_normalized in left_normalized:
         return 1
     return 0
-
-
-def _match_artist(left: str | None, right: str | None) -> int:
-    if not left or not right:
-        return 0
-    return max(_match_score(left, item) for item in re.split(r"[,，、/&]+", right))
-
-
-async def _match_artist_with_aliases(
-    left: str | None,
-    right: str | None,
-    *,
-    artist_service: ArtistService | None = None,
-) -> int:
-    if not left or not right:
-        return 0
-    direct_score = max(_match_score(left, item) for item in _split_artist_names(right))
-    if direct_score > 0 or artist_service is None:
-        return direct_score
-    left_aliases = await artist_service.get_aliases(left)
-    right_aliases: list[str] = []
-    for item in _split_artist_names(right):
-        right_aliases.extend(await artist_service.get_aliases(item))
-    left_values = {_normalize_match_text(item) for item in left_aliases if item}
-    right_values = {_normalize_match_text(item) for item in right_aliases if item}
-    return 2 if left_values and right_values and left_values & right_values else 0
-
-
-def _split_artist_names(value: str) -> list[str]:
-    return [item.strip() for item in re.split(r"[,，、/&]+", value) if item.strip()]
 
 
 def _match_artist(left: str | None, right: str | None) -> int:

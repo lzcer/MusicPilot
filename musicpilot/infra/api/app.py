@@ -400,6 +400,9 @@ class AppState:
         self.playlist_download_tasks: dict[int, asyncio.Task[None]] = {}
         self.playlist_track_download_tasks: dict[int, asyncio.Task[None]] = {}
         self.artist_build_lock = asyncio.Lock()
+        self.artist_build_started_at: datetime | None = None
+        self.artist_build_finished_at: datetime | None = None
+        self.artist_build_last_error: str | None = None
         self.download_item_scraping_tasks: dict[int, asyncio.Task[None]] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
         self.scraping_metadata = MetadataCascade([MultiSourceMusicProvider()])
@@ -778,7 +781,7 @@ def create_app() -> FastAPI:
         merged = _dedupe_results(raw_results)
         exclude = await _get_exclude_keywords(state)
         merged = _filter_by_exclude_keywords(merged, exclude)
-        filtered = await _filter_by_artist(state, merged, payload.media.artist)
+        filtered = await _filter_by_artist_with_aliases(state, merged, payload.media.artist)
         ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[: payload.limit]
         state.add_log(
             "search",
@@ -1834,7 +1837,12 @@ def create_app() -> FastAPI:
 
     @app.get("/api/artists/build-status", response_model=ArtistBuildStatusResponse)
     async def artist_build_status() -> ArtistBuildStatusResponse:
-        return ArtistBuildStatusResponse(running=state.artist_build_lock.locked())
+        return ArtistBuildStatusResponse(
+            running=state.artist_build_lock.locked(),
+            started_at=state.artist_build_started_at,
+            finished_at=state.artist_build_finished_at,
+            last_error=state.artist_build_last_error,
+        )
 
     @app.post("/api/artists/build-library", response_model=BuildArtistLibraryResponse)
     async def build_artist_library() -> BuildArtistLibraryResponse:
@@ -2751,7 +2759,7 @@ async def _metadata_download_results(
     deduped = _dedupe_results(raw_results)
     exclude = await _get_exclude_keywords(state)
     deduped = _filter_by_exclude_keywords(deduped, exclude)
-    filtered = await _filter_by_artist(state, deduped, media.artist)
+    filtered = await _filter_by_artist_with_aliases(state, deduped, media.artist)
     ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)
     state.add_log(
         "search",
@@ -3302,6 +3310,7 @@ async def _auto_build_artist_library(state: AppState) -> None:
         state.add_log("artist", "自动构建歌手库跳过：已有构建任务进行中", "INFO")
         return
     async with state.artist_build_lock:
+        _mark_artist_build_started(state)
         try:
             created = await asyncio.wait_for(
                 state.artist_service.build_library_from_media_files(),
@@ -3313,15 +3322,19 @@ async def _auto_build_artist_library(state: AppState) -> None:
                     f"启动时自动构建歌手库：已创建 {created} 个歌手组。",
                     "INFO",
                 )
-        except asyncio.TimeoutError:
+            _mark_artist_build_finished(state)
+        except TimeoutError:
+            _mark_artist_build_finished(state, "自动构建歌手库超时（可稍后手动构建）")
             state.add_log("artist", "自动构建歌手库超时（可稍后手动构建）", "WARNING")
         except Exception as exc:  # noqa: BLE001
+            _mark_artist_build_finished(state, str(exc))
             state.add_log("artist", f"自动构建歌手库失败（可稍后手动构建）：{exc}", "WARNING")
 
 
 async def _run_artist_build(state: AppState) -> None:
     """Run artist library build in background."""
     async with state.artist_build_lock:
+        _mark_artist_build_started(state)
         try:
             created = await state.artist_service.build_library_from_media_files()
             state.add_log(
@@ -3329,10 +3342,24 @@ async def _run_artist_build(state: AppState) -> None:
                 f"歌手库构建完成：共 {created} 个歌手组。" if created else "歌手库构建完成：没有新增歌手组。",
                 "INFO",
             )
+            _mark_artist_build_finished(state)
         except asyncio.CancelledError:
+            _mark_artist_build_finished(state, "歌手库构建已被取消")
             state.add_log("artist", "歌手库构建已被取消", "WARNING")
         except Exception as exc:  # noqa: BLE001
+            _mark_artist_build_finished(state, str(exc))
             state.add_log("artist", f"歌手库构建失败：{exc}", "ERROR")
+
+
+def _mark_artist_build_started(state: AppState) -> None:
+    state.artist_build_started_at = datetime.now(UTC)
+    state.artist_build_finished_at = None
+    state.artist_build_last_error = None
+
+
+def _mark_artist_build_finished(state: AppState, error: str | None = None) -> None:
+    state.artist_build_finished_at = datetime.now(UTC)
+    state.artist_build_last_error = error
 
 
 async def _ensure_artist_from_metadata(
@@ -3499,7 +3526,10 @@ async def _run_metadata_site_search_stream(
         return
     try:
         await asyncio.gather(
-            *(_run_metadata_site_search_for_indexer(task, indexer, limit) for indexer in indexers)
+            *(
+                _run_metadata_site_search_for_indexer(state, task, indexer, limit)
+                for indexer in indexers
+            )
         )
     except Exception as exc:  # noqa: BLE001
         state.add_log("search", f"Streaming metadata site search failed: {exc}", "ERROR")
@@ -3513,6 +3543,7 @@ async def _run_metadata_site_search_stream(
 
 
 async def _run_metadata_site_search_for_indexer(
+    state: AppState,
     task: MetadataSiteSearchTask,
     indexer: object,
     limit: int,
@@ -3549,7 +3580,7 @@ async def _run_metadata_site_search_for_indexer(
 
         await asyncio.gather(*(search_keyword(keyword) for keyword in keywords))
         merged = _dedupe_results(raw_results)
-        filtered = await _filter_by_artist(state, merged, task.media.artist)
+        filtered = await _filter_by_artist_with_aliases(state, merged, task.media.artist)
         ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[:limit]
         await task.site_done(
             site=site_name,
@@ -3785,7 +3816,16 @@ def _site_keyword_variants(value: str | None) -> list[str]:
     return [normalized, value]
 
 
-async def _filter_by_artist(
+def _filter_by_artist(results: list[SearchResult], artist: str | None) -> list[SearchResult]:
+    if not artist:
+        return results
+    artist_values = _artist_credit_base_match_values(artist)
+    if not artist_values:
+        return results
+    return [item for item in results if _resource_matches_artist_values(item, artist_values)]
+
+
+async def _filter_by_artist_with_aliases(
     state: AppState,
     results: list[SearchResult],
     artist: str | None,
@@ -3823,6 +3863,18 @@ async def _artist_credit_match_values(state: AppState, artist_credit: str | None
                 values.add(normalized)
             if compact:
                 values.add(compact)
+    return values
+
+
+def _artist_credit_base_match_values(artist_credit: str | None) -> set[str]:
+    values: set[str] = set()
+    for artist in split_artist_credit(artist_credit):
+        normalized = normalize_search_text(artist)
+        compact = _compact_search_text(normalized)
+        if normalized:
+            values.add(normalized)
+        if compact:
+            values.add(compact)
     return values
 
 

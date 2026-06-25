@@ -29,7 +29,7 @@ def _write_tags_sync(
         if audio.tags is None:
             audio.add_tags()
     except Exception:
-        audio.close()
+        _close_audio(audio)
         return
 
     _set_tag(audio, "title", metadata.title)
@@ -46,7 +46,7 @@ def _write_tags_sync(
     if metadata.lyrics:
         _set_tag(audio, "lyrics", metadata.lyrics)
     audio.save()
-    audio.close()
+    _close_audio(audio)
     if metadata.lyrics:
         _write_lyrics_sync(path, metadata.lyrics)
     if cover is not None:
@@ -123,7 +123,7 @@ def _write_cover_sync(path: Path, cover_data: bytes, mime: str) -> None:
             audio["covr"] = [MP4Cover(cover_data, imageformat=image_format)]
         audio.save()
     finally:
-        audio.close()
+        _close_audio(audio)
 
 
 def _write_lyrics_sync(path: Path, lyrics: str) -> None:
@@ -150,4 +150,10 @@ def _write_lyrics_sync(path: Path, lyrics: str) -> None:
             audio["\xa9lyr"] = [lyrics]
         audio.save()
     finally:
-        audio.close()
+        _close_audio(audio)
+
+
+def _close_audio(audio: object) -> None:
+    close = getattr(audio, "close", None)
+    if callable(close):
+        close()

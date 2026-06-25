@@ -528,6 +528,9 @@ class BuildArtistLibraryResponse(BaseModel):
 
 class ArtistBuildStatusResponse(BaseModel):
     running: bool
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    last_error: str | None = None
 
 
 class ClearArtistLibraryResponse(BaseModel):
