@@ -20,8 +20,8 @@ from musicpilot.ports.metadata import TrackMetadata
 
 logger = logging.getLogger(__name__)
 
-_t2s = OpenCC("t2s")  # Traditional → Simplified
-_s2t = OpenCC("s2t")  # Simplified → Traditional
+_t2s = OpenCC("t2s")  # Traditional -> Simplified
+_s2t = OpenCC("s2t")  # Simplified -> Traditional
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,8 +35,8 @@ class ArtistInfo:
 def normalize_artist_name(name: str | None) -> str:
     """Normalize an artist name for comparison.
 
-    - Traditional → Simplified (OpenCC)
-    - Fullwidth → Halfwidth
+    - Traditional -> Simplified (OpenCC)
+    - Fullwidth -> Halfwidth
     - Lowercase
     - Strip whitespace/punctuation
     """
@@ -94,7 +94,7 @@ class ArtistService:
     def __init__(self, repository: Any) -> None:
         self._repo = repository
 
-    # ── Public API ──────────────────────────────────────────────
+    # -- Public API --
 
     async def get_aliases(self, name: str | None) -> list[str]:
         """Get all known names (canonical + aliases) for an artist.
@@ -222,23 +222,24 @@ class ArtistService:
     ) -> int:
         """Auto-populate artist database from existing MediaFile records.
 
-        Scans all distinct artist values from media_files and music_library_tracks,
-        creates artist groups enriched with aliases from MusicBrainz (cross-language
-        merging: "Jay Chou" ↦ "周杰伦"), and merges groups that share MusicBrainz
-        aliases.
+        Scans all distinct artist values from media_files, music_library_tracks,
+        and playlist_tracks, groups them by normalized name, then processes
+        each group incrementally:
 
-        Idempotent: re-running will add new aliases and merge groups that were
-        previously separate, but will not duplicate existing artists.
+        1. If the artist already exists in the DB -- add any new aliases, skip.
+        2. If it's new -- fetch aliases from MusicBrainz, create artist, commit.
 
-        Returns the number of artist groups created/updated.
+        Each group is committed immediately so partial progress survives crashes.
+        Idempotent: re-running skips already-created artists.
+
+        Returns the number of artist groups created.
         """
         raw_names = await self._repo.list_distinct_artists()
         if not raw_names:
             logger.info("No existing artists found to build library from.")
             return 0
 
-        # Phase 1: Initial grouping by normalization
-        # Also collect MusicBrainz aliases for each name
+        # Phase 1: Group raw names by normalization
         norm_groups: dict[str, set[str]] = {}
 
         for raw in raw_names:
@@ -253,105 +254,66 @@ class ArtistService:
                     norm_groups[normalized] = set()
                 norm_groups[normalized].add(part)
 
-        # Phase 2: Fetch aliases from MusicBrainz with rate limiting
-        musicbrainz_aliases: dict[str, set[str]] = {}
-        seen_mb_artists: set[str] = set()
+        # Phase 2: Process each group incrementally with immediate commit
+        created = 0
+        skipped = 0
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+            seen_mb_artists: set[str] = set()
+            group_count = len(norm_groups)
+
             for i, (normalized, names) in enumerate(norm_groups.items()):
-                # Rate limit: 1 request per second (MusicBrainz policy)
                 if i > 0:
                     await asyncio.sleep(1)
 
-                # Pick the longest name for MusicBrainz search
+                logger.info(
+                    "Artist build [%d/%d]: processing %s",
+                    i + 1, group_count, next(iter(names)),
+                )
+
+                # Check if this group already exists in the database
+                existing_artist = await self._repo.find_artist_by_normalized(normalized)
+                if existing_artist is None:
+                    for name in names:
+                        artist_id = await self._repo.find_artist_id_by_alias(name)
+                        if artist_id is not None:
+                            existing_artist = await self._repo.get_artist(artist_id)
+                            break
+
+                if existing_artist is not None:
+                    # Already exists -- add any new aliases, then skip MB lookup
+                    for alias in names:
+                        if alias != existing_artist.name:
+                            await self._repo.add_alias(existing_artist.id, alias, "media_file")
+                    skipped += 1
+                    continue
+
+                # New artist -- fetch MusicBrainz aliases
                 search_name = max(names, key=len)
-                mb_alias_set = await _fetch_musicbrainz_aliases(
+                mb_aliases = await _fetch_musicbrainz_aliases(
                     client, search_name, user_agent, seen_mb_artists,
                 )
-                if mb_alias_set:
-                    musicbrainz_aliases[normalized] = mb_alias_set
 
-        # Phase 3: Merge groups using MusicBrainz alias overlap
-        # If group A's MusicBrainz aliases intersect group B's → they're the same artist
-        merged_groups: list[set[str]] = []
-        used: set[str] = set()
-
-        for norm_key, names in norm_groups.items():
-            if norm_key in used:
-                continue
-            mb_set_a = musicbrainz_aliases.get(norm_key, set())
-            cluster: set[str] = set(names)
-            used.add(norm_key)
-
-            for other_key, other_names in norm_groups.items():
-                if other_key in used:
-                    continue
-                mb_set_b = musicbrainz_aliases.get(other_key, set())
-                # Merge if either normalization overlaps or MusicBrainz aliases overlap
-                same_normalized_name = normalize_artist_name(
-                    next(iter(other_names))
-                ) == normalize_artist_name(next(iter(names)))
-                has_shared_musicbrainz_alias = bool(mb_set_a and mb_set_b and mb_set_a & mb_set_b)
-                if same_normalized_name or has_shared_musicbrainz_alias:
-                    cluster.update(other_names)
-                    used.add(other_key)
-
-            merged_groups.append(cluster)
-
-        # Phase 4: Persist (idempotent — don't re-create existing artists)
-        created = 0
-        for names in merged_groups:
-            # Canonical = most common name in the cluster
-            name_counts: dict[str, int] = {}
-            for n in names:
-                name_counts[n] = name_counts.get(n, 0) + 1
-            canonical = max(name_counts, key=name_counts.get)
-            normalized = normalize_artist_name(canonical)
-
-            # Check if any name in this group already maps to an existing artist
-            # (by normalized_name or by alias lookup — handles idempotent re-runs)
-            existing_artist = await self._repo.find_artist_by_normalized(normalized)
-            if existing_artist is None:
-                for name in names:
-                    artist_id = await self._repo.find_artist_id_by_alias(name)
-                    if artist_id is not None:
-                        existing_artist = await self._repo.get_artist(artist_id)
-                        break
-            if existing_artist is not None:
-                # Add any new aliases
+                # Pick canonical name (longest is usually most descriptive)
+                canonical = max(names, key=len)
+                artist = await self._repo.create_artist(
+                    name=canonical,
+                    normalized_name=normalized,
+                    external_ids={},
+                )
                 for alias in names:
-                    if alias != existing_artist.name:
-                        await self._repo.add_alias(existing_artist.id, alias, "media_file")
-                # Also add MusicBrainz aliases from the cluster
-                if normalized in musicbrainz_aliases:
-                    for alias in musicbrainz_aliases[normalized]:
-                        if normalize_artist_name(alias) != normalized:
-                            await self._repo.add_alias(
-                                existing_artist.id, alias, "musicbrainz",
-                            )
-                continue
-
-            artist = await self._repo.create_artist(
-                name=canonical,
-                normalized_name=normalized,
-                external_ids={},
-            )
-            for alias in names:
-                src = "primary" if alias == canonical else "media_file"
-                await self._repo.add_alias(artist.id, alias, src)
-            # Add MusicBrainz aliases
-            if normalized in musicbrainz_aliases:
-                for alias in musicbrainz_aliases[normalized]:
-                    # Skip only if the raw string matches the canonical name
-                    if alias != canonical:
-                        await self._repo.add_alias(artist.id, alias, "musicbrainz")
-            created += 1
+                    src = "primary" if alias == canonical else "media_file"
+                    await self._repo.add_alias(artist.id, alias, src)
+                for mb_alias in mb_aliases:
+                    if mb_alias != canonical:
+                        await self._repo.add_alias(artist.id, mb_alias, "musicbrainz")
+                created += 1
 
         logger.info(
-            "Built artist library: %d groups from %d names, %d with MusicBrainz data",
-            max(len(merged_groups), created), len(raw_names), len(musicbrainz_aliases),
+            "Artist build done: %d created, %d skipped (from %d names, %d groups)",
+            created, skipped, len(raw_names), group_count,
         )
-        return max(len(merged_groups), created)
+        return created
 
     async def add_alias(self, artist_id: int, alias: str, source: str = "user") -> None:
         """Add an alias to an existing artist."""
@@ -376,7 +338,7 @@ class ArtistService:
     def resolve_metadata_artist(self, metadata: TrackMetadata) -> TrackMetadata:
         """Resolve the artist in a TrackMetadata to its canonical name.
 
-        Does NOT perform async lookups — returns quickly if already canonical.
+        Does NOT perform async lookups -- returns quickly if already canonical.
         To do a full async resolve, call get_canonical_name separately.
         This is a convenience for cases where the name is already canonical.
         """
@@ -393,7 +355,7 @@ class ArtistService:
             extra=metadata.extra,
         )
 
-    # ── Internal ────────────────────────────────────────────────
+    # -- Internal --
 
     async def _get_artist_info(self, artist_id: int) -> ArtistInfo:
         artist = await self._repo.get_artist(artist_id)
@@ -422,7 +384,7 @@ async def _fetch_musicbrainz_aliases(
 
     Returns an empty set if the lookup fails or no match is found.
     """
-    # Name too short → not worth querying
+    # Name too short -- not worth querying
     if not name or len(name) < 2:
         return set()
 
@@ -493,7 +455,7 @@ async def _fetch_musicbrainz_aliases(
     if sort_name and sort_name != primary:
         aliases.add(sort_name)
 
-    # Expand with OpenCC script variants (simplified ↔ traditional CJK)
+    # Expand with OpenCC script variants (simplified <-> traditional CJK)
     # MusicBrainz may not return both scripts for all artists
     expanded: set[str] = set(aliases)
     for alias in aliases:
@@ -505,7 +467,7 @@ async def _fetch_musicbrainz_aliases(
             expanded.add(traditional)
 
     logger.debug(
-        "MusicBrainz: %r → %d aliases (+%d via OpenCC) (mbid=%s)",
+        "MusicBrainz: %r -> %d aliases (+%d via OpenCC) (mbid=%s)",
         name, len(aliases), len(expanded) - len(aliases), mbid,
     )
     return expanded
