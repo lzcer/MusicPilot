@@ -433,6 +433,7 @@ class ScrapingSettings(BaseModel):
     mode: Literal["source", "mapped", "copy"] = "mapped"
     source_directory: str = ""
     mapped_directory: str = ""
+    scrape_when_missing: list[Literal["album", "artist", "lyrics"]] = Field(default_factory=list)
     required_metadata: list[Literal["album", "artist", "lyrics"]] = Field(default_factory=list)
     auto_rename: bool = False
     auto_classify: bool = False

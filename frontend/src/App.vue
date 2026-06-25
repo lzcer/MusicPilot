@@ -295,6 +295,7 @@ type SystemSettings = {
     mode: 'source' | 'mapped' | 'copy'
     source_directory: string
     mapped_directory: string
+    scrape_when_missing: Array<'album' | 'artist' | 'lyrics'>
     required_metadata: Array<'album' | 'artist' | 'lyrics'>
     auto_rename: boolean
     auto_classify: boolean
@@ -522,6 +523,7 @@ const systemForm = ref<SystemSettings>({
     mode: 'mapped',
     source_directory: '',
     mapped_directory: '',
+    scrape_when_missing: [],
     required_metadata: [],
     auto_rename: false,
     auto_classify: false,
@@ -3205,7 +3207,21 @@ onUnmounted(() => {
                     </div>
 
                     <div class="settings-checks">
-                      <div class="settings-checks-label">刮削内容</div>
+                      <div class="settings-checks-label">缺失时尝试刮削</div>
+                      <div class="settings-checks-row">
+                        <v-checkbox
+                          v-for="item in scrapingRequiredMetadataOptions"
+                          :key="item.value"
+                          v-model="systemForm.scraping.scrape_when_missing"
+                          :label="item.title"
+                          :value="item.value"
+                          hide-details
+                        />
+                      </div>
+                    </div>
+
+                    <div class="settings-checks">
+                      <div class="settings-checks-label">缺失则判定失败</div>
                       <div class="settings-checks-row">
                         <v-checkbox
                           v-for="item in scrapingRequiredMetadataOptions"

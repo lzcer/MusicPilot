@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -14,6 +15,8 @@ from musicpilot.core.artist import ArtistService
 from musicpilot.core.metadata import MetadataCascade
 from musicpilot.ports.metadata import TrackMetadata
 from musicpilot.ports.tag_writer import TagWriter
+
+logger = logging.getLogger("musicpilot.metadata.scraping")
 
 _t2s = OpenCC("t2s")  # Traditional → Simplified
 
@@ -68,6 +71,7 @@ class ScrapingConfig:
     mode: ScrapingMode = "mapped"
     source_directory: Path | None = None
     mapped_directory: Path | None = None
+    scrape_when_missing: tuple[RequiredMetadata, ...] = ()
     required_metadata: tuple[RequiredMetadata, ...] = ()
     auto_rename: bool = False
     auto_classify: bool = False
@@ -144,6 +148,7 @@ class LocalMusicScraper:
         source_files: tuple[Path, ...] | None = None,
         library_tracks: tuple[LibraryTrackSnapshot, ...] = (),
         media_history: tuple[LibraryTrackSnapshot, ...] = (),
+        cached_metadata: dict[Path, tuple[TrackMetadata, ...]] | None = None,
     ) -> ScrapingSummary:
         if not config.enabled:
             return ScrapingSummary()
@@ -154,6 +159,18 @@ class LocalMusicScraper:
         )
         if not audio_files:
             return ScrapingSummary()
+
+        logger.info(
+            "Scraping run input: task=%r, save_path=%r, source_files=%s, "
+            "config=%s, library_tracks=%d, media_history=%d, cached_files=%d",
+            task_name,
+            save_path,
+            [str(item) for item in audio_files],
+            _scraping_config_log_text(config),
+            len(library_tracks),
+            len(media_history),
+            len(cached_metadata or {}),
+        )
 
         mapped_files = 0
         updated_files = 0
@@ -173,8 +190,10 @@ class LocalMusicScraper:
                     library_tracks,
                     media_history,
                     dir_inferred=dir_inferred,
+                    cached_candidates=(cached_metadata or {}).get(source_file, ()),
                 )
             except Exception as exc:
+                logger.exception("Scraping file failed unexpectedly: source=%s", source_file)
                 try:
                     source_metadata = await asyncio.to_thread(read_track_metadata, source_file)
                 except Exception:
@@ -209,6 +228,7 @@ class LocalMusicScraper:
         library_tracks: tuple[LibraryTrackSnapshot, ...],
         media_history: tuple[LibraryTrackSnapshot, ...],
         dir_inferred: dict[Path, TrackMetadata] | None = None,
+        cached_candidates: tuple[TrackMetadata, ...] = (),
     ) -> tuple[ScrapingFileResult, int, int, int]:
         working_file = source_file
         mapped_files = 0
@@ -217,55 +237,160 @@ class LocalMusicScraper:
         source_metadata = await asyncio.to_thread(read_track_metadata, source_file)
         dir_meta = (dir_inferred or {}).get(source_file)
         match_metadata = _metadata_for_matching(source_metadata, source_file, dir_meta=dir_meta)
-        needs_update = _metadata_missing(source_metadata, config.required_metadata)
+        scrape_fields = _metadata_fields_union(
+            config.scrape_when_missing,
+            config.required_metadata,
+        )
+        missing_before = _missing_metadata_fields(source_metadata, scrape_fields)
+        needs_scrape = bool(missing_before)
         metadata = _merge_metadata(source_metadata, match_metadata)
         candidate_count = 0
         tag_writer = self.tag_writer
-        if needs_update:
-            candidates = await self._search_metadata_candidates(source_metadata, match_metadata)
-            candidate_count = len(candidates)
-            looked_up = _select_metadata_candidate(
+        metadata_gain: tuple[RequiredMetadata, ...] = ()
+        logger.info(
+            "Scraping file input: source=%s, source_metadata=%s, dir_inferred=%s, "
+            "match_metadata=%s, scrape_fields=%s, missing_before=%s, cached_candidates=%s",
+            source_file,
+            _metadata_log_text(source_metadata),
+            _metadata_log_text(dir_meta),
+            _metadata_log_text(match_metadata),
+            scrape_fields,
+            missing_before,
+            _metadata_candidates_log_text(cached_candidates),
+        )
+        if needs_scrape:
+            candidates = cached_candidates
+            looked_up = await _select_metadata_candidate(
                 match_metadata,
-                candidates,
+                cached_candidates,
                 config.required_metadata,
+                artist_service=self.artist_service,
+            )
+            logger.info(
+                "Scraping cached candidate result: source=%s, selected=%s",
+                source_file,
+                _metadata_log_text(looked_up),
             )
             if looked_up is None:
+                online_candidates = await self._search_metadata_candidates(
+                    source_metadata,
+                    match_metadata,
+                )
+                candidates = (*cached_candidates, *online_candidates)
+                looked_up = await _select_metadata_candidate(
+                    match_metadata,
+                    online_candidates,
+                    config.required_metadata,
+                    artist_service=self.artist_service,
+                )
+                logger.info(
+                    "Scraping online candidate result: source=%s, "
+                    "online_candidates=%s, selected=%s",
+                    source_file,
+                    _metadata_candidates_log_text(online_candidates),
+                    _metadata_log_text(looked_up),
+                )
+            candidate_count = len(candidates)
+            if looked_up is not None:
+                metadata = _merge_metadata(metadata, looked_up)
+            missing_required = _missing_metadata_fields(metadata, config.required_metadata)
+            if looked_up is None:
+                if not missing_required:
+                    metadata_gain = _filled_metadata_fields(
+                        source_metadata,
+                        metadata,
+                        missing_before,
+                    )
+                else:
+                    error_message = await _candidate_failure_message(
+                        match_metadata,
+                        config.required_metadata,
+                        candidates,
+                        artist_service=self.artist_service,
+                    )
+                    logger.info(
+                        "Scraping file result: source=%s, status=failed, stage=metadata_candidate, "
+                        "metadata=%s, error=%s",
+                        source_file,
+                        _metadata_log_text(source_metadata),
+                        error_message,
+                    )
+                    return (
+                        ScrapingFileResult(
+                            source_path=source_file,
+                            library_path=None,
+                            metadata=source_metadata,
+                            status="failed",
+                            error_message=error_message,
+                            stage="metadata_candidate",
+                            needs_metadata_update=needs_scrape,
+                            candidate_count=candidate_count,
+                        ),
+                        0,
+                        0,
+                        0,
+                    )
+            elif missing_required:
+                error_message = await _candidate_failure_message(
+                    match_metadata,
+                    config.required_metadata,
+                    candidates,
+                    artist_service=self.artist_service,
+                )
+                logger.info(
+                    "Scraping file result: source=%s, status=failed, stage=metadata_candidate, "
+                    "metadata=%s, selected=%s, missing_required=%s, error=%s",
+                    source_file,
+                    _metadata_log_text(source_metadata),
+                    _metadata_log_text(looked_up),
+                    missing_required,
+                    error_message,
+                )
                 return (
                     ScrapingFileResult(
                         source_path=source_file,
                         library_path=None,
                         metadata=source_metadata,
                         status="failed",
-                        error_message=_candidate_failure_message(
-                            match_metadata,
-                            config.required_metadata,
-                            candidates,
-                        ),
+                        error_message=error_message,
                         stage="metadata_candidate",
-                        needs_metadata_update=needs_update,
+                        needs_metadata_update=needs_scrape,
                         candidate_count=candidate_count,
                     ),
                     0,
                     0,
                     0,
+                )
+            else:
+                metadata_gain = _filled_metadata_fields(
+                    source_metadata,
+                    metadata,
+                    missing_before,
                 )
             if tag_writer is None:
-                return (
-                    ScrapingFileResult(
-                        source_path=source_file,
-                        library_path=None,
-                        metadata=source_metadata,
-                        status="failed",
-                        error_message="标签写入器不可用。",
-                        stage="tag_writer",
-                        needs_metadata_update=needs_update,
-                        candidate_count=candidate_count,
-                    ),
-                    0,
-                    0,
-                    0,
-                )
-            metadata = _merge_metadata(metadata, looked_up)
+                if metadata_gain:
+                    logger.info(
+                        "Scraping file result: source=%s, status=failed, stage=tag_writer, "
+                        "metadata=%s, metadata_gain=%s",
+                        source_file,
+                        _metadata_log_text(source_metadata),
+                        metadata_gain,
+                    )
+                    return (
+                        ScrapingFileResult(
+                            source_path=source_file,
+                            library_path=None,
+                            metadata=source_metadata,
+                            status="failed",
+                            error_message="标签写入器不可用。",
+                            stage="tag_writer",
+                            needs_metadata_update=needs_scrape,
+                            candidate_count=candidate_count,
+                        ),
+                        0,
+                        0,
+                        0,
+                    )
 
         # Resolve artist to canonical name
         if self.artist_service is not None:
@@ -290,20 +415,28 @@ class LocalMusicScraper:
         current_size = await asyncio.to_thread(_file_size, source_file)
         if duplicate is not None:
             if config.duplicate_handling == "ignore":
+                error_message = _duplicate_skip_message(
+                    metadata,
+                    duplicate,
+                    current_size,
+                    reason="音乐库已存在，重复文件处理为不处理",
+                )
+                logger.info(
+                    "Scraping file result: source=%s, status=skipped, stage=skip_duplicate, "
+                    "metadata=%s, error=%s",
+                    source_file,
+                    _metadata_log_text(metadata),
+                    error_message,
+                )
                 return (
                     ScrapingFileResult(
                         source_path=source_file,
                         library_path=None,
                         metadata=metadata,
                         status="skipped",
-                        error_message=_duplicate_skip_message(
-                            metadata,
-                            duplicate,
-                            current_size,
-                            reason="音乐库已存在，重复文件处理为不处理",
-                        ),
+                        error_message=error_message,
                         stage="skip_duplicate",
-                        needs_metadata_update=needs_update,
+                        needs_metadata_update=needs_scrape,
                         candidate_count=candidate_count,
                     ),
                     0,
@@ -317,20 +450,28 @@ class LocalMusicScraper:
                         if duplicate.size is None
                         else "当前文件不大于音乐库文件，保留最大文件"
                     )
+                    error_message = _duplicate_skip_message(
+                        metadata,
+                        duplicate,
+                        current_size,
+                        reason=reason,
+                    )
+                    logger.info(
+                        "Scraping file result: source=%s, status=skipped, "
+                        "stage=skip_smaller_duplicate, metadata=%s, error=%s",
+                        source_file,
+                        _metadata_log_text(metadata),
+                        error_message,
+                    )
                     return (
                         ScrapingFileResult(
                             source_path=source_file,
                             library_path=None,
                             metadata=metadata,
                             status="skipped",
-                            error_message=_duplicate_skip_message(
-                                metadata,
-                                duplicate,
-                                current_size,
-                                reason=reason,
-                            ),
+                            error_message=error_message,
                             stage="skip_smaller_duplicate",
-                            needs_metadata_update=needs_update,
+                            needs_metadata_update=needs_scrape,
                             candidate_count=candidate_count,
                         ),
                         0,
@@ -347,7 +488,7 @@ class LocalMusicScraper:
                 _copy_to_mapping,
                 source_file,
                 config,
-                hardlink=not needs_update,
+                hardlink=not metadata_gain,
                 overwrite=not _will_classify_or_rename(config),
             )
             working_file = mapped_result.path
@@ -365,7 +506,7 @@ class LocalMusicScraper:
             overwritten_existing_target = mapped_result.overwritten_existing
             mapped_files += 1
 
-        if needs_update:
+        if metadata_gain:
             assert tag_writer is not None
             await tag_writer.write(working_file, metadata)
             updated_files += 1
@@ -389,6 +530,16 @@ class LocalMusicScraper:
             remark = _target_overwrite_message(final_file)
         else:
             remark = "刮削并转移完成"
+        logger.info(
+            "Scraping file result: source=%s, status=success, library_path=%s, "
+            "metadata=%s, metadata_gain=%s, candidate_count=%d, remark=%s",
+            source_file,
+            final_file,
+            _metadata_log_text(metadata),
+            metadata_gain,
+            candidate_count,
+            remark,
+        )
         return (
             ScrapingFileResult(
                 source_path=source_file,
@@ -396,12 +547,45 @@ class LocalMusicScraper:
                 metadata=metadata,
                 status="success",
                 error_message=remark,
-                needs_metadata_update=needs_update,
+                needs_metadata_update=needs_scrape,
                 candidate_count=candidate_count,
             ),
             mapped_files,
             updated_files,
             moved_files,
+        )
+
+    async def search_metadata_candidates(
+        self,
+        source_metadata: TrackMetadata,
+        match_metadata: TrackMetadata,
+    ) -> tuple[TrackMetadata, ...]:
+        return await self._search_metadata_candidates(source_metadata, match_metadata)
+
+    async def select_metadata_candidate(
+        self,
+        reference: TrackMetadata,
+        candidates: tuple[TrackMetadata, ...],
+        required: tuple[RequiredMetadata, ...] = (),
+    ) -> TrackMetadata | None:
+        return await _select_metadata_candidate(
+            reference,
+            candidates,
+            required,
+            artist_service=self.artist_service,
+        )
+
+    async def metadata_candidate_failure_message(
+        self,
+        reference: TrackMetadata,
+        candidates: tuple[TrackMetadata, ...],
+        required: tuple[RequiredMetadata, ...] = (),
+    ) -> str:
+        return await _candidate_failure_message(
+            reference,
+            required,
+            candidates,
+            artist_service=self.artist_service,
         )
 
     async def _search_metadata_candidates(
@@ -471,6 +655,11 @@ def scraping_config_from_payload(payload: dict[str, object]) -> ScrapingConfig:
     classify_by = str(scraping.get("classify_by") or "artist")
     duplicate_handling = str(scraping.get("duplicate_handling") or "ignore")
     required = scraping.get("required_metadata")
+    scrape_when_missing = scraping.get("scrape_when_missing")
+    required_metadata = _required_metadata(required)
+    scrape_metadata = _required_metadata(scrape_when_missing)
+    if "scrape_when_missing" not in scraping:
+        scrape_metadata = required_metadata
     if mode not in {"source", "mapped", "copy"}:
         mode = "mapped"
     if duplicate_handling not in {"ignore", "overwrite", "keep_largest"}:
@@ -480,7 +669,8 @@ def scraping_config_from_payload(payload: dict[str, object]) -> ScrapingConfig:
         mode=mode,
         source_directory=_optional_path(scraping.get("source_directory")),
         mapped_directory=_optional_path(scraping.get("mapped_directory")),
-        required_metadata=_required_metadata(required),
+        scrape_when_missing=scrape_metadata,
+        required_metadata=required_metadata,
         auto_rename=bool(scraping.get("auto_rename")),
         auto_classify=bool(scraping.get("auto_classify")),
         classify_by="album" if classify_by == "album" else "artist",
@@ -555,6 +745,7 @@ class _DirInferredInfo:
     """Metadata inferred from directory structure analysis."""
     artist: str | None = None
     album: str | None = None
+    year: int | None = None
 
 
 def _infer_batch_metadata(source_files: list[Path]) -> dict[Path, TrackMetadata]:
@@ -602,20 +793,28 @@ def _infer_batch_metadata(source_files: list[Path]) -> dict[Path, TrackMetadata]
                 title=file_title,
                 artist=file_artist,
                 album=info.album,
+                year=info.year,
             )
         else:
             result[f] = TrackMetadata(
                 title=title_no_track or stem,
                 artist=info.artist,
                 album=info.album,
+                year=info.year,
             )
 
     return result
 
 
+def infer_metadata_from_paths(source_files: list[Path]) -> dict[Path, TrackMetadata]:
+    return _infer_batch_metadata(source_files)
+
+
 def _clean_album_name(name: str) -> str:
     """Remove trailing format/quality noise from an album or artist name."""
     name = _ALBUM_TRAILING_NOISE_RE.sub("", name).strip()
+    name = re.sub(r"\s*\{[^}]*\}\s*$", "", name).strip()
+    name = re.sub(r"\s*[\[(]?(?:19|20)\d{2}[\])]?\s*$", "", name).strip()
     name = re.sub(r"\s+", " ", name).strip()
     return name
 
@@ -637,6 +836,7 @@ def _analyze_directory(dir_path: Path, children: list[Path]) -> _DirInferredInfo
     cleaned = _DIR_NOISE_RE.sub("", dir_name).strip()
     if not cleaned:
         cleaned = dir_name
+    year = _parse_year(cleaned)
 
     # Strip leading year patterns: "2014 周杰伦 - 哎呦" → "周杰伦 - 哎呦"
     cleaned = re.sub(r"^\d{4}\s+", "", cleaned).strip()
@@ -654,7 +854,7 @@ def _analyze_directory(dir_path: Path, children: list[Path]) -> _DirInferredInfo
         artist_part = parts[0].strip()
         album_part = _clean_album_name(parts[1].strip())
         if artist_part and len(artist_part) >= 1:
-            return _DirInferredInfo(artist=artist_part, album=album_part)
+            return _DirInferredInfo(artist=artist_part, album=album_part, year=year)
 
     # No artist separator found. Check grandparent as potential artist.
     grandparent = dir_path.parent.name.strip()
@@ -673,10 +873,18 @@ def _analyze_directory(dir_path: Path, children: list[Path]) -> _DirInferredInfo
             # Current dir is the actual album, OR if it's a sub-dir (like CD1),
             # it was already handled above. Use grandparent's album content here.
             gp_album = _clean_album_name(gp_parts[1].strip())
-            return _DirInferredInfo(artist=gp_parts[0].strip(), album=gp_album)
+            return _DirInferredInfo(
+                artist=gp_parts[0].strip(),
+                album=gp_album,
+                year=year or _parse_year(gp_cleaned),
+            )
         elif gp_cleaned and len(gp_cleaned) >= 2:
             # Grandparent is the artist, current dir is the album
-            return _DirInferredInfo(artist=gp_cleaned, album=_clean_album_name(cleaned))
+            return _DirInferredInfo(
+                artist=gp_cleaned,
+                album=_clean_album_name(cleaned),
+                year=year,
+            )
 
     # No grandparent or grandparent not usable. Try to determine if current
     # dir is an artist name or album name by checking child stems.
@@ -686,9 +894,9 @@ def _analyze_directory(dir_path: Path, children: list[Path]) -> _DirInferredInfo
         if _normalize_match_text(cleaned) in _normalize_match_text(s)
     )
     if children and match_count / len(children) >= 0.5:
-        return _DirInferredInfo(artist=None, album=_clean_album_name(cleaned))
+        return _DirInferredInfo(artist=None, album=_clean_album_name(cleaned), year=year)
 
-    return _DirInferredInfo(artist=cleaned, album=_clean_album_name(cleaned))
+    return _DirInferredInfo(artist=cleaned, album=_clean_album_name(cleaned), year=year)
 
 
 def _audio_files(path: Path) -> list[Path]:
@@ -903,6 +1111,41 @@ def _format_size(value: int | None) -> str:
     return f"{size:.2f} {units[index]}"
 
 
+def _scraping_config_log_text(config: ScrapingConfig) -> str:
+    return (
+        "{"
+        f"enabled={config.enabled}, mode={config.mode!r}, "
+        f"source_directory={str(config.source_directory) if config.source_directory else None!r}, "
+        f"mapped_directory={str(config.mapped_directory) if config.mapped_directory else None!r}, "
+        f"scrape_when_missing={config.scrape_when_missing}, "
+        f"required_metadata={config.required_metadata}, "
+        f"auto_rename={config.auto_rename}, auto_classify={config.auto_classify}, "
+        f"classify_by={config.classify_by!r}, duplicate_handling={config.duplicate_handling!r}"
+        "}"
+    )
+
+
+def _metadata_log_text(metadata: TrackMetadata | None) -> str:
+    if metadata is None:
+        return "None"
+    return (
+        "{"
+        f"title={metadata.title!r}, artist={metadata.artist!r}, album={metadata.album!r}, "
+        f"year={metadata.year!r}, track_number={metadata.track_number!r}, "
+        f"lyrics={bool(metadata.lyrics)}, cover_url={metadata.cover_url!r}, "
+        f"extra_keys={sorted(metadata.extra.keys()) if metadata.extra else []}"
+        "}"
+    )
+
+
+def _metadata_candidates_log_text(candidates: tuple[TrackMetadata, ...]) -> str:
+    if not candidates:
+        return "[]"
+    items = ", ".join(_metadata_log_text(candidate) for candidate in candidates[:10])
+    suffix = f", ... +{len(candidates) - 10} more" if len(candidates) > 10 else ""
+    return f"[{items}{suffix}]"
+
+
 def _metadata_missing(metadata: TrackMetadata, required: tuple[RequiredMetadata, ...]) -> bool:
     for field in required:
         value = getattr(metadata, field)
@@ -980,10 +1223,12 @@ def _strip_track_prefix(value: str) -> str:
 _MATCH_SCORE_THRESHOLD = 1  # Minimum total score to accept a candidate
 
 
-def _select_metadata_candidate(
+async def _select_metadata_candidate(
     existing: TrackMetadata,
     candidates: tuple[TrackMetadata, ...],
     required: tuple[RequiredMetadata, ...],
+    *,
+    artist_service: ArtistService | None = None,
 ) -> TrackMetadata | None:
     """Select the best metadata candidate using scoring.
 
@@ -998,7 +1243,9 @@ def _select_metadata_candidate(
     for candidate in candidates:
         if not _candidate_fills_required(existing, candidate, required):
             continue
-        score = _metadata_match_score(existing, candidate)
+        if _candidate_has_conflicting_album(existing, candidate):
+            continue
+        score = await _metadata_match_score(existing, candidate, artist_service=artist_service)
         scored.append((score.total, candidate))
 
     if not scored:
@@ -1029,29 +1276,51 @@ def _candidate_fills_required(
     return True
 
 
-def _candidate_failure_message(
+def _candidate_has_conflicting_album(existing: TrackMetadata, candidate: TrackMetadata) -> bool:
+    return bool(
+        existing.album
+        and candidate.album
+        and _match_score(existing.album, candidate.album) == 0
+    )
+
+
+async def _candidate_failure_message(
     metadata: TrackMetadata,
     required: tuple[RequiredMetadata, ...],
     candidates: tuple[TrackMetadata, ...],
+    *,
+    artist_service: ArtistService | None = None,
 ) -> str:
     required_text = ", ".join(required) if required else "none"
-    score_text = _best_candidate_score_text(metadata, candidates)
+    score_text = await _best_candidate_score_text(
+        metadata,
+        candidates,
+        artist_service=artist_service,
+    )
+    diagnostics_text = await _candidate_diagnostics_text(
+        metadata,
+        required,
+        candidates,
+        artist_service=artist_service,
+    )
     return (
         "未找到可信的刮削候选。"
         f"title={metadata.title!r}, artist={metadata.artist!r}, "
         f"required={required_text}, candidates={len(candidates)}"
-        f"{score_text}"
+        f"{score_text}{diagnostics_text}"
     )
 
 
-def _best_candidate_score_text(
+async def _best_candidate_score_text(
     metadata: TrackMetadata,
     candidates: tuple[TrackMetadata, ...],
+    *,
+    artist_service: ArtistService | None = None,
 ) -> str:
     best_candidate = None
     best_score = _MatchScore()
     for candidate in candidates:
-        score = _metadata_match_score(metadata, candidate)
+        score = await _metadata_match_score(metadata, candidate, artist_service=artist_service)
         if score.total > best_score.total:
             best_candidate = candidate
             best_score = score
@@ -1064,9 +1333,65 @@ def _best_candidate_score_text(
     )
 
 
-def _metadata_match_score(existing: TrackMetadata, scraped: TrackMetadata) -> _MatchScore:
+async def _candidate_diagnostics_text(
+    metadata: TrackMetadata,
+    required: tuple[RequiredMetadata, ...],
+    candidates: tuple[TrackMetadata, ...],
+    *,
+    artist_service: ArtistService | None = None,
+) -> str:
+    if not candidates:
+        return ""
+    items: list[str] = []
+    for index, candidate in enumerate(candidates[:5], start=1):
+        score = await _metadata_match_score(metadata, candidate, artist_service=artist_service)
+        missing = _candidate_missing_required(metadata, candidate, required)
+        album_conflict = _candidate_has_conflicting_album(metadata, candidate)
+        reasons: list[str] = []
+        if missing:
+            reasons.append(f"missing={','.join(missing)}")
+        if album_conflict:
+            reasons.append("album_conflict")
+        if score.total < _MATCH_SCORE_THRESHOLD:
+            reasons.append(f"score_below_threshold={_MATCH_SCORE_THRESHOLD}")
+        reason_text = ";".join(reasons) if reasons else "eligible"
+        items.append(
+            f"#{index}:{candidate.title!r}/{candidate.artist!r}/{candidate.album!r} "
+            f"score={score.total}(title={score.title},artist={score.artist},album={score.album}) "
+            f"{reason_text}"
+        )
+    suffix = "" if len(candidates) <= 5 else f"; ... +{len(candidates) - 5} more"
+    return f", diagnostics=[{'; '.join(items)}{suffix}]"
+
+
+def _candidate_missing_required(
+    existing: TrackMetadata,
+    candidate: TrackMetadata,
+    required: tuple[RequiredMetadata, ...],
+) -> tuple[RequiredMetadata, ...]:
+    missing: list[RequiredMetadata] = []
+    for field in required:
+        current = getattr(existing, field)
+        if isinstance(current, str) and current.strip():
+            continue
+        value = getattr(candidate, field)
+        if not isinstance(value, str) or not value.strip():
+            missing.append(field)
+    return tuple(missing)
+
+
+async def _metadata_match_score(
+    existing: TrackMetadata,
+    scraped: TrackMetadata,
+    *,
+    artist_service: ArtistService | None = None,
+) -> _MatchScore:
     title_score = _match_score(existing.title, scraped.title)
-    artist_score = _match_artist(existing.artist, scraped.artist)
+    artist_score = await _match_artist_with_aliases(
+        existing.artist,
+        scraped.artist,
+        artist_service=artist_service,
+    )
     album_score = _match_score(existing.album, scraped.album)
 
     # Strong penalty: existing artist known but candidate artist doesn't match
@@ -1103,6 +1428,30 @@ def _match_artist(left: str | None, right: str | None) -> int:
     return max(_match_score(left, item) for item in re.split(r"[,，、/&]+", right))
 
 
+async def _match_artist_with_aliases(
+    left: str | None,
+    right: str | None,
+    *,
+    artist_service: ArtistService | None = None,
+) -> int:
+    if not left or not right:
+        return 0
+    direct_score = max(_match_score(left, item) for item in _split_artist_names(right))
+    if direct_score > 0 or artist_service is None:
+        return direct_score
+    left_aliases = await artist_service.get_aliases(left)
+    right_aliases: list[str] = []
+    for item in _split_artist_names(right):
+        right_aliases.extend(await artist_service.get_aliases(item))
+    left_values = {_normalize_match_text(item) for item in left_aliases if item}
+    right_values = {_normalize_match_text(item) for item in right_aliases if item}
+    return 2 if left_values and right_values and left_values & right_values else 0
+
+
+def _split_artist_names(value: str) -> list[str]:
+    return [item.strip() for item in re.split(r"[,，、/&]+", value) if item.strip()]
+
+
 def _normalize_match_text(value: str | None) -> str:
     if not value:
         return ""
@@ -1126,6 +1475,41 @@ def _merge_metadata(existing: TrackMetadata, scraped: TrackMetadata) -> TrackMet
         cover_url=scraped.cover_url or existing.cover_url,
         extra={**existing.extra, **scraped.extra},
     )
+
+
+def _metadata_fields_union(
+    left: tuple[RequiredMetadata, ...],
+    right: tuple[RequiredMetadata, ...],
+) -> tuple[RequiredMetadata, ...]:
+    values: list[RequiredMetadata] = []
+    for field in (*left, *right):
+        if field not in values:
+            values.append(field)
+    return tuple(values)
+
+
+def _missing_metadata_fields(
+    metadata: TrackMetadata,
+    fields: tuple[RequiredMetadata, ...],
+) -> tuple[RequiredMetadata, ...]:
+    return tuple(field for field in fields if not _metadata_has_value(metadata, field))
+
+
+def _filled_metadata_fields(
+    before: TrackMetadata,
+    after: TrackMetadata,
+    fields: tuple[RequiredMetadata, ...],
+) -> tuple[RequiredMetadata, ...]:
+    return tuple(
+        field
+        for field in fields
+        if not _metadata_has_value(before, field) and _metadata_has_value(after, field)
+    )
+
+
+def _metadata_has_value(metadata: TrackMetadata, field: RequiredMetadata) -> bool:
+    value = getattr(metadata, field)
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _optional_path(value: object) -> Path | None:

@@ -67,6 +67,7 @@ from musicpilot.core.scraping import (
     ScrapingConfig,
     ScrapingFileResult,
     ScrapingSummary,
+    infer_metadata_from_paths,
     scraping_config_from_payload,
 )
 from musicpilot.infra.api.schemas import (
@@ -313,6 +314,7 @@ class AppState:
         self.playlist_import_previews: dict[str, PublicPlaylist] = {}
         self.playlist_download_tasks: dict[int, asyncio.Task[None]] = {}
         self.playlist_track_download_tasks: dict[int, asyncio.Task[None]] = {}
+        self.download_item_scraping_tasks: dict[int, asyncio.Task[None]] = {}
         self.scraping_metadata = MetadataCascade([MultiSourceMusicProvider()])
         self.scraper = LocalMusicScraper(
             metadata=self.scraping_metadata,
@@ -833,7 +835,7 @@ def create_app() -> FastAPI:
             task.id if task else None,
             submitted.torrent_data,
         )
-        _schedule_download_task_item_scraping(state, item_ids)
+        _schedule_download_task_item_scraping(state, task.id if task else None, item_ids)
         await _send_event_notifications(state, "download", task)
         state.add_log("download", f"Download submitted: {payload.title}")
         return DownloadResponse(
@@ -2461,7 +2463,7 @@ async def _create_and_submit_download_task(
         submitted.torrent_data,
         playlist_track_id=playlist_track_id,
     )
-    _schedule_download_task_item_scraping(state, item_ids)
+    _schedule_download_task_item_scraping(state, (updated or task).id, item_ids)
     await _send_event_notifications(state, "download", updated or task)
     return updated or task
 
@@ -2616,13 +2618,33 @@ async def _record_submitted_torrent_items(
     return [row.id for row in rows]
 
 
-def _schedule_download_task_item_scraping(state: AppState, item_ids: list[int]) -> None:
-    if not item_ids:
+def _schedule_download_task_item_scraping(
+    state: AppState,
+    task_id: int | None,
+    item_ids: list[int],
+) -> None:
+    if task_id is None or not item_ids:
         return
-    asyncio.create_task(
+    current = state.download_item_scraping_tasks.pop(task_id, None)
+    if current is not None and not current.done():
+        current.cancel()
+    task = asyncio.create_task(
         _scrape_download_task_items(state, item_ids),
-        name=f"musicpilot-download-item-scrape-{item_ids[0]}",
+        name=f"musicpilot-download-item-scrape-{task_id}",
     )
+    state.download_item_scraping_tasks[task_id] = task
+
+    def _cleanup(done: asyncio.Task[None]) -> None:
+        if state.download_item_scraping_tasks.get(task_id) is done:
+            state.download_item_scraping_tasks.pop(task_id, None)
+
+    task.add_done_callback(_cleanup)
+
+
+def _cancel_download_task_item_scraping(state: AppState, task_id: int) -> None:
+    task = state.download_item_scraping_tasks.pop(task_id, None)
+    if task is not None and not task.done():
+        task.cancel()
 
 
 async def _scrape_download_task_items(state: AppState, item_ids: list[int]) -> None:
@@ -2634,7 +2656,8 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> None:
     item = await state.repository.get_download_task_item(item_id)
     if item is None:
         return
-    title = (item.parsed_title or Path(item.file_name).stem).strip()
+    reference = _download_task_item_reference_metadata(item)
+    title = reference.title.strip()
     if not title:
         await state.repository.update_download_task_item(
             item_id,
@@ -2648,19 +2671,43 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> None:
         last_error=None,
     )
     try:
-        metadata = await state.metadata.lookup(title=title, artist=item.artist)
+        state.add_log(
+            "metadata",
+            f"Download item metadata scraping input: item_id={item_id}, "
+            f"file={item.file_path}, reference={_track_metadata_log_text(reference)}",
+        )
+        candidates = await state.scraper.search_metadata_candidates(reference, reference)
+        metadata = await state.scraper.select_metadata_candidate(reference, candidates)
+        failure_message = await state.scraper.metadata_candidate_failure_message(
+            reference,
+            candidates,
+        )
     except Exception as exc:  # noqa: BLE001
+        error_message = f"{exc.__class__.__name__}: {exc}"
         await state.repository.update_download_task_item(
             item_id,
             status="failed",
-            last_error=str(exc),
+            last_error=error_message,
+        )
+        state.add_log(
+            "metadata",
+            f"Download item metadata scraping failed: item_id={item_id}, "
+            f"reference={_track_metadata_log_text(reference)}, error={error_message}",
+            "WARNING",
         )
         return
     if metadata is None:
         await state.repository.update_download_task_item(
             item_id,
             status="metadata_not_found",
-            last_error="No metadata matched.",
+            last_error=failure_message,
+        )
+        state.add_log(
+            "metadata",
+            f"Download item metadata scraping result: item_id={item_id}, "
+            f"status=metadata_not_found, reference={_track_metadata_log_text(reference)}, "
+            f"candidates={len(candidates)}, error={failure_message}",
+            "WARNING",
         )
         return
     await state.repository.update_download_task_item(
@@ -2672,10 +2719,43 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> None:
         metadata_payload=_track_metadata_payload(metadata),
         last_error=None,
     )
+    state.add_log(
+        "metadata",
+        f"Download item metadata scraping result: item_id={item_id}, status=metadata_found, "
+        f"reference={_track_metadata_log_text(reference)}, "
+        f"metadata={_track_metadata_log_text(metadata)}, "
+        f"candidates={len(candidates)}",
+    )
 
 
 def _track_metadata_payload(metadata: TrackMetadata) -> dict[str, object]:
     return dataclasses.asdict(metadata)
+
+
+def _track_metadata_log_text(metadata: TrackMetadata | None) -> str:
+    if metadata is None:
+        return "None"
+    return (
+        "{"
+        f"title={metadata.title!r}, artist={metadata.artist!r}, album={metadata.album!r}, "
+        f"year={metadata.year!r}, track_number={metadata.track_number!r}, "
+        f"lyrics={bool(metadata.lyrics)}, cover_url={metadata.cover_url!r}, "
+        f"extra_keys={sorted(metadata.extra.keys()) if metadata.extra else []}"
+        "}"
+    )
+
+
+def _download_task_item_reference_metadata(item: TorrentRecordItem) -> TrackMetadata:
+    virtual_path = Path(item.file_path.replace("\\", "/"))
+    inferred = infer_metadata_from_paths([virtual_path]).get(virtual_path)
+    title = item.parsed_title or (inferred.title if inferred else None) or Path(item.file_name).stem
+    artist = item.artist or (inferred.artist if inferred else None)
+    return TrackMetadata(
+        title=title,
+        artist=artist,
+        album=inferred.album if inferred else None,
+        year=inferred.year if inferred else None,
+    )
 
 
 def _torrent_audio_items(torrent_data: bytes) -> list[dict[str, object]]:
@@ -3615,6 +3695,7 @@ async def _refresh_library_for_task(state: AppState, task: TorrentRecord) -> Non
 
 
 async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> None:
+    _cancel_download_task_item_scraping(state, task.id)
     settings_payload = await state.repository.get_system_settings()
     config = scraping_config_from_payload(settings_payload)
     if not config.enabled:
@@ -3650,6 +3731,11 @@ async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> Non
         source_files = await _scraping_source_files_for_task(state, task)
         if source_files is None:
             return
+        cached_metadata = await _cached_metadata_for_task_source_files(
+            state,
+            task,
+            source_files,
+        )
         summary = await state.scraper.process_download(
             task_name=task.name,
             save_path=task.save_path,
@@ -3657,6 +3743,7 @@ async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> Non
             source_files=source_files,
             library_tracks=library_tracks,
             media_history=media_history,
+            cached_metadata=cached_metadata,
         )
     except Exception as exc:  # noqa: BLE001
         state.add_log("metadata", f"Scraping failed for {task.name}: {exc}", "WARNING")
@@ -3724,6 +3811,84 @@ async def _scraping_source_files_for_task(
         f"Scraping source files resolved for {task.name}: files={len(source_files)}",
     )
     return source_files
+
+
+async def _cached_metadata_for_task_source_files(
+    state: AppState,
+    task: TorrentRecord,
+    source_files: tuple[Path, ...],
+) -> dict[Path, tuple[TrackMetadata, ...]]:
+    items = await state.repository.list_download_task_items(task.id)
+    candidates_by_item = [
+        (item, metadata)
+        for item in items
+        if (metadata := _track_metadata_from_payload(item.metadata_payload)) is not None
+    ]
+    if not candidates_by_item:
+        return {}
+
+    result: dict[Path, tuple[TrackMetadata, ...]] = {}
+    used_item_ids: set[int] = set()
+    for source_file in source_files:
+        matched: list[TrackMetadata] = []
+        for item, metadata in candidates_by_item:
+            if item.id in used_item_ids:
+                continue
+            if _source_file_matches_torrent_item(source_file, item):
+                matched.append(metadata)
+                used_item_ids.add(item.id)
+        if matched:
+            result[source_file] = tuple(matched)
+
+    for source_file in source_files:
+        if source_file in result:
+            continue
+        same_name = [
+            (item, metadata)
+            for item, metadata in candidates_by_item
+            if item.id not in used_item_ids
+            and item.file_name.casefold() == source_file.name.casefold()
+        ]
+        if len(same_name) == 1:
+            item, metadata = same_name[0]
+            used_item_ids.add(item.id)
+            result[source_file] = (metadata,)
+    return result
+
+
+def _track_metadata_from_payload(payload: dict[str, Any] | None) -> TrackMetadata | None:
+    if not isinstance(payload, dict):
+        return None
+    title = _optional_string(payload.get("title"))
+    if title is None:
+        return None
+    extra = payload.get("extra")
+    return TrackMetadata(
+        title=title,
+        artist=_optional_string(payload.get("artist")),
+        album=_optional_string(payload.get("album")),
+        year=_optional_int(payload.get("year")),
+        track_number=_optional_int(payload.get("track_number")),
+        lyrics=_optional_string(payload.get("lyrics")),
+        cover_url=_optional_string(payload.get("cover_url")),
+        extra=dict(extra) if isinstance(extra, dict) else {},
+    )
+
+
+def _source_file_matches_torrent_item(source_file: Path, item: TorrentRecordItem) -> bool:
+    item_parts = _normalized_torrent_path_parts(item.file_path)
+    if not item_parts:
+        return False
+    source_parts = tuple(part.casefold() for part in source_file.parts)
+    return len(source_parts) >= len(item_parts) and source_parts[-len(item_parts) :] == item_parts
+
+
+def _normalized_torrent_path_parts(value: str) -> tuple[str, ...]:
+    return tuple(
+        part.casefold()
+        for part in Path(value.replace("\\", "/")).parts
+        if part not in {"", ".", "/"}
+    )
 
 
 def _resolve_torrent_audio_files(
@@ -4054,6 +4219,8 @@ def _proxy_url(settings_payload: dict[str, object]) -> str | None:
 
 
 def _category_from_logger(name: str) -> str:
+    if name.startswith("musicpilot.metadata.scraping"):
+        return "metadata"
     if "indexer" in name:
         return "search"
     if "download" in name:
