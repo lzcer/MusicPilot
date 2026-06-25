@@ -395,6 +395,7 @@ class AppState:
         self.playlist_import_previews: dict[str, PublicPlaylist] = {}
         self.playlist_download_tasks: dict[int, asyncio.Task[None]] = {}
         self.playlist_track_download_tasks: dict[int, asyncio.Task[None]] = {}
+        self.artist_build_lock = asyncio.Lock()
         self.download_item_scraping_tasks: dict[int, asyncio.Task[None]] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
         self.scraping_metadata = MetadataCascade([MultiSourceMusicProvider()])
@@ -1808,17 +1809,20 @@ def create_app() -> FastAPI:
 
     @app.post("/api/artists/build-library", response_model=BuildArtistLibraryResponse)
     async def build_artist_library() -> BuildArtistLibraryResponse:
-        try:
-            created = await state.artist_service.build_library_from_media_files()
-            state.add_log(
-                "artist",
-                f"已从曲库自动构建歌手库，共 {created} 个歌手组。",
-                "INFO",
-            )
-            return BuildArtistLibraryResponse(created=created)
-        except Exception as exc:  # noqa: BLE001
-            state.add_log("artist", f"构建歌手库失败：{exc}", "ERROR")
-            raise HTTPException(status_code=502, detail=f"构建失败：{exc}") from exc
+        if state.artist_build_lock.locked():
+            raise HTTPException(status_code=409, detail="歌手库正在构建中，请稍后重试")
+        async with state.artist_build_lock:
+            try:
+                created = await state.artist_service.build_library_from_media_files()
+                state.add_log(
+                    "artist",
+                    f"已从曲库自动构建歌手库，共 {created} 个歌手组。",
+                    "INFO",
+                )
+                return BuildArtistLibraryResponse(created=created)
+            except Exception as exc:  # noqa: BLE001
+                state.add_log("artist", f"构建歌手库失败：{exc}", "ERROR")
+                raise HTTPException(status_code=502, detail=f"构建失败：{exc}") from exc
 
     @app.delete("/api/artists", response_model=ClearArtistLibraryResponse)
     async def clear_artist_library() -> ClearArtistLibraryResponse:
@@ -3269,21 +3273,25 @@ def _track_metadata_payload(metadata: TrackMetadata) -> dict[str, object]:
 
 async def _auto_build_artist_library(state: AppState) -> None:
     """Build artist library in background with a timeout."""
-    try:
-        created = await asyncio.wait_for(
-            state.artist_service.build_library_from_media_files(),
-            timeout=300,
-        )
-        if created:
-            state.add_log(
-                "artist",
-                f"启动时自动构建歌手库：已创建 {created} 个歌手组。",
-                "INFO",
+    if state.artist_build_lock.locked():
+        state.add_log("artist", "自动构建歌手库跳过：已有构建任务进行中", "INFO")
+        return
+    async with state.artist_build_lock:
+        try:
+            created = await asyncio.wait_for(
+                state.artist_service.build_library_from_media_files(),
+                timeout=300,
             )
-    except asyncio.TimeoutError:
-        state.add_log("artist", "自动构建歌手库超时（可稍后手动构建）", "WARNING")
-    except Exception as exc:  # noqa: BLE001
-        state.add_log("artist", f"自动构建歌手库失败（可稍后手动构建）：{exc}", "WARNING")
+            if created:
+                state.add_log(
+                    "artist",
+                    f"启动时自动构建歌手库：已创建 {created} 个歌手组。",
+                    "INFO",
+                )
+        except asyncio.TimeoutError:
+            state.add_log("artist", "自动构建歌手库超时（可稍后手动构建）", "WARNING")
+        except Exception as exc:  # noqa: BLE001
+            state.add_log("artist", f"自动构建歌手库失败（可稍后手动构建）：{exc}", "WARNING")
 
 
 async def _ensure_artist_from_metadata(
