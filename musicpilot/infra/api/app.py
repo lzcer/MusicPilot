@@ -55,7 +55,7 @@ from musicpilot.adapters.music_platforms.spotify import (
     refresh_token_expiry,
     token_expiry,
 )
-from musicpilot.core.artist import ArtistService, normalize_artist_name
+from musicpilot.core.artist import ArtistService, normalize_artist_name, split_artist_credit
 from musicpilot.core.event_bus import EventBus
 from musicpilot.core.events import NotifyEvent, SearchEvent, SearchResult
 from musicpilot.core.metadata import MetadataCascade
@@ -286,86 +286,82 @@ class MetadataSiteSearchTask:
 
 @dataclasses.dataclass(slots=True)
 class ArtistDownloadJob:
+    id: int
+    artist_keys: tuple[str, ...]
     label: str
-    runner: Callable[[], Awaitable[str]]
-    future: asyncio.Future[str]
 
 
 class ArtistDownloadQueue:
     def __init__(self, log: Callable[[str, str, str], None]) -> None:
         self._log = log
-        self._queues: dict[str, deque[ArtistDownloadJob]] = {}
-        self._workers: dict[str, asyncio.Task[None]] = {}
+        self._condition = asyncio.Condition()
+        self._pending: deque[ArtistDownloadJob] = deque()
+        self._active_keys: set[str] = set()
+        self._next_id = 1
 
     async def submit(
         self,
-        artist_key: str,
+        artist_keys: tuple[str, ...],
         label: str,
         runner: Callable[[], Awaitable[str]],
     ) -> str:
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[str] = loop.create_future()
-        queue = self._queues.setdefault(artist_key, deque())
-        queue.append(ArtistDownloadJob(label=label, runner=runner, future=future))
+        keys = tuple(dict.fromkeys(key for key in artist_keys if key))
+        if not keys:
+            keys = (f"job:{id(runner)}",)
+        async with self._condition:
+            job = ArtistDownloadJob(id=self._next_id, artist_keys=keys, label=label)
+            self._next_id += 1
+            self._pending.append(job)
+            self._log(
+                "playlist",
+                f"Artist queue enqueued: artist_keys={','.join(keys)}, pending={len(self._pending)}, job={label}",
+                "INFO",
+            )
+            while not self._can_start(job):
+                await self._condition.wait()
+            self._pending.remove(job)
+            self._active_keys.update(keys)
+            self._log(
+                "playlist",
+                f"Artist queue started: artist_keys={','.join(keys)}, pending={len(self._pending)}, job={label}",
+                "INFO",
+            )
+        try:
+            result = await runner()
+        except Exception as exc:  # noqa: BLE001
+            self._log(
+                "playlist",
+                f"Artist download job failed: artist_keys={','.join(keys)}, job={label}, error={exc}",
+                "ERROR",
+            )
+            raise
+        finally:
+            async with self._condition:
+                self._active_keys.difference_update(keys)
+                self._condition.notify_all()
         self._log(
             "playlist",
-            f"Artist queue enqueued: artist_key={artist_key}, position={len(queue)}, job={label}",
+            f"Artist queue finished: artist_keys={','.join(keys)}, status={result}, pending={len(self._pending)}, job={label}",
             "INFO",
         )
-        if artist_key not in self._workers or self._workers[artist_key].done():
-            self._workers[artist_key] = asyncio.create_task(
-                self._run_artist_queue(artist_key),
-                name=f"musicpilot-artist-download-{artist_key}",
-            )
-        return await future
+        return result
 
     async def stop(self) -> None:
-        workers = tuple(self._workers.values())
-        for worker in workers:
-            worker.cancel()
-        for worker in workers:
-            with contextlib.suppress(asyncio.CancelledError):
-                await worker
-        self._queues.clear()
-        self._workers.clear()
+        async with self._condition:
+            self._pending.clear()
+            self._active_keys.clear()
+            self._condition.notify_all()
 
-    async def _run_artist_queue(self, artist_key: str) -> None:
-        try:
-            while True:
-                queue = self._queues.get(artist_key)
-                if not queue:
-                    return
-                job = queue.popleft()
-                if job.future.cancelled():
-                    continue
-                self._log(
-                    "playlist",
-                    f"Artist queue started: artist_key={artist_key}, remaining={len(queue)}, job={job.label}",
-                    "INFO",
-                )
-                try:
-                    result = await job.runner()
-                except Exception as exc:  # noqa: BLE001
-                    if not job.future.done():
-                        job.future.set_exception(exc)
-                    self._log(
-                        "playlist",
-                        f"Artist download job failed: artist={artist_key}, job={job.label}, error={exc}",
-                        "ERROR",
-                    )
-                else:
-                    if not job.future.done():
-                        job.future.set_result(result)
-                    self._log(
-                        "playlist",
-                        f"Artist queue finished: artist_key={artist_key}, status={result}, remaining={len(queue)}, job={job.label}",
-                        "INFO",
-                    )
-        finally:
-            if not self._queues.get(artist_key):
-                self._queues.pop(artist_key, None)
-            if self._workers.get(artist_key) is asyncio.current_task():
-                self._workers.pop(artist_key, None)
+    def _can_start(self, job: ArtistDownloadJob) -> bool:
+        key_set = set(job.artist_keys)
+        if self._active_keys & key_set:
+            return False
+        for pending in self._pending:
+            if pending.id == job.id:
+                return True
+            if set(pending.artist_keys) & key_set:
+                return False
+        return True
 
 
 class AppState:
@@ -761,7 +757,7 @@ def create_app() -> FastAPI:
         merged = _dedupe_results(raw_results)
         exclude = await _get_exclude_keywords(state)
         merged = _filter_by_exclude_keywords(merged, exclude)
-        filtered = _filter_by_artist(merged, payload.media.artist)
+        filtered = await _filter_by_artist(state, merged, payload.media.artist)
         ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[: payload.limit]
         state.add_log(
             "search",
@@ -2315,18 +2311,14 @@ def _match_library_track(
     library_tracks: list[MusicLibraryTrack],
 ) -> MusicLibraryTrack | None:
     normalized_title = normalize_search_text(title)
-    normalized_artist = normalize_search_text(artist or "")
-    if not normalized_title or not normalized_artist:
+    target_artists = _normalized_artist_credit_parts(artist)
+    if not normalized_title:
         return None
     for item in library_tracks:
         if normalize_search_text(item.title) != normalized_title:
             continue
-        item_artist = normalize_search_text(item.artist or "")
-        if item_artist == normalized_artist:
-            return item
-        if item_artist and (
-            item_artist in normalized_artist or normalized_artist in item_artist
-        ):
+        item_artists = _normalized_artist_credit_parts(item.artist)
+        if not target_artists or _artist_value_sets_match(item_artists, target_artists):
             return item
     return None
 
@@ -2341,7 +2333,7 @@ async def _match_active_download_task_item(
         return None
     compact_title = _compact_search_text(normalized_title)
     for item in await state.repository.list_active_download_task_items():
-        if not _artist_matches(item.metadata_artist or item.artist, artist):
+        if not await _artist_matches(state, item.metadata_artist or item.artist, artist):
             continue
         for candidate in _download_task_item_titles(item):
             candidate_title = normalize_search_text(candidate)
@@ -2364,6 +2356,18 @@ def _download_task_item_titles(item: TorrentRecordItem) -> list[str]:
         Path(item.file_name).stem,
     ]
     return [value for value in values if value]
+
+
+def _normalized_artist_credit_parts(value: str | None) -> set[str]:
+    parts: set[str] = set()
+    for artist in split_artist_credit(value):
+        normalized = normalize_search_text(artist)
+        compact = _compact_search_text(normalized)
+        if normalized:
+            parts.add(normalized)
+        if compact:
+            parts.add(compact)
+    return parts
 
 
 def _playlist_track_log_text(track: PlaylistTrack) -> str:
@@ -2487,26 +2491,33 @@ async def _enqueue_playlist_track_download(
             last_checked_at=datetime.now(UTC),
             last_error=None,
         )
-    artist_key = await _playlist_track_artist_queue_key(state, track)
+    artist_keys = await _playlist_track_artist_queue_keys(state, track)
     state.add_log(
         "playlist",
-        f"Playlist track queued: artist_key={artist_key}, playlist_id={playlist_id}, track={_playlist_track_log_text(track)}",
+        f"Playlist track queued: artist_keys={','.join(artist_keys)}, playlist_id={playlist_id}, track={_playlist_track_log_text(track)}",
     )
     return await state.artist_download_queue.submit(
-        artist_key,
+        artist_keys,
         f"playlist={playlist_id}, track={track_id}, title={track.title}, artist={track.artist or ''}",
         lambda: _check_and_download_playlist_track(state, track_id),
     )
 
 
-async def _playlist_track_artist_queue_key(state: AppState, track: PlaylistTrack) -> str:
-    artist = (track.artist or "").strip()
-    if not artist:
-        return f"track:{track.id}"
-    canonical = await state.artist_service.get_canonical_name(artist)
-    normalized = normalize_artist_name(canonical or artist)
-    compact = _compact_search_text(normalized)
-    return compact or f"track:{track.id}"
+async def _playlist_track_artist_queue_keys(
+    state: AppState,
+    track: PlaylistTrack,
+) -> tuple[str, ...]:
+    artist_names = split_artist_credit(track.artist)
+    if not artist_names:
+        return (f"track:{track.id}",)
+    keys: list[str] = []
+    for artist in artist_names:
+        canonical = await state.artist_service.get_canonical_name(artist)
+        normalized = normalize_artist_name(canonical or artist)
+        compact = _compact_search_text(normalized)
+        if compact and compact not in keys:
+            keys.append(compact)
+    return tuple(keys) or (f"track:{track.id}",)
 
 
 async def _check_and_download_playlist_track(
@@ -2670,7 +2681,7 @@ async def _playlist_media_candidates(
     matched = [
         candidate
         for candidate in aggregated
-        if _artist_matches(candidate.artist, track.artist)
+        if await _artist_matches(state, candidate.artist, track.artist)
     ]
     fallback = _playlist_media_candidate(track)
     state.add_log(
@@ -2707,7 +2718,7 @@ async def _metadata_download_results(
     deduped = _dedupe_results(raw_results)
     exclude = await _get_exclude_keywords(state)
     deduped = _filter_by_exclude_keywords(deduped, exclude)
-    filtered = _filter_by_artist(deduped, media.artist)
+    filtered = await _filter_by_artist(state, deduped, media.artist)
     ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)
     state.add_log(
         "search",
@@ -2810,7 +2821,7 @@ async def _scrape_playlist_candidate_items(
     async def scrape_one(item_id: int) -> None:
         nonlocal submitted_task
         item = await _scrape_download_task_item(state, item_id)
-        if item is None or not _download_task_item_matches_playlist_track(item, track):
+        if item is None or not await _download_task_item_matches_playlist_track(state, item, track):
             return
         state.add_log(
             "playlist",
@@ -2891,11 +2902,12 @@ async def _submit_playlist_candidate_to_downloader(
     return updated or task
 
 
-def _download_task_item_matches_playlist_track(
+async def _download_task_item_matches_playlist_track(
+    state: AppState,
     item: TorrentRecordItem,
     track: PlaylistTrack,
 ) -> bool:
-    if not _artist_matches(item.metadata_artist or item.artist, track.artist):
+    if not await _artist_matches(state, item.metadata_artist or item.artist, track.artist):
         return False
     normalized_title = normalize_search_text(track.title)
     if not normalized_title:
@@ -3257,17 +3269,18 @@ async def _ensure_artist_from_metadata(
     *,
     context: str,
 ) -> None:
-    artist = (metadata.artist or "").strip()
-    if not artist:
+    artists = split_artist_credit(metadata.artist)
+    if not artists:
         return
-    try:
-        await state.artist_service.ensure_artist(artist, source="scraping")
-    except Exception as exc:  # noqa: BLE001
-        state.add_log(
-            "artist",
-            f"Artist library update skipped for {context}: artist={artist}, error={exc}",
-            "WARNING",
-        )
+    for artist in artists:
+        try:
+            await state.artist_service.ensure_artist(artist, source="scraping")
+        except Exception as exc:  # noqa: BLE001
+            state.add_log(
+                "artist",
+                f"Artist library update skipped for {context}: artist={artist}, error={exc}",
+                "WARNING",
+            )
 
 
 def _track_metadata_log_text(metadata: TrackMetadata | None) -> str:
@@ -3464,7 +3477,7 @@ async def _run_metadata_site_search_for_indexer(
 
         await asyncio.gather(*(search_keyword(keyword) for keyword in keywords))
         merged = _dedupe_results(raw_results)
-        filtered = _filter_by_artist(merged, task.media.artist)
+        filtered = await _filter_by_artist(state, merged, task.media.artist)
         ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[:limit]
         await task.site_done(
             site=site_name,
@@ -3700,32 +3713,66 @@ def _site_keyword_variants(value: str | None) -> list[str]:
     return [normalized, value]
 
 
-def _filter_by_artist(results: list[SearchResult], artist: str | None) -> list[SearchResult]:
+async def _filter_by_artist(
+    state: AppState,
+    results: list[SearchResult],
+    artist: str | None,
+) -> list[SearchResult]:
     if not artist:
         return results
-    needle = normalize_search_text(artist)
-    compact_needle = _compact_search_text(needle)
-    return [
-        item
-        for item in results
-        if _normalized_contains(_resource_text(item), needle, compact_needle)
-    ]
+    artist_values = await _artist_credit_match_values(state, artist)
+    if not artist_values:
+        return results
+    return [item for item in results if _resource_matches_artist_values(item, artist_values)]
 
 
-def _artist_matches(value: str | None, artist: str | None) -> bool:
+async def _artist_matches(state: AppState, value: str | None, artist: str | None) -> bool:
     if not artist:
         return True
     if not value:
         return False
-    needle = normalize_search_text(artist)
-    haystack = normalize_search_text(value)
-    return (
-        _normalized_contains(haystack, needle, _compact_search_text(needle))
-        or _normalized_contains(
-            needle,
-            haystack,
-            _compact_search_text(haystack),
-        )
+    left_values = await _artist_credit_match_values(state, value)
+    right_values = await _artist_credit_match_values(state, artist)
+    return _artist_value_sets_match(left_values, right_values)
+
+
+async def _artist_credit_match_values(state: AppState, artist_credit: str | None) -> set[str]:
+    values: set[str] = set()
+    for artist in split_artist_credit(artist_credit):
+        candidates = [artist]
+        canonical = await state.artist_service.get_canonical_name(artist)
+        if canonical:
+            candidates.append(canonical)
+        candidates.extend(await state.artist_service.get_aliases(artist))
+        for candidate in candidates:
+            normalized = normalize_search_text(candidate)
+            compact = _compact_search_text(normalized)
+            if normalized:
+                values.add(normalized)
+            if compact:
+                values.add(compact)
+    return values
+
+
+def _artist_value_sets_match(left_values: set[str], right_values: set[str]) -> bool:
+    if not left_values or not right_values:
+        return False
+    if left_values & right_values:
+        return True
+    return any(
+        _normalized_contains(left, right, _compact_search_text(right))
+        or _normalized_contains(right, left, _compact_search_text(left))
+        for left in left_values
+        for right in right_values
+    )
+
+
+def _resource_matches_artist_values(result: SearchResult, artist_values: set[str]) -> bool:
+    text = _resource_text(result)
+    return any(
+        _normalized_contains(text, value, _compact_search_text(value))
+        for value in artist_values
+        if value
     )
 
 

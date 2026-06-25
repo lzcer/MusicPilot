@@ -11,7 +11,7 @@ from typing import Literal
 
 from opencc import OpenCC
 
-from musicpilot.core.artist import ArtistService
+from musicpilot.core.artist import ArtistService, split_artist_credit
 from musicpilot.core.metadata import MetadataCascade
 from musicpilot.ports.metadata import TrackMetadata
 from musicpilot.ports.tag_writer import TagWriter
@@ -1040,10 +1040,11 @@ def _find_duplicate_media(
                 continue
             track_artist = _normalize_match_text(track.artist)
             track_album = _normalize_match_text(track.album)
-            if artist and track_artist and artist != track_artist:
+            artist_matches = _artist_credit_matches(metadata.artist, track.artist)
+            if artist and track_artist and not artist_matches:
                 continue
             score = 1
-            if artist and track_artist == artist:
+            if artist and artist_matches:
                 score += 2
             if album and track_album == album:
                 score += 1
@@ -1051,6 +1052,16 @@ def _find_duplicate_media(
                 best = track
                 best_score = score
     return best
+
+
+def _artist_credit_matches(left: str | None, right: str | None) -> bool:
+    left_values = {_normalize_match_text(item) for item in split_artist_credit(left)}
+    right_values = {_normalize_match_text(item) for item in split_artist_credit(right)}
+    left_values.discard("")
+    right_values.discard("")
+    if not left_values or not right_values:
+        return False
+    return bool(left_values & right_values)
 
 
 def _library_track_path(track: LibraryTrackSnapshot) -> Path | None:
@@ -1450,6 +1461,43 @@ async def _match_artist_with_aliases(
 
 def _split_artist_names(value: str) -> list[str]:
     return [item.strip() for item in re.split(r"[,，、/&]+", value) if item.strip()]
+
+
+def _match_artist(left: str | None, right: str | None) -> int:
+    if not left or not right:
+        return 0
+    scores = [
+        _match_score(left_item, right_item)
+        for left_item in _split_artist_names(left)
+        for right_item in _split_artist_names(right)
+    ]
+    return max(scores, default=0)
+
+
+async def _match_artist_with_aliases(
+    left: str | None,
+    right: str | None,
+    *,
+    artist_service: ArtistService | None = None,
+) -> int:
+    if not left or not right:
+        return 0
+    direct_score = _match_artist(left, right)
+    if direct_score > 0 or artist_service is None:
+        return direct_score
+    left_aliases: list[str] = []
+    for item in _split_artist_names(left):
+        left_aliases.extend(await artist_service.get_aliases(item))
+    right_aliases: list[str] = []
+    for item in _split_artist_names(right):
+        right_aliases.extend(await artist_service.get_aliases(item))
+    left_values = {_normalize_match_text(item) for item in left_aliases if item}
+    right_values = {_normalize_match_text(item) for item in right_aliases if item}
+    return 2 if left_values and right_values and left_values & right_values else 0
+
+
+def _split_artist_names(value: str) -> list[str]:
+    return split_artist_credit(value)
 
 
 def _normalize_match_text(value: str | None) -> str:

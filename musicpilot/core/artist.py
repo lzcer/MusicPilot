@@ -67,6 +67,27 @@ def normalize_compare(a: str | None, b: str | None) -> bool:
     return bool(normalize_artist_name(a) == normalize_artist_name(b))
 
 
+def split_artist_credit(value: str | None) -> list[str]:
+    if not value:
+        return []
+    pattern = re.compile(
+        r"\s*(?:/|、|,|，|&|＆|\+|\bfeat\.?|\bft\.?|\bfeaturing\b|\bwith\b)\s*",
+        re.IGNORECASE,
+    )
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in pattern.split(value):
+        name = item.strip()
+        if not name:
+            continue
+        normalized = normalize_artist_name(name)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        names.append(name)
+    return names
+
+
 class ArtistService:
     """Service for managing artist names, aliases, and canonical names."""
 
@@ -142,6 +163,20 @@ class ArtistService:
         name = name.strip()
         if not name:
             raise ValueError("Artist name cannot be empty")
+        names = split_artist_credit(name)
+        if len(names) > 1:
+            primary: ArtistInfo | None = None
+            for item in names:
+                info = await self.ensure_artist(
+                    item,
+                    source=source,
+                    external_ids=external_ids if item == names[0] else None,
+                )
+                if primary is None:
+                    primary = info
+            if primary is None:
+                raise ValueError("Artist name cannot be empty")
+            return primary
 
         # Check existing
         artist_id = await self._repo.find_artist_id_by_alias(name)
