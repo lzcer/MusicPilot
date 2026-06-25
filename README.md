@@ -55,6 +55,8 @@ MP_HTTP_PORT=8000
 MP_ADMIN_USERNAME=admin
 MP_ADMIN_PASSWORD=change-this-password
 MP_SESSION_SECRET=change-this-random-secret
+MP_HOST_DATA_PATH=/volume1/docker/musicpilot/data
+MP_HOST_CONFIG_PATH=/volume1/docker/musicpilot/config
 MP_HOST_MUSIC_PATH=/volume1/music
 MP_HOST_DOWNLOADS_PATH=/volume1/downloads
 ```
@@ -95,8 +97,8 @@ docker compose up -d --build
 The default `docker-compose.yml` mounts:
 
 ```text
-./data                 -> /data
-./config               -> /config
+MP_HOST_DATA_PATH      -> /data
+MP_HOST_CONFIG_PATH    -> /config
 MP_HOST_MUSIC_PATH     -> /music
 MP_HOST_DOWNLOADS_PATH -> /downloads
 ```

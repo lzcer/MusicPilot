@@ -25,7 +25,7 @@ services:
     ports:
       - "${MP_HTTP_PORT:-8000}:8000"
     volumes:
-      - ./data:/data
-      - ./config:/config
+      - ${MP_HOST_DATA_PATH:-./data}:/data
+      - ${MP_HOST_CONFIG_PATH:-./config}:/config
       - ${MP_HOST_MUSIC_PATH:-./data/library}:/music
       - ${MP_HOST_DOWNLOADS_PATH:-./data/downloads}:/downloads
