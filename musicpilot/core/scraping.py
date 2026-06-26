@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Literal
@@ -279,6 +280,7 @@ class LocalMusicScraper:
                 online_candidates = await self._search_metadata_candidates(
                     source_metadata,
                     match_metadata,
+                    config.required_metadata,
                 )
                 candidates = (*cached_candidates, *online_candidates)
                 looked_up = await _select_metadata_candidate(
@@ -563,8 +565,9 @@ class LocalMusicScraper:
         self,
         source_metadata: TrackMetadata,
         match_metadata: TrackMetadata,
+        required: tuple[RequiredMetadata, ...] = (),
     ) -> tuple[TrackMetadata, ...]:
-        return await self._search_metadata_candidates(source_metadata, match_metadata)
+        return await self._search_metadata_candidates(source_metadata, match_metadata, required)
 
     async def select_metadata_candidate(
         self,
@@ -596,6 +599,7 @@ class LocalMusicScraper:
         self,
         source_metadata: TrackMetadata,
         match_metadata: TrackMetadata,
+        required: tuple[RequiredMetadata, ...],
     ) -> tuple[TrackMetadata, ...]:
         # Build search tuples: (title, artist) from various sources
         searches: list[tuple[str, str | None]] = []
@@ -611,12 +615,12 @@ class LocalMusicScraper:
             if self.artist_service is not None and artist:
                 aliases = await self.artist_service.get_aliases(artist)
                 for alias in aliases:
-                    query = (title, alias)
+                    query: tuple[str, str | None] = (title, alias)
                     if query not in seen_queries:
                         seen_queries.add(query)
                         searches.append(query)
             else:
-                query = (title, artist)
+                query: tuple[str, str | None] = (title, artist)
                 if query not in seen_queries:
                     seen_queries.add(query)
                     searches.append(query)
@@ -634,20 +638,31 @@ class LocalMusicScraper:
         for title, artist in searches:
             if not title:
                 continue
-            for candidate in await self.metadata.search_metadata(
+            async for batch in _iter_metadata_candidate_batches(
+                self.metadata,
                 title=title,
                 artist=artist,
                 limit=5,
             ):
-                key = (
-                    _normalize_match_text(candidate.title),
-                    _normalize_match_text(candidate.artist),
-                    _normalize_match_text(candidate.album),
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                candidates.append(candidate)
+                added = False
+                for candidate in batch:
+                    key = (
+                        _normalize_match_text(candidate.title),
+                        _normalize_match_text(candidate.artist),
+                        _normalize_match_text(candidate.album),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(candidate)
+                    added = True
+                if added and await _select_metadata_candidate(
+                    match_metadata,
+                    tuple(candidates),
+                    required,
+                    artist_service=self.artist_service,
+                ):
+                    return tuple(candidates)
         return tuple(candidates)
 
     async def _resolve_known_artist_directory(
@@ -675,6 +690,33 @@ class LocalMusicScraper:
             cover_url=dir_meta.cover_url,
             extra=dir_meta.extra,
         )
+
+
+async def _iter_metadata_candidate_batches(
+    metadata: MetadataCascade,
+    *,
+    title: str,
+    artist: str | None,
+    limit: int,
+) -> AsyncIterator[tuple[TrackMetadata, ...]]:
+    for provider in metadata.providers:
+        try:
+            batch_iter = getattr(provider, "iter_metadata_batches", None)
+            if batch_iter is not None:
+                async for batch in batch_iter(title=title, artist=artist, limit=limit):
+                    yield batch
+                continue
+            search = getattr(provider, "search_metadata", None)
+            if search is None:
+                lookup = await provider.lookup(title=title, artist=artist)
+                batch = (lookup,) if lookup is not None else ()
+            else:
+                batch = await search(title=title, artist=artist, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Metadata provider %s failed: %s", provider.name, exc)
+            continue
+        if batch:
+            yield tuple(batch)
 
 
 def scraping_config_from_payload(payload: dict[str, object]) -> ScrapingConfig:

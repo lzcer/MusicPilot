@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import random
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid1
@@ -52,6 +53,21 @@ class MultiSourceMusicProvider:
         artist: str | None = None,
         limit: int = 5,
     ) -> tuple[TrackMetadata, ...]:
+        async for candidates in self.iter_metadata_batches(
+            title=title,
+            artist=artist,
+            limit=limit,
+        ):
+            return candidates
+        return ()
+
+    async def iter_metadata_batches(
+        self,
+        *,
+        title: str,
+        artist: str | None = None,
+        limit: int = 5,
+    ) -> AsyncIterator[tuple[TrackMetadata, ...]]:
         for resource in ("qmusic", "netease", "migu", "kuwo"):
             songs = await self._fetch_id3_by_title(resource, title)
             matched = _matched_songs(title, artist or "", songs, limit)
@@ -61,8 +77,7 @@ class MultiSourceMusicProvider:
             for song in matched:
                 lyrics = await self._fetch_lyric(song)
                 results.append(_song_metadata(song, lyrics))
-            return tuple(results)
-        return ()
+            yield tuple(results)
 
     async def _fetch_id3_by_title(
         self,
