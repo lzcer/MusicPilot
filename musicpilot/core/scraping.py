@@ -5,10 +5,10 @@ import logging
 import os
 import re
 import shutil
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, Literal
+from typing import Literal
 
 from opencc import OpenCC
 
@@ -239,9 +239,11 @@ class LocalMusicScraper:
         updated_files = 0
         moved_files = 0
         source_metadata = await asyncio.to_thread(read_track_metadata, source_file)
-        dir_meta = (dir_inferred or {}).get(source_file)
-        dir_meta = await self._resolve_known_artist_directory(source_metadata, dir_meta)
+        raw_dir_meta = (dir_inferred or {}).get(source_file)
+        dir_meta = await self._resolve_known_artist_directory(source_metadata, raw_dir_meta)
         match_metadata = _metadata_for_matching(source_metadata, source_file, dir_meta=dir_meta)
+        fallback_metadata = _path_only_metadata_for_matching(source_file, raw_dir_meta)
+        fallback_available = not _same_metadata_match_key(match_metadata, fallback_metadata)
         scrape_fields = _metadata_fields_union(
             config.scrape_when_missing,
             config.required_metadata,
@@ -250,15 +252,19 @@ class LocalMusicScraper:
         needs_scrape = bool(missing_before)
         metadata = _merge_metadata(source_metadata, match_metadata)
         candidate_count = 0
+        candidate_reference = match_metadata
+        candidate_stage = "metadata_candidate"
         tag_writer = self.tag_writer
         metadata_gain: tuple[RequiredMetadata, ...] = ()
         logger.info(
             "Scraping file input: source=%s, source_metadata=%s, dir_inferred=%s, "
-            "match_metadata=%s, scrape_fields=%s, missing_before=%s, cached_candidates=%s",
+            "match_metadata=%s, fallback_metadata=%s, scrape_fields=%s, "
+            "missing_before=%s, cached_candidates=%s",
             source_file,
             _metadata_log_text(source_metadata),
             _metadata_log_text(dir_meta),
             _metadata_log_text(match_metadata),
+            _metadata_log_text(fallback_metadata),
             scrape_fields,
             missing_before,
             _metadata_candidates_log_text(cached_candidates),
@@ -296,6 +302,31 @@ class LocalMusicScraper:
                     _metadata_candidates_log_text(online_candidates),
                     _metadata_log_text(looked_up),
                 )
+            if looked_up is None and fallback_available:
+                fallback_candidates = await self._search_metadata_candidates(
+                    fallback_metadata,
+                    fallback_metadata,
+                    config.required_metadata,
+                )
+                fallback_lookup = await _select_metadata_candidate(
+                    fallback_metadata,
+                    fallback_candidates,
+                    config.required_metadata,
+                    artist_service=self.artist_service,
+                )
+                candidates = (*candidates, *fallback_candidates)
+                candidate_reference = fallback_metadata
+                candidate_stage = "metadata_candidate_fallback"
+                logger.info(
+                    "Scraping fallback candidate result: source=%s, "
+                    "fallback_metadata=%s, fallback_candidates=%s, selected=%s",
+                    source_file,
+                    _metadata_log_text(fallback_metadata),
+                    _metadata_candidates_log_text(fallback_candidates),
+                    _metadata_log_text(fallback_lookup),
+                )
+                if fallback_lookup is not None:
+                    looked_up = fallback_lookup
             candidate_count = len(candidates)
             if looked_up is not None:
                 metadata = _merge_metadata(metadata, looked_up)
@@ -309,15 +340,16 @@ class LocalMusicScraper:
                     )
                 else:
                     error_message = await _candidate_failure_message(
-                        match_metadata,
+                        candidate_reference,
                         config.required_metadata,
                         candidates,
                         artist_service=self.artist_service,
                     )
                     logger.info(
-                        "Scraping file result: source=%s, status=failed, stage=metadata_candidate, "
+                        "Scraping file result: source=%s, status=failed, stage=%s, "
                         "metadata=%s, error=%s",
                         source_file,
+                        candidate_stage,
                         _metadata_log_text(source_metadata),
                         error_message,
                     )
@@ -328,7 +360,7 @@ class LocalMusicScraper:
                             metadata=source_metadata,
                             status="failed",
                             error_message=error_message,
-                            stage="metadata_candidate",
+                            stage=candidate_stage,
                             needs_metadata_update=needs_scrape,
                             candidate_count=candidate_count,
                         ),
@@ -338,15 +370,16 @@ class LocalMusicScraper:
                     )
             elif missing_required:
                 error_message = await _candidate_failure_message(
-                    match_metadata,
+                    candidate_reference,
                     config.required_metadata,
                     candidates,
                     artist_service=self.artist_service,
                 )
                 logger.info(
-                    "Scraping file result: source=%s, status=failed, stage=metadata_candidate, "
+                    "Scraping file result: source=%s, status=failed, stage=%s, "
                     "metadata=%s, selected=%s, missing_required=%s, error=%s",
                     source_file,
+                    candidate_stage,
                     _metadata_log_text(source_metadata),
                     _metadata_log_text(looked_up),
                     missing_required,
@@ -359,7 +392,7 @@ class LocalMusicScraper:
                         metadata=source_metadata,
                         status="failed",
                         error_message=error_message,
-                        stage="metadata_candidate",
+                        stage=candidate_stage,
                         needs_metadata_update=needs_scrape,
                         candidate_count=candidate_count,
                     ),
@@ -1275,6 +1308,35 @@ def _metadata_for_matching(
         )
 
     return metadata
+
+
+def _path_only_metadata_for_matching(
+    source_file: Path,
+    dir_meta: TrackMetadata | None = None,
+) -> TrackMetadata:
+    if dir_meta is not None:
+        return dir_meta
+
+    title_no_track = _strip_track_prefix(source_file.stem) or source_file.stem
+    parsed = _parse_artist_title(title_no_track)
+    if parsed is not None:
+        artist, title = parsed
+    else:
+        artist = None
+        title = title_no_track
+    return TrackMetadata(title=title, artist=artist)
+
+
+def _same_metadata_match_key(left: TrackMetadata, right: TrackMetadata) -> bool:
+    return (
+        _normalize_match_text(left.title),
+        _normalize_match_text(left.artist),
+        _normalize_match_text(left.album),
+    ) == (
+        _normalize_match_text(right.title),
+        _normalize_match_text(right.artist),
+        _normalize_match_text(right.album),
+    )
 
 
 def _parse_artist_title(value: str | None) -> tuple[str, str] | None:
