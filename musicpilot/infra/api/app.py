@@ -4402,11 +4402,14 @@ async def _scrape_manual_source_files(
             title=item.title or "",
             artist=item.artist,
             album=item.album,
-            size=_file_size_or_none(item.library_path),
+            size=media_file_size,
             path=item.library_path,
         )
         for item in await state.repository.list_media_files()
         if item.title
+        and item.status == "success"
+        and item.library_path
+        and (media_file_size := _file_size_or_none(item.library_path)) is not None
     )
     async def record_file_result(item: ScrapingFileResult) -> None:
         if item.status in {"success", "skipped"}:
@@ -4639,11 +4642,14 @@ async def _scrape_download_for_task(state: AppState, task: TorrentRecord) -> Scr
                 title=item.title or "",
                 artist=item.artist,
                 album=item.album,
-                size=_file_size_or_none(item.library_path),
+                size=media_file_size,
                 path=item.library_path,
             )
             for item in await state.repository.list_media_files()
             if item.title
+            and item.status == "success"
+            and item.library_path
+            and (media_file_size := _file_size_or_none(item.library_path)) is not None
         )
         source_files = await _scraping_source_files_for_task(state, task)
         if source_files is None:
