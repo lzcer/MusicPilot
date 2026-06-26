@@ -644,7 +644,6 @@ class LocalMusicScraper:
                 artist=artist,
                 limit=5,
             ):
-                added = False
                 for candidate in batch:
                     key = (
                         _normalize_match_text(candidate.title),
@@ -655,14 +654,6 @@ class LocalMusicScraper:
                         continue
                     seen.add(key)
                     candidates.append(candidate)
-                    added = True
-                if added and await _select_metadata_candidate(
-                    match_metadata,
-                    tuple(candidates),
-                    required,
-                    artist_service=self.artist_service,
-                ):
-                    return tuple(candidates)
         return tuple(candidates)
 
     async def _resolve_known_artist_directory(
@@ -1325,8 +1316,6 @@ async def _select_metadata_candidate(
     scored: list[tuple[int, TrackMetadata]] = []
     for candidate in candidates:
         if not _candidate_fills_required(existing, candidate, required):
-            continue
-        if _candidate_has_conflicting_album(existing, candidate):
             continue
         score = await _metadata_match_score(existing, candidate, artist_service=artist_service)
         scored.append((score.total, candidate))
