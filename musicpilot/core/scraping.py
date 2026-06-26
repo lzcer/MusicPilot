@@ -58,6 +58,16 @@ _DIR_NOISE_RE = re.compile(
 )
 _ARTIST_SEP_RE = re.compile(r"\s+[–—\-|/]\s+")
 _DISC_DIR_RE = re.compile(r"^(?:CD|Disc|Disk|ディスク|Volume|Vol)\s*\d+", re.I)
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_SEARCH_TITLE_TRANSLATION = str.maketrans(
+    {
+        "妳": "你",
+        "祢": "你",
+        "裏": "里",
+        "裡": "里",
+        "麽": "么",
+    }
+)
 # Trailing noise to strip from album/artist names: year, format tags
 _ALBUM_TRAILING_NOISE_RE = re.compile(
     r"\s+(?:20\d{2}\s*)?(?:FLAC|MP3|WAV|ALAC|APE|AAC|DSD|SACD|"
@@ -642,29 +652,31 @@ class LocalMusicScraper:
             (match_metadata.title, match_metadata.artist),
             (source_metadata.title, source_metadata.artist),
         ]:
-            if not title:
+            search_title = _metadata_search_title(title)
+            if not search_title:
                 continue
             # Search with each alias of the artist
             if self.artist_service is not None and artist:
                 aliases = await self.artist_service.get_aliases(artist)
                 for alias in aliases:
-                    query: tuple[str, str | None] = (title, alias)
+                    query: tuple[str, str | None] = (search_title, alias)
                     if query not in seen_queries:
                         seen_queries.add(query)
                         searches.append(query)
             else:
-                query: tuple[str, str | None] = (title, artist)
+                query: tuple[str, str | None] = (search_title, artist)
                 if query not in seen_queries:
                     seen_queries.add(query)
                     searches.append(query)
 
         # Also add a pure title search as fallback
         for title in (match_metadata.title, source_metadata.title):
-            if title:
-                query = (title, None)
+            search_title = _metadata_search_title(title)
+            if search_title:
+                query = (search_title, None)
                 if query not in seen_queries:
                     seen_queries.add(query)
-                    searches.append((title, None))
+                    searches.append(query)
 
         candidates: list[TrackMetadata] = []
         seen: set[tuple[str, str, str]] = set()
@@ -1352,8 +1364,23 @@ def _parse_artist_title(value: str | None) -> tuple[str, str] | None:
     return None
 
 
+def _metadata_search_title(title: str | None) -> str | None:
+    text = _strip_track_prefix(str(title or "").strip())
+    if not text:
+        return None
+    if not _CJK_RE.search(text):
+        return text
+    normalized = _t2s.convert(text).translate(_SEARCH_TITLE_TRANSLATION)
+    return normalized.strip() or text
+
+
 def _strip_track_prefix(value: str) -> str:
-    return re.sub(r"^\s*(?:cd\s*)?\d{1,3}(?:[.\-_、\s]+)", "", value, flags=re.I).strip()
+    return re.sub(
+        r"^\s*(?:(?:cd\s*)?\d{1,3}(?:[.\-_、\s]+))+",
+        "",
+        value,
+        flags=re.I,
+    ).strip()
 
 
 _MATCH_SCORE_THRESHOLD = 1  # Minimum total score to accept a candidate
