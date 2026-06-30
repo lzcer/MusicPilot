@@ -235,6 +235,7 @@ class DownloaderConfig(TimestampMixin, Base):
     username: Mapped[str] = mapped_column(String(256), default="")
     password: Mapped[str] = mapped_column(Text, default="")
     download_path: Mapped[str] = mapped_column(Text, default="")
+    local_path: Mapped[str] = mapped_column(Text, default="")
     listen_mode: Mapped[str] = mapped_column(String(64), default="polling")
     is_default: Mapped[bool] = mapped_column(Boolean, default=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)

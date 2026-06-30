@@ -182,6 +182,7 @@ class SqlAlchemyMediaRepository:
                     "base_url",
                     "username",
                     "download_path",
+                    "local_path",
                     "listen_mode",
                     "is_default",
                     "enabled",

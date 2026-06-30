@@ -248,6 +248,7 @@ class DownloaderCreateRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = ""
     download_path: str = ""
+    local_path: str = ""
     listen_mode: str = Field(default="polling", pattern="^(polling|qb_callback)$")
     is_default: bool = True
     enabled: bool = True
@@ -260,6 +261,7 @@ class DownloaderResponse(BaseModel):
     base_url: str
     username: str
     download_path: str = ""
+    local_path: str = ""
     listen_mode: str = "polling"
     is_default: bool
     enabled: bool = True

@@ -52,6 +52,13 @@ class Database:
             )
             await _add_sqlite_columns(
                 conn,
+                "downloaders",
+                {
+                    "local_path": "TEXT NOT NULL DEFAULT ''",
+                },
+            )
+            await _add_sqlite_columns(
+                conn,
                 "indexer_sites",
                 {
                     "enabled": "BOOLEAN NOT NULL DEFAULT 1",

@@ -3783,6 +3783,7 @@ def _downloader_response(item: DownloaderConfig) -> DownloaderResponse:
         base_url=item.base_url,
         username=item.username,
         download_path=item.download_path,
+        local_path=item.local_path,
         listen_mode=item.listen_mode,
         is_default=item.is_default,
         enabled=item.enabled,
@@ -4341,6 +4342,10 @@ def _delete_source_path_sync(path: Path) -> None:
 
 
 def _source_audio_files(root: Path, target: Path) -> tuple[Path, ...]:
+    return _audio_files_for_target(target, root=root)
+
+
+def _audio_files_for_target(target: Path, *, root: Path | None = None) -> tuple[Path, ...]:
     candidates = (target,) if target.is_file() else tuple(target.rglob("*"))
     files: list[Path] = []
     seen: set[Path] = set()
@@ -4351,7 +4356,7 @@ def _source_audio_files(root: Path, target: Path) -> tuple[Path, ...]:
             continue
         if (
             resolved in seen
-            or not resolved.is_relative_to(root)
+            or (root is not None and not resolved.is_relative_to(root))
             or not resolved.is_file()
             or not _is_audio_file(resolved)
         ):
@@ -4727,14 +4732,35 @@ async def _scraping_source_files_for_task(
         return None
     try:
         status = await state.downloader.get_status(task.torrent_hash or "")
-        torrent_files = await state.downloader.list_files(task.torrent_hash or "")
     except Exception as exc:  # noqa: BLE001
         state.add_log(
             "metadata",
-            f"Scraping skipped for {task.name}: qBittorrent file list failed: {exc}",
+            f"Scraping skipped for {task.name}: qBittorrent status failed: {exc}",
             "WARNING",
         )
         return None
+    try:
+        torrent_files = await state.downloader.list_files(task.torrent_hash or "")
+    except Exception as exc:  # noqa: BLE001
+        torrent_files = ()
+        state.add_log(
+            "metadata",
+            f"qBittorrent file list unavailable for {task.name}, mapped directory scan will still run: {exc}",
+            "WARNING",
+        )
+    downloader_config = await state.repository.default_downloader()
+    source_files = await asyncio.to_thread(
+        _mapped_torrent_audio_files,
+        task,
+        status,
+        downloader_config,
+    )
+    if source_files:
+        state.add_log(
+            "metadata",
+            f"Scraping source files resolved from mapped download path for {task.name}: files={len(source_files)}",
+        )
+        return source_files
     source_files = _resolve_torrent_audio_files(task, status, torrent_files)
     state.add_log(
         "metadata",
@@ -4819,6 +4845,105 @@ def _normalized_torrent_path_parts(value: str) -> tuple[str, ...]:
         for part in Path(value.replace("\\", "/")).parts
         if part not in {"", ".", "/"}
     )
+
+
+def _mapped_torrent_audio_files(
+    task: TorrentRecord,
+    status: DownloadStatus,
+    downloader: DownloaderConfig | None,
+) -> tuple[Path, ...]:
+    targets = _mapped_torrent_targets(task, status, downloader)
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for target in targets:
+        for source_file in _audio_files_for_target(target):
+            if source_file in seen:
+                continue
+            seen.add(source_file)
+            files.append(source_file)
+    return tuple(sorted(files, key=lambda path: path.as_posix().casefold()))
+
+
+def _mapped_torrent_targets(
+    task: TorrentRecord,
+    status: DownloadStatus,
+    downloader: DownloaderConfig | None,
+) -> tuple[Path, ...]:
+    remote_roots = _download_remote_roots(task, status, downloader)
+    local_root = (downloader.local_path if downloader is not None else "").strip()
+    candidates = _torrent_content_roots(task, status)
+    mapped: list[Path] = []
+    for candidate in candidates:
+        if candidate.exists():
+            mapped.append(candidate)
+        for remote_root in remote_roots:
+            local = _map_downloader_path(candidate, remote_root, local_root)
+            if local is not None:
+                mapped.append(local)
+    return tuple(_dedupe_paths(mapped))
+
+
+def _download_remote_roots(
+    task: TorrentRecord,
+    status: DownloadStatus,
+    downloader: DownloaderConfig | None,
+) -> tuple[str, ...]:
+    roots: list[str] = []
+    if downloader is not None and downloader.download_path.strip():
+        roots.append(downloader.download_path)
+    if task.save_path:
+        roots.append(task.save_path)
+    if status.save_path is not None:
+        roots.append(str(status.save_path))
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for root in roots:
+        key = _normalized_path_text(root).casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(root)
+    return tuple(deduped)
+
+
+def _torrent_content_roots(task: TorrentRecord, status: DownloadStatus) -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    if status.content_path is not None:
+        candidates.append(status.content_path)
+    if status.save_path is not None and task.name:
+        candidates.append(status.save_path / task.name)
+    if task.save_path and task.name:
+        candidates.append(Path(task.save_path) / task.name)
+    return tuple(_dedupe_paths(candidates))
+
+
+def _map_downloader_path(
+    path: Path,
+    remote_root: str,
+    local_root: str,
+) -> Path | None:
+    if not remote_root.strip() or not local_root.strip():
+        return None
+    path_text = _normalized_path_text(str(path))
+    root_text = _normalized_path_text(remote_root).rstrip("/")
+    if not path_text or not root_text:
+        return None
+    path_key = path_text.casefold()
+    root_key = root_text.casefold()
+    if path_key == root_key:
+        suffix = ""
+    elif path_key.startswith(f"{root_key}/"):
+        suffix = path_text[len(root_text) :].lstrip("/")
+    else:
+        return None
+    local = Path(local_root).expanduser()
+    if not suffix:
+        return local
+    return local.joinpath(*[part for part in suffix.split("/") if part])
+
+
+def _normalized_path_text(value: str) -> str:
+    return value.replace("\\", "/").rstrip("/")
 
 
 def _resolve_torrent_audio_files(
@@ -5076,6 +5201,7 @@ def _legacy_downloader_payload(item: dict[str, object]) -> dict[str, object]:
         "username": str(item.get("username") or ""),
         "password": str(item.get("password") or ""),
         "download_path": str(item.get("download_path") or ""),
+        "local_path": str(item.get("local_path") or ""),
         "listen_mode": str(item.get("listen_mode") or "polling"),
         "is_default": bool(item.get("is_default", True)),
         "enabled": bool(item.get("enabled", True)),

@@ -198,6 +198,7 @@ type DownloaderConfig = {
   base_url: string
   username: string
   download_path: string
+  local_path: string
   listen_mode: string
   is_default: boolean
   enabled: boolean
@@ -544,6 +545,7 @@ const downloaderForm = ref({
   username: '',
   password: '',
   download_path: '',
+  local_path: '',
   listen_mode: 'polling',
   is_default: true,
   enabled: true
@@ -2065,6 +2067,7 @@ function openNewDownloaderDialog() {
     username: '',
     password: '',
     download_path: '',
+    local_path: '',
     listen_mode: 'polling',
     is_default: true,
     enabled: true
@@ -2082,6 +2085,7 @@ function editDownloader(downloader: DownloaderConfig) {
     username: downloader.username,
     password: '',
     download_path: downloader.download_path ?? '',
+    local_path: downloader.local_path ?? '',
     listen_mode: downloader.listen_mode ?? 'polling',
     is_default: downloader.is_default,
     enabled: downloader.enabled
@@ -3629,6 +3633,7 @@ onUnmounted(() => {
                     <v-card-text>
                       <div class="muted">{{ downloader.base_url }}</div>
                       <div class="muted">{{ downloader.download_path || '未设置下载目录' }}</div>
+                      <div class="muted">{{ downloader.local_path || '未设置本机对应目录' }}</div>
                       <v-chip v-if="downloader.is_default" color="success" size="small" variant="tonal">默认</v-chip>
                       <v-chip v-if="!downloader.enabled" color="warning" size="small" variant="tonal">停用</v-chip>
                     </v-card-text>
@@ -4267,6 +4272,7 @@ onUnmounted(() => {
             :placeholder="editingDownloaderId ? '留空则保持原密码' : ''"
           />
           <v-text-field v-model="downloaderForm.download_path" label="下载目录" placeholder="/downloads/music" />
+          <v-text-field v-model="downloaderForm.local_path" label="本机对应目录" placeholder="/volume1/music" />
           <v-select
             v-model="downloaderForm.listen_mode"
             :items="[
