@@ -184,6 +184,7 @@ _TORRENT_AUDIO_EXTENSIONS = {
 DOWNLOAD_POLL_INTERVAL_SECONDS = 5
 MUSIC_LIBRARY_SYNC_INTERVAL_SECONDS = 3600
 MUSIC_LIBRARY_SYNC_AFTER_REFRESH_DELAY_SECONDS = 5
+SLOW_API_OPERATION_SECONDS = float(os.getenv("MP_SLOW_API_OPERATION_SECONDS", "0.5"))
 PLAYLIST_TRACK_RETRYABLE_STATUSES = {
     "failed",
     "not_found",
@@ -200,6 +201,11 @@ PLAYLIST_TRACK_ACTIVE_STATUSES = {
     "refreshing_library",
 }
 PLAYLIST_TRACK_SUCCESS_STATUSES = {"existing", "library_refreshed"}
+logger = logging.getLogger(__name__)
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return (time.perf_counter() - started_at) * 1000
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1548,9 +1554,13 @@ def create_app() -> FastAPI:
         download_status: str | None = Query(default=None),
         exists_in_library: bool | None = Query(default=None),
     ) -> PlaylistTrackPageResponse:
+        request_started_at = time.perf_counter()
+        playlist_started_at = time.perf_counter()
         playlist = await state.repository.get_playlist(playlist_id)
+        playlist_elapsed_ms = _elapsed_ms(playlist_started_at)
         if playlist is None:
             raise HTTPException(status_code=404, detail="Playlist not found.")
+        tracks_started_at = time.perf_counter()
         tracks, total = await state.repository.list_playlist_tracks_page(
             playlist_id,
             offset=_page_offset(page, page_size),
@@ -1560,6 +1570,27 @@ def create_app() -> FastAPI:
             download_status=_optional_string(download_status),
             exists_in_library=exists_in_library,
         )
+        tracks_elapsed_ms = _elapsed_ms(tracks_started_at)
+        elapsed_ms = _elapsed_ms(request_started_at)
+        if elapsed_ms >= SLOW_API_OPERATION_SECONDS * 1000:
+            logger.warning(
+                "Slow playlist tracks request: playlist_id=%s page=%s page_size=%s "
+                "total=%s rows=%s elapsed_ms=%.1f get_playlist_ms=%.1f "
+                "list_tracks_ms=%.1f title_filter=%s artist_filter=%s "
+                "download_status=%r exists_in_library=%r",
+                playlist_id,
+                page,
+                page_size,
+                total,
+                len(tracks),
+                elapsed_ms,
+                playlist_elapsed_ms,
+                tracks_elapsed_ms,
+                bool(_optional_string(title)),
+                bool(_optional_string(artist)),
+                _optional_string(download_status),
+                exists_in_library,
+            )
         return PlaylistTrackPageResponse(
             items=[_playlist_track_response(item) for item in tracks],
             total=total,

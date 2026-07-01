@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import os
+import time
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +30,26 @@ from musicpilot.infra.db.models import (
 )
 from musicpilot.infra.db.session import Database
 from musicpilot.ports.metadata import TrackMetadata
+
+logger = logging.getLogger(__name__)
+SLOW_DB_OPERATION_SECONDS = float(os.getenv("MP_SLOW_DB_OPERATION_SECONDS", "0.5"))
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return (time.perf_counter() - started_at) * 1000
+
+
+def _log_slow_db_operation(operation: str, started_at: float, **fields: Any) -> None:
+    elapsed_ms = _elapsed_ms(started_at)
+    if elapsed_ms < SLOW_DB_OPERATION_SECONDS * 1000:
+        return
+    details = " ".join(f"{key}={value!r}" for key, value in fields.items())
+    logger.warning(
+        "Slow DB operation: operation=%s elapsed_ms=%.1f %s",
+        operation,
+        elapsed_ms,
+        details,
+    )
 
 
 class SqlAlchemyMediaRepository:
@@ -76,6 +99,7 @@ class SqlAlchemyMediaRepository:
         status: str,
         error_message: str | None = None,
     ) -> None:
+        operation_started_at = time.perf_counter()
         result_path = str(library_path) if library_path is not None else None
         async with self.database.session() as session:
             media_file = None
@@ -108,7 +132,22 @@ class SqlAlchemyMediaRepository:
             media_file.status = status
             media_file.error_message = error_message
             media_file.metadata_payload = asdict(metadata)
+            commit_started_at = time.perf_counter()
             await session.commit()
+            _log_slow_db_operation(
+                "record_scraping_result.commit",
+                commit_started_at,
+                status=status,
+                torrent_hash=torrent_hash,
+                source_path=str(source_path),
+            )
+        _log_slow_db_operation(
+            "record_scraping_result.total",
+            operation_started_at,
+            status=status,
+            torrent_hash=torrent_hash,
+            source_path=str(source_path),
+        )
 
     async def mark_torrent_completed(
         self,
@@ -365,14 +404,28 @@ class SqlAlchemyMediaRepository:
             return list(result.scalars().all())
 
     async def update_download_task(self, task_id: int, **changes: Any) -> TorrentRecord | None:
+        operation_started_at = time.perf_counter()
         async with self.database.session() as session:
             row = await session.get(TorrentRecord, task_id)
             if row is None:
                 return None
             for key, value in changes.items():
                 setattr(row, key, value)
+            commit_started_at = time.perf_counter()
             await session.commit()
+            _log_slow_db_operation(
+                "update_download_task.commit",
+                commit_started_at,
+                task_id=task_id,
+                fields=tuple(changes.keys()),
+            )
             await session.refresh(row)
+            _log_slow_db_operation(
+                "update_download_task.total",
+                operation_started_at,
+                task_id=task_id,
+                fields=tuple(changes.keys()),
+            )
             return row
 
     async def list_download_task_items(self, task_id: int) -> list[TorrentRecordItem]:
@@ -652,10 +705,30 @@ class SqlAlchemyMediaRepository:
             conditions.append(PlaylistTrack.download_status == download_status)
         if exists_in_library is not None:
             conditions.append(PlaylistTrack.exists_in_library.is_(exists_in_library))
+        filter_names = tuple(
+            name
+            for name, enabled in (
+                ("title", bool(title)),
+                ("artist", bool(artist)),
+                ("download_status", bool(download_status)),
+                ("exists_in_library", exists_in_library is not None),
+            )
+            if enabled
+        )
+        operation_started_at = time.perf_counter()
         async with self.database.session() as session:
+            count_started_at = time.perf_counter()
             total_result = await session.execute(
                 select(func.count()).select_from(PlaylistTrack).where(*conditions)
             )
+            total = int(total_result.scalar_one())
+            _log_slow_db_operation(
+                "list_playlist_tracks_page.count",
+                count_started_at,
+                playlist_id=playlist_id,
+                filters=filter_names,
+            )
+            select_started_at = time.perf_counter()
             result = await session.execute(
                 select(PlaylistTrack)
                 .where(*conditions)
@@ -663,7 +736,27 @@ class SqlAlchemyMediaRepository:
                 .offset(offset)
                 .limit(limit)
             )
-            return list(result.scalars().all()), int(total_result.scalar_one())
+            tracks = list(result.scalars().all())
+            _log_slow_db_operation(
+                "list_playlist_tracks_page.select",
+                select_started_at,
+                playlist_id=playlist_id,
+                offset=offset,
+                limit=limit,
+                filters=filter_names,
+                rows=len(tracks),
+            )
+            _log_slow_db_operation(
+                "list_playlist_tracks_page.total",
+                operation_started_at,
+                playlist_id=playlist_id,
+                offset=offset,
+                limit=limit,
+                filters=filter_names,
+                rows=len(tracks),
+                total=total,
+            )
+            return tracks, total
 
     async def list_all_playlist_tracks(self) -> list[PlaylistTrack]:
         async with self.database.session() as session:
@@ -719,14 +812,30 @@ class SqlAlchemyMediaRepository:
             return rows
 
     async def update_playlist_track(self, track_id: int, **changes: Any) -> PlaylistTrack | None:
+        operation_started_at = time.perf_counter()
         async with self.database.session() as session:
             row = await session.get(PlaylistTrack, track_id)
             if row is None:
                 return None
             for key, value in changes.items():
                 setattr(row, key, value)
+            commit_started_at = time.perf_counter()
             await session.commit()
+            _log_slow_db_operation(
+                "update_playlist_track.commit",
+                commit_started_at,
+                track_id=track_id,
+                fields=tuple(changes.keys()),
+                status=changes.get("download_status"),
+            )
             await session.refresh(row)
+            _log_slow_db_operation(
+                "update_playlist_track.total",
+                operation_started_at,
+                track_id=track_id,
+                fields=tuple(changes.keys()),
+                status=changes.get("download_status"),
+            )
             return row
 
     async def list_playlist_tracks_by_torrent_record(
