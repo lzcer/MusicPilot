@@ -69,6 +69,7 @@ from musicpilot.core.scraping import (
     ScrapingFileResult,
     ScrapingSummary,
     infer_metadata_from_paths,
+    normalize_metadata_match_text,
     scraping_config_from_payload,
 )
 from musicpilot.infra.api.schemas import (
@@ -2500,9 +2501,16 @@ async def _refresh_playlist_library_matches(
         else await state.repository.list_all_playlist_tracks()
     )
     checked_at = datetime.now(UTC)
+    artist_values_cache: dict[str, set[str]] = {}
     updated = 0
     for track in playlist_tracks:
-        match = _match_library_track(track.title, track.artist, library_tracks)
+        match = await _match_library_track(
+            state,
+            track.title,
+            track.artist,
+            library_tracks,
+            artist_values_cache=artist_values_cache,
+        )
         exists = match is not None
         status = "existing" if exists else track.download_status
         await state.repository.update_playlist_track(
@@ -2534,19 +2542,26 @@ async def _restore_playlist_download_tasks(state: AppState) -> None:
         state.add_log("playlist", f"Restored {restored} playlist download queue(s).")
 
 
-def _match_library_track(
+async def _match_library_track(
+    state: AppState,
     title: str,
     artist: str | None,
     library_tracks: list[MusicLibraryTrack],
+    *,
+    artist_values_cache: dict[str, set[str]] | None = None,
 ) -> MusicLibraryTrack | None:
-    normalized_title = normalize_search_text(title)
-    target_artists = _normalized_artist_credit_parts(artist)
+    normalized_title = normalize_metadata_match_text(title)
+    target_artists = await _artist_credit_match_values_cached(state, artist, artist_values_cache)
     if not normalized_title:
         return None
     for item in library_tracks:
-        if normalize_search_text(item.title) != normalized_title:
+        if normalize_metadata_match_text(item.title) != normalized_title:
             continue
-        item_artists = _normalized_artist_credit_parts(item.artist)
+        item_artists = await _artist_credit_match_values_cached(
+            state,
+            item.artist,
+            artist_values_cache,
+        )
         if not target_artists or _artist_value_sets_match(item_artists, target_artists):
             return item
     return None
@@ -2557,7 +2572,7 @@ async def _match_active_download_task_item(
     title: str,
     artist: str | None,
 ) -> TorrentRecordItem | None:
-    normalized_title = normalize_search_text(title)
+    normalized_title = normalize_metadata_match_text(title)
     if not normalized_title:
         return None
     compact_title = _compact_search_text(normalized_title)
@@ -2565,7 +2580,7 @@ async def _match_active_download_task_item(
         if not await _artist_matches(state, item.metadata_artist or item.artist, artist):
             continue
         for candidate in _download_task_item_titles(item):
-            candidate_title = normalize_search_text(candidate)
+            candidate_title = normalize_metadata_match_text(candidate)
             if not candidate_title:
                 continue
             if candidate_title == normalized_title:
@@ -2594,18 +2609,6 @@ def _playlist_track_can_start_download(track: PlaylistTrack) -> bool:
     if status in PLAYLIST_TRACK_ACTIVE_STATUSES | PLAYLIST_TRACK_SUCCESS_STATUSES:
         return False
     return status == "pending" or status in PLAYLIST_TRACK_RETRYABLE_STATUSES
-
-
-def _normalized_artist_credit_parts(value: str | None) -> set[str]:
-    parts: set[str] = set()
-    for artist in split_artist_credit(value):
-        normalized = normalize_search_text(artist)
-        compact = _compact_search_text(normalized)
-        if normalized:
-            parts.add(normalized)
-        if compact:
-            parts.add(compact)
-    return parts
 
 
 def _playlist_track_log_text(track: PlaylistTrack) -> str:
@@ -2763,7 +2766,7 @@ async def _check_and_download_playlist_track(
     state.add_log("playlist", f"Playlist track processing: {_playlist_track_log_text(track)}")
 
     library_tracks = await state.repository.list_music_library_tracks()
-    match = _match_library_track(track.title, track.artist, library_tracks)
+    match = await _match_library_track(state, track.title, track.artist, library_tracks)
     if match is not None:
         await state.repository.update_playlist_track(
             track.id,
@@ -3143,12 +3146,12 @@ async def _download_task_item_matches_playlist_track(
 ) -> bool:
     if not await _artist_matches(state, item.metadata_artist or item.artist, track.artist):
         return False
-    normalized_title = normalize_search_text(track.title)
+    normalized_title = normalize_metadata_match_text(track.title)
     if not normalized_title:
         return False
     compact_title = _compact_search_text(normalized_title)
     for candidate in _download_task_item_titles(item):
-        candidate_title = normalize_search_text(candidate)
+        candidate_title = normalize_metadata_match_text(candidate)
         if not candidate_title:
             continue
         if candidate_title == normalized_title:
@@ -4068,6 +4071,19 @@ async def _artist_matches(state: AppState, value: str | None, artist: str | None
     return _artist_value_sets_match(left_values, right_values)
 
 
+async def _artist_credit_match_values_cached(
+    state: AppState,
+    artist_credit: str | None,
+    cache: dict[str, set[str]] | None,
+) -> set[str]:
+    if cache is None:
+        return await _artist_credit_match_values(state, artist_credit)
+    key = artist_credit or ""
+    if key not in cache:
+        cache[key] = await _artist_credit_match_values(state, artist_credit)
+    return cache[key]
+
+
 async def _artist_credit_match_values(state: AppState, artist_credit: str | None) -> set[str]:
     values: set[str] = set()
     for artist in split_artist_credit(artist_credit):
@@ -4079,10 +4095,13 @@ async def _artist_credit_match_values(state: AppState, artist_credit: str | None
         for candidate in candidates:
             normalized = normalize_search_text(candidate)
             compact = _compact_search_text(normalized)
+            match_normalized = normalize_metadata_match_text(candidate)
             if normalized:
                 values.add(normalized)
             if compact:
                 values.add(compact)
+            if match_normalized:
+                values.add(match_normalized)
     return values
 
 
@@ -4091,10 +4110,13 @@ def _artist_credit_base_match_values(artist_credit: str | None) -> set[str]:
     for artist in split_artist_credit(artist_credit):
         normalized = normalize_search_text(artist)
         compact = _compact_search_text(normalized)
+        match_normalized = normalize_metadata_match_text(artist)
         if normalized:
             values.add(normalized)
         if compact:
             values.add(compact)
+        if match_normalized:
+            values.add(match_normalized)
     return values
 
 

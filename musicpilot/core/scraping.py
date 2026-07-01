@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -456,9 +457,10 @@ class LocalMusicScraper:
                     extra=metadata.extra,
                 )
 
-        duplicate = _find_duplicate_media(
+        duplicate = await _find_duplicate_media(
             _duplicate_metadata_candidates(source_metadata, match_metadata, metadata),
             (*library_tracks, *media_history),
+            artist_service=self.artist_service,
         )
         overwrite_duplicate = False
         current_size = await asyncio.to_thread(_file_size, source_file)
@@ -1131,24 +1133,31 @@ def _duplicate_metadata_candidates(
     return tuple(candidates)
 
 
-def _find_duplicate_media(
+async def _find_duplicate_media(
     candidates: tuple[TrackMetadata, ...],
     tracks: tuple[LibraryTrackSnapshot, ...],
+    *,
+    artist_service: ArtistService | None = None,
 ) -> LibraryTrackSnapshot | None:
     best: LibraryTrackSnapshot | None = None
     best_score = 0
     for metadata in candidates:
-        title = _normalize_match_text(metadata.title)
-        artist = _normalize_match_text(metadata.artist)
-        album = _normalize_match_text(metadata.album)
+        title = normalize_metadata_match_text(metadata.title)
+        artist = normalize_metadata_match_text(metadata.artist)
+        album = normalize_metadata_match_text(metadata.album)
         if not title:
             continue
         for track in tracks:
-            if _normalize_match_text(track.title) != title:
+            if normalize_metadata_match_text(track.title) != title:
                 continue
-            track_artist = _normalize_match_text(track.artist)
-            track_album = _normalize_match_text(track.album)
-            artist_matches = _artist_credit_matches(metadata.artist, track.artist)
+            track_artist = normalize_metadata_match_text(track.artist)
+            track_album = normalize_metadata_match_text(track.album)
+            artist_score = await _match_artist_with_aliases(
+                metadata.artist,
+                track.artist,
+                artist_service=artist_service,
+            )
+            artist_matches = artist_score > 0
             if artist and track_artist and not artist_matches:
                 continue
             score = 1
@@ -1160,16 +1169,6 @@ def _find_duplicate_media(
                 best = track
                 best_score = score
     return best
-
-
-def _artist_credit_matches(left: str | None, right: str | None) -> bool:
-    left_values = {_normalize_match_text(item) for item in split_artist_credit(left)}
-    right_values = {_normalize_match_text(item) for item in split_artist_credit(right)}
-    left_values.discard("")
-    right_values.discard("")
-    if not left_values or not right_values:
-        return False
-    return bool(left_values & right_values)
 
 
 def _library_track_path(track: LibraryTrackSnapshot) -> Path | None:
@@ -1365,7 +1364,7 @@ def _parse_artist_title(value: str | None) -> tuple[str, str] | None:
 
 
 def _metadata_search_title(title: str | None) -> str | None:
-    text = _strip_track_prefix(str(title or "").strip())
+    text = _strip_track_prefix(unicodedata.normalize("NFKC", str(title or "").strip()))
     if not text:
         return None
     if not _CJK_RE.search(text):
@@ -1640,16 +1639,18 @@ def _split_artist_names(value: str) -> list[str]:
     return split_artist_credit(value)
 
 
-def _normalize_match_text(value: str | None) -> str:
+def normalize_metadata_match_text(value: str | None) -> str:
     if not value:
         return ""
-    # Remove content in brackets/parens (version info, quality tags)
-    text = re.sub(r"\[[^\]]+\]|\([^\)]*\)", " ", value)
-    # Traditional \u2192 Simplified
-    text = _t2s.convert(text)
-    # Keep only alphanumeric and CJK
+    text = unicodedata.normalize("NFKC", value)
+    text = re.sub(r"\[[^\]]+\]|\([^\)]*\)", " ", text)
+    text = _t2s.convert(text).translate(_SEARCH_TITLE_TRANSLATION)
     text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", text)
     return text.casefold()
+
+
+def _normalize_match_text(value: str | None) -> str:
+    return normalize_metadata_match_text(value)
 
 
 def _merge_metadata(existing: TrackMetadata, scraped: TrackMetadata) -> TrackMetadata:
