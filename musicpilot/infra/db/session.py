@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
+import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import event
 from sqlalchemy.engine import make_url
@@ -15,16 +19,30 @@ from sqlalchemy.ext.asyncio import (
 
 from musicpilot.infra.db.models import Base
 
+logger = logging.getLogger(__name__)
+SQLITE_BUSY_TIMEOUT_SECONDS = float(os.getenv("MP_SQLITE_BUSY_TIMEOUT_SECONDS", "60"))
+SLOW_SQL_OPERATION_SECONDS = float(os.getenv("MP_SLOW_SQL_OPERATION_SECONDS", "0.5"))
+
 
 class Database:
     def __init__(self, database_url: str) -> None:
         self.database_url = database_url
         if database_url.startswith("sqlite"):
             _ensure_sqlite_parent_dir(database_url)
-        self.engine = create_async_engine(database_url, pool_pre_ping=True)
+        connect_args = (
+            {"timeout": SQLITE_BUSY_TIMEOUT_SECONDS}
+            if database_url.startswith("sqlite")
+            else {}
+        )
+        self.engine = create_async_engine(
+            database_url,
+            pool_pre_ping=True,
+            connect_args=connect_args,
+        )
         self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
         if database_url.startswith("sqlite"):
             _install_sqlite_pragmas(self.engine)
+            _install_sqlite_timing(engine=self.engine)
 
     async def create_all(self) -> None:
         async with self.engine.begin() as conn:
@@ -92,8 +110,49 @@ def _install_sqlite_pragmas(engine: AsyncEngine) -> None:
         del connection_record
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute(f"PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}")
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
+
+
+def _install_sqlite_timing(*, engine: AsyncEngine) -> None:
+    @event.listens_for(engine.sync_engine, "before_cursor_execute")
+    def before_cursor_execute(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: Any,
+        executemany: bool,
+    ) -> None:
+        del conn, cursor, statement, parameters, executemany
+        context._musicpilot_query_started_at = time.perf_counter()
+
+    @event.listens_for(engine.sync_engine, "after_cursor_execute")
+    def after_cursor_execute(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: Any,
+        executemany: bool,
+    ) -> None:
+        del conn, cursor, parameters, executemany
+        started_at = getattr(context, "_musicpilot_query_started_at", None)
+        if started_at is None:
+            return
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        if elapsed_ms < SLOW_SQL_OPERATION_SECONDS * 1000:
+            return
+        logger.warning(
+            "Slow SQL operation: elapsed_ms=%.1f statement=%r",
+            elapsed_ms,
+            _compact_sql(statement),
+        )
+
+
+def _compact_sql(statement: str) -> str:
+    return " ".join(statement.split())
 
 
 def _ensure_sqlite_parent_dir(database_url: str) -> None:

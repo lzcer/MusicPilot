@@ -607,8 +607,23 @@ class SqlAlchemyMediaRepository:
             return list(result.scalars().all())
 
     async def get_playlist(self, playlist_id: int) -> Playlist | None:
+        operation_started_at = time.perf_counter()
         async with self.database.session() as session:
-            return await session.get(Playlist, playlist_id)
+            get_started_at = time.perf_counter()
+            playlist = await session.get(Playlist, playlist_id)
+            _log_slow_db_operation(
+                "get_playlist.get",
+                get_started_at,
+                playlist_id=playlist_id,
+                found=playlist is not None,
+            )
+            _log_slow_db_operation(
+                "get_playlist.total",
+                operation_started_at,
+                playlist_id=playlist_id,
+                found=playlist is not None,
+            )
+            return playlist
 
     async def delete_playlist(self, playlist_id: int) -> bool:
         async with self.database.session() as session:
@@ -814,7 +829,14 @@ class SqlAlchemyMediaRepository:
     async def update_playlist_track(self, track_id: int, **changes: Any) -> PlaylistTrack | None:
         operation_started_at = time.perf_counter()
         async with self.database.session() as session:
+            get_started_at = time.perf_counter()
             row = await session.get(PlaylistTrack, track_id)
+            _log_slow_db_operation(
+                "update_playlist_track.get",
+                get_started_at,
+                track_id=track_id,
+                fields=tuple(changes.keys()),
+            )
             if row is None:
                 return None
             for key, value in changes.items():
@@ -828,7 +850,15 @@ class SqlAlchemyMediaRepository:
                 fields=tuple(changes.keys()),
                 status=changes.get("download_status"),
             )
+            refresh_started_at = time.perf_counter()
             await session.refresh(row)
+            _log_slow_db_operation(
+                "update_playlist_track.refresh",
+                refresh_started_at,
+                track_id=track_id,
+                fields=tuple(changes.keys()),
+                status=changes.get("download_status"),
+            )
             _log_slow_db_operation(
                 "update_playlist_track.total",
                 operation_started_at,

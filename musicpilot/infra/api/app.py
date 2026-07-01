@@ -2512,11 +2512,18 @@ async def _refresh_playlist_library_matches(
             artist_values_cache=artist_values_cache,
         )
         exists = match is not None
+        matched_library_track_id = match.id if match is not None else None
         status = "existing" if exists else track.download_status
+        if (
+            track.exists_in_library == exists
+            and track.matched_library_track_id == matched_library_track_id
+            and track.download_status == status
+        ):
+            continue
         await state.repository.update_playlist_track(
             track.id,
             exists_in_library=exists,
-            matched_library_track_id=match.id if match is not None else None,
+            matched_library_track_id=matched_library_track_id,
             download_status=status,
             last_checked_at=checked_at,
         )
