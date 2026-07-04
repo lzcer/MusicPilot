@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      network: ${MP_DOCKER_BUILD_NETWORK:-host}
       args:
         UV_DEFAULT_INDEX: ${UV_DEFAULT_INDEX:-https://pypi.org/simple}
         UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:latest}

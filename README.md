@@ -59,6 +59,8 @@ MP_HOST_DATA_PATH=/volume1/docker/musicpilot/data
 MP_HOST_CONFIG_PATH=/volume1/docker/musicpilot/config
 MP_HOST_MUSIC_PATH=/volume1/music
 MP_HOST_DOWNLOADS_PATH=/volume1/downloads
+# Use host networking during image build when Docker bridge networking cannot reach package indexes.
+MP_DOCKER_BUILD_NETWORK=host
 # Optional: use a nearby PyPI mirror if NAS builds cannot reach pypi.org reliably.
 UV_DEFAULT_INDEX=https://pypi.org/simple
 ```
@@ -94,7 +96,7 @@ git pull
 docker compose up -d --build
 ```
 
-The Dockerfile installs third-party Python dependencies before copying the application source, so ordinary backend code changes should reuse the dependency layer. If your NAS has unstable access to PyPI, set `UV_DEFAULT_INDEX` in `.env` to a stable mirror URL and rebuild.
+The Dockerfile installs third-party Python dependencies before copying the application source, so ordinary backend code changes should reuse the dependency layer. If Docker bridge networking cannot reach package indexes but the NAS host can, keep `MP_DOCKER_BUILD_NETWORK=host`. If your NAS has unstable access to PyPI, set `UV_DEFAULT_INDEX` in `.env` to a stable mirror URL and rebuild.
 
 ## 4. Docker Volumes And Paths
 
