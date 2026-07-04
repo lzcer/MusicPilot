@@ -80,6 +80,7 @@ class Database:
                 "indexer_sites",
                 {
                     "enabled": "BOOLEAN NOT NULL DEFAULT 1",
+                    "use_proxy": "BOOLEAN NOT NULL DEFAULT 0",
                 },
             )
             await _add_sqlite_columns(
