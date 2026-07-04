@@ -297,6 +297,20 @@ class ArtistService:
                         if alias != existing_artist.name
                     )
                     await self._repo.add_aliases(existing_artist.id, aliases)
+                    if i > 0:
+                        await asyncio.sleep(1)
+                    search_name = max(names, key=len)
+                    mb_aliases = await _fetch_musicbrainz_aliases(
+                        client, search_name, user_agent, seen_mb_artists,
+                    )
+                    await self._repo.add_aliases(
+                        existing_artist.id,
+                        tuple(
+                            (mb_alias, "musicbrainz")
+                            for mb_alias in mb_aliases
+                            if mb_alias != existing_artist.name
+                        ),
+                    )
                     skipped += 1
                     continue
 
@@ -407,21 +421,31 @@ async def _fetch_musicbrainz_aliases(
 
     headers = {"User-Agent": user_agent}
     search_url = "https://musicbrainz.org/ws/2/artist/"
-    params = {
-        "query": f'artist:"{name}"',
-        "limit": "3",
-        "fmt": "json",
-    }
+    queries = (
+        f'artist:"{name}"',
+        f'alias:"{name}"',
+        name,
+    )
+    artists: list[dict[str, Any]] = []
 
-    try:
-        response = await client.get(search_url, params=params, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("MusicBrainz search failed for %r: %s", name, exc)
-        return set()
+    for query in queries:
+        params = {
+            "query": query,
+            "limit": "5",
+            "fmt": "json",
+        }
+        try:
+            response = await client.get(search_url, params=params, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("MusicBrainz search failed for %r using %r: %s", name, query, exc)
+            continue
 
-    artists = data.get("artists") or []
+        artists = data.get("artists") or []
+        if artists:
+            break
+
     if not artists:
         logger.debug("MusicBrainz: no artist found for %r", name)
         return set()
