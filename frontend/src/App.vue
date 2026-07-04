@@ -423,6 +423,7 @@ const downloads = ref<DownloadTask[]>([])
 const downloadTaskItems = ref<DownloadTaskItem[]>([])
 const selectedDownloadTask = ref<DownloadTask | null>(null)
 const selectedDownloadIds = ref<number[]>([])
+const downloadActiveOnly = ref(true)
 const mediaFiles = ref<MediaFile[]>([])
 const mediaQuery = ref('')
 const mediaPage = ref(1)
@@ -751,8 +752,18 @@ const fileBreadcrumbs = computed(() => {
   return items
 })
 
+const filteredDownloads = computed(() =>
+  downloadActiveOnly.value
+    ? downloads.value.filter((item) => item.state !== 'library_refreshed')
+    : downloads.value
+)
+
+const downloadEmptyText = computed(() =>
+  downloadActiveOnly.value ? '暂无活跃下载任务' : '暂无下载任务'
+)
+
 const downloadableTaskIds = computed(() =>
-  downloads.value.map((item) => item.id).filter((id): id is number => typeof id === 'number')
+  filteredDownloads.value.map((item) => item.id).filter((id): id is number => typeof id === 'number')
 )
 
 const allDownloadsSelected = computed({
@@ -1163,6 +1174,10 @@ async function addDownload(result: SearchResult) {
 
 async function loadDownloads() {
   downloads.value = await api<DownloadTask[]>('/api/downloads')
+  syncSelectedDownloadIds()
+}
+
+function syncSelectedDownloadIds() {
   const existingIds = new Set(downloadableTaskIds.value)
   selectedDownloadIds.value = selectedDownloadIds.value.filter((id) => existingIds.has(id))
 }
@@ -2063,6 +2078,10 @@ watch(activePage, () => {
   syncPagePolling()
 })
 
+watch(downloadableTaskIds, () => {
+  syncSelectedDownloadIds()
+})
+
 function openNewSiteDialog() {
   editingSiteId.value = null
   siteForm.value = {
@@ -2795,7 +2814,8 @@ onUnmounted(() => {
           <div class="brand-subtitle">音乐库自动化</div>
         </div>
         <v-list nav density="compact" class="nav-list">
-          <template v-for="group in navGroups" :key="group.title">
+          <template v-for="(group, index) in navGroups" :key="group.title">
+            <v-divider v-if="index > 0" class="nav-group-divider" />
             <v-list-subheader class="nav-group-title">{{ group.title }}</v-list-subheader>
             <v-list-item
               v-for="item in group.items"
@@ -2946,7 +2966,7 @@ onUnmounted(() => {
           </section>
 
           <section v-if="activePage === 'downloads'" class="page-stack">
-            <div class="toolbar-row">
+            <div class="toolbar-row download-toolbar">
               <v-btn prepend-icon="mdi-refresh" variant="tonal" @click="loadDownloads">刷新</v-btn>
               <v-btn
                 prepend-icon="mdi-delete"
@@ -2957,6 +2977,15 @@ onUnmounted(() => {
               >
                 删除
               </v-btn>
+              <v-switch
+                v-model="downloadActiveOnly"
+                class="download-active-switch"
+                color="primary"
+                density="compact"
+                hide-details
+                inset
+                label="仅看活跃"
+              />
             </div>
             <v-card>
               <v-table>
@@ -2978,8 +3007,8 @@ onUnmounted(() => {
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-if="!downloads.length"><td colspan="6" class="empty-cell">暂无下载任务</td></tr>
-                  <tr v-for="row in downloads" :key="row.id || row.torrent_hash || row.name">
+                  <tr v-if="!filteredDownloads.length"><td colspan="6" class="empty-cell">{{ downloadEmptyText }}</td></tr>
+                  <tr v-for="row in filteredDownloads" :key="row.id || row.torrent_hash || row.name">
                     <td class="select-cell">
                       <v-checkbox
                         v-if="typeof row.id === 'number'"
@@ -4822,6 +4851,10 @@ onUnmounted(() => {
   padding: 4px 12px 16px;
 }
 
+.nav-group-divider {
+  margin: 10px 8px 8px;
+}
+
 .nav-group-title {
   font-size: 12px;
   font-weight: 700;
@@ -4829,6 +4862,18 @@ onUnmounted(() => {
   line-height: 28px;
   min-height: 28px;
   padding-inline-start: 12px !important;
+}
+
+.download-toolbar {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.download-active-switch {
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .delete-action-buttons {
