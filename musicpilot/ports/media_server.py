@@ -23,6 +23,7 @@ class MediaServerTrack:
 class MediaServerPlaylistSyncResult:
     playlist_id: str | None
     synced_count: int
+    mode: str = "updated"
 
 
 class MediaServerClient(Protocol):

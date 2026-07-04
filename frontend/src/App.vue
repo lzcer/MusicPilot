@@ -81,6 +81,7 @@ type DownloadTaskItem = {
   torrent_record_id: number
   file_name: string
   file_path: string
+  size_bytes?: number | null
   artist?: string | null
   parsed_title?: string | null
   metadata_title?: string | null
@@ -102,6 +103,7 @@ type MediaFile = {
   torrent_hash?: string | null
   source_path: string
   library_path?: string | null
+  operation_type?: string
   status: string
   operation_time: string
   remark?: string | null
@@ -308,6 +310,7 @@ type PlaylistLibrarySyncResponse = {
   playlist_id: number
   library_playlist_id?: string | null
   synced_count: number
+  mode?: string
 }
 
 type PageResponse<T> = {
@@ -436,6 +439,7 @@ const mediaTableHeaders = [
   { title: '艺人', key: 'artist', sortable: false, width: 150 },
   { title: '专辑', key: 'album', sortable: false, width: 320 },
   { title: '操作时间', key: 'operation_time', sortable: false, width: 180 },
+  { title: '类型', key: 'operation_type', sortable: false, width: 90 },
   { title: '状态', key: 'status', sortable: false, width: 90 },
   { title: '文件路径', key: 'path', sortable: false, width: 520 },
   { title: '备注', key: 'remark', sortable: false, width: 180 },
@@ -613,7 +617,7 @@ const systemForm = ref<SystemSettings>({
     duplicate_handling: 'ignore'
   },
   search: {
-    exclude_keywords: ''
+    exclude_keywords: '整轨|整軌|WAV|wav'
   }
 })
 
@@ -1911,7 +1915,8 @@ async function syncPlaylistToLibrary(playlist: Playlist) {
       `/api/playlists/${playlist.id}/sync-to-library`,
       { method: 'POST' }
     )
-    notify(`已同步到音乐库歌单：${response.synced_count} 首`)
+    const actionText = response.mode === 'created' ? '创建' : '更新'
+    notify(`已${actionText}音乐库歌单：${response.synced_count} 首`)
   } catch (error) {
     notify(error instanceof Error ? error.message : '同步到音乐库失败', 'error')
   } finally {
@@ -2609,6 +2614,14 @@ function mediaStatusText(status: string) {
   return '成功'
 }
 
+function mediaOperationTypeText(type: string | undefined) {
+  return {
+    copy: '复制',
+    mapped: '映射',
+    source: '源目录'
+  }[type || 'mapped'] ?? (type || '映射')
+}
+
 const mediaStatusFilterOptions = [
   { title: '全部', value: '' },
   { title: '成功', value: 'success' },
@@ -3031,6 +3044,11 @@ onUnmounted(() => {
                 </template>
                 <template #item.operation_time="{ item }">
                   {{ formatTime(mediaTableRow(item).operation_time) }}
+                </template>
+                <template #item.operation_type="{ item }">
+                  <v-chip size="small" variant="tonal">
+                    {{ mediaOperationTypeText(mediaTableRow(item).operation_type) }}
+                  </v-chip>
                 </template>
                 <template #item.status="{ item }">
                   <v-chip
@@ -4477,6 +4495,7 @@ onUnmounted(() => {
             <thead>
               <tr>
                 <th class="download-item-file-col">文件名</th>
+                <th class="download-item-size-col">大小</th>
                 <th class="download-item-title-col">解析标题</th>
                 <th class="download-item-artist-col">任务艺术家</th>
                 <th class="download-item-title-col">匹配标题</th>
@@ -4488,10 +4507,11 @@ onUnmounted(() => {
             </thead>
             <tbody>
               <tr v-if="!downloadTaskItems.length">
-                <td colspan="8" class="empty-cell">暂无明细</td>
+                <td colspan="9" class="empty-cell">暂无明细</td>
               </tr>
               <tr v-for="item in downloadTaskItems" :key="item.id">
                 <td class="truncate-cell" :title="item.file_path">{{ item.file_name }}</td>
+                <td>{{ formatSize(item.size_bytes) }}</td>
                 <td class="truncate-cell" :title="item.parsed_title || '-'">{{ item.parsed_title || '-' }}</td>
                 <td class="truncate-cell" :title="item.artist || '-'">{{ item.artist || '-' }}</td>
                 <td class="truncate-cell" :title="item.metadata_title || '-'">{{ item.metadata_title || '-' }}</td>
@@ -4865,6 +4885,10 @@ onUnmounted(() => {
 
 .download-item-file-col {
   width: 260px;
+}
+
+.download-item-size-col {
+  width: 96px;
 }
 
 .download-item-title-col {

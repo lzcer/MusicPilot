@@ -89,6 +89,7 @@ class Database:
                 {
                     "status": "VARCHAR(64) NOT NULL DEFAULT 'success'",
                     "error_message": "TEXT",
+                    "operation_type": "VARCHAR(32) NOT NULL DEFAULT 'mapped'",
                 },
             )
             await _ensure_media_files_library_path_nullable(conn)
@@ -198,6 +199,7 @@ async def _ensure_media_files_library_path_nullable(conn: object) -> None:
             torrent_hash VARCHAR(64),
             source_path TEXT NOT NULL,
             library_path TEXT,
+            operation_type VARCHAR(32) NOT NULL DEFAULT 'mapped',
             title VARCHAR(512),
             artist VARCHAR(512),
             album VARCHAR(512),
@@ -220,6 +222,7 @@ async def _ensure_media_files_library_path_nullable(conn: object) -> None:
             torrent_hash,
             source_path,
             library_path,
+            operation_type,
             title,
             artist,
             album,
@@ -236,6 +239,7 @@ async def _ensure_media_files_library_path_nullable(conn: object) -> None:
             torrent_hash,
             source_path,
             CASE WHEN status = 'success' THEN library_path ELSE NULL END,
+            'mapped',
             title,
             artist,
             album,

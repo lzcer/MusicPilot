@@ -88,6 +88,7 @@ class NavidromeMediaServerClient:
         return MediaServerPlaylistSyncResult(
             playlist_id=playlist_id,
             synced_count=len(song_ids),
+            mode="updated" if existing_playlist_id else "created",
         )
 
     async def _find_playlist_id(

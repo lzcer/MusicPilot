@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from musicpilot.core.defaults import DEFAULT_SEARCH_EXCLUDE_KEYWORDS
+
 
 class HealthResponse(BaseModel):
     status: str = "ok"
@@ -122,6 +124,7 @@ class DownloadTaskItemResponse(BaseModel):
     torrent_record_id: int
     file_name: str
     file_path: str
+    size_bytes: int | None = None
     artist: str | None = None
     parsed_title: str | None = None
     metadata_title: str | None = None
@@ -449,6 +452,7 @@ class PlaylistLibrarySyncResponse(BaseModel):
     playlist_id: int
     library_playlist_id: str | None = None
     synced_count: int
+    mode: str = "updated"
 
 
 class ProxySettings(BaseModel):
@@ -472,7 +476,7 @@ class ScrapingSettings(BaseModel):
 
 
 class SearchSettings(BaseModel):
-    exclude_keywords: str = ""
+    exclude_keywords: str = DEFAULT_SEARCH_EXCLUDE_KEYWORDS
 
 
 class SystemSettingsRequest(BaseModel):
@@ -519,6 +523,7 @@ class MediaFileResponse(BaseModel):
     torrent_hash: str | None
     source_path: str
     library_path: str | None = None
+    operation_type: str = "mapped"
     status: str = "success"
     operation_time: datetime
     remark: str | None = None

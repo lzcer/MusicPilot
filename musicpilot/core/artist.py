@@ -23,6 +23,12 @@ logger = logging.getLogger(__name__)
 _t2s = OpenCC("t2s")  # Traditional -> Simplified
 _s2t = OpenCC("s2t")  # Simplified -> Traditional
 
+_KNOWN_ARTIST_ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("JJ Lin", "林俊杰", "林俊傑", "Lin Jun Jie"),
+    ("Aska Yang", "杨宗纬", "楊宗緯"),
+    ("Hu Xia", "胡夏"),
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ArtistInfo:
@@ -88,6 +94,29 @@ def split_artist_credit(value: str | None) -> list[str]:
     return names
 
 
+def _known_artist_aliases(name: str | None) -> tuple[str, ...]:
+    normalized = normalize_artist_name(name)
+    if not normalized:
+        return ()
+    for group in _KNOWN_ARTIST_ALIAS_GROUPS:
+        if any(normalize_artist_name(alias) == normalized for alias in group):
+            return group
+    return ()
+
+
+def _unique_artist_names(values: tuple[str, ...]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        name = value.strip()
+        normalized = normalize_artist_name(name)
+        if not name or not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(name)
+    return result
+
+
 class ArtistService:
     """Service for managing artist names, aliases, and canonical names."""
 
@@ -111,15 +140,17 @@ class ArtistService:
         # Direct alias lookup
         artist_id = await self._repo.find_artist_id_by_alias(name)
         if artist_id is not None:
-            return await self._repo.list_artist_aliases(artist_id)
+            aliases = await self._repo.list_artist_aliases(artist_id)
+            return await self._aliases_with_known_names(artist_id, name, aliases)
 
         # Try normalized lookup
         normalized = normalize_artist_name(name)
         artist = await self._repo.find_artist_by_normalized(normalized)
         if artist is not None:
-            return await self._repo.list_artist_aliases(artist.id)
+            aliases = await self._repo.list_artist_aliases(artist.id)
+            return await self._aliases_with_known_names(artist.id, name, aliases)
 
-        return [name]
+        return _unique_artist_names((name, *_known_artist_aliases(name)))
 
     async def get_canonical_name(self, name: str | None) -> str | None:
         """Resolve an artist name to its canonical (authoritative) name.
@@ -193,6 +224,10 @@ class ArtistService:
         # Check existing
         artist_id = await self._repo.find_artist_id_by_alias(name)
         if artist_id is not None:
+            await self._repo.add_aliases(
+                artist_id,
+                tuple((alias, "builtin") for alias in _known_artist_aliases(name)),
+            )
             return await self._get_artist_info(artist_id)
 
         normalized = normalize_artist_name(name)
@@ -200,6 +235,10 @@ class ArtistService:
         if artist is not None:
             # Add this name as an alias
             await self._repo.add_alias(artist.id, name, source)
+            await self._repo.add_aliases(
+                artist.id,
+                tuple((alias, "builtin") for alias in _known_artist_aliases(name)),
+            )
             return await self._get_artist_info(artist.id)
 
         # Create new artist
@@ -210,6 +249,10 @@ class ArtistService:
         )
         # Add itself as a default alias
         await self._repo.add_alias(artist.id, name, "primary")
+        await self._repo.add_aliases(
+            artist.id,
+            tuple((alias, "builtin") for alias in _known_artist_aliases(name)),
+        )
 
         return ArtistInfo(
             id=artist.id,
@@ -303,6 +346,7 @@ class ArtistService:
                     mb_aliases = await _fetch_musicbrainz_aliases(
                         client, search_name, user_agent, seen_mb_artists,
                     )
+                    mb_aliases.update(_known_artist_aliases(search_name))
                     await self._repo.add_aliases(
                         existing_artist.id,
                         tuple(
@@ -321,6 +365,7 @@ class ArtistService:
                 mb_aliases = await _fetch_musicbrainz_aliases(
                     client, search_name, user_agent, seen_mb_artists,
                 )
+                mb_aliases.update(_known_artist_aliases(search_name))
 
                 # Pick canonical name (longest is usually most descriptive)
                 canonical = max(names, key=len)
@@ -356,6 +401,7 @@ class ArtistService:
         result = []
         for artist in artists:
             aliases = await self._repo.list_artist_aliases(artist.id)
+            aliases = await self._aliases_with_known_names(artist.id, artist.name, aliases)
             result.append(
                 ArtistInfo(
                     id=artist.id,
@@ -400,6 +446,20 @@ class ArtistService:
             normalized_name=artist.normalized_name,
             aliases=tuple(a for a in aliases if a != artist.name),
         )
+
+    async def _aliases_with_known_names(
+        self,
+        artist_id: int,
+        name: str,
+        aliases: list[str],
+    ) -> list[str]:
+        known_aliases = _known_artist_aliases(name)
+        if known_aliases:
+            await self._repo.add_aliases(
+                artist_id,
+                tuple((alias, "builtin") for alias in known_aliases),
+            )
+        return _unique_artist_names((*aliases, *known_aliases))
 
 
 async def _fetch_musicbrainz_aliases(

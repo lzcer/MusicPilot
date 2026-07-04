@@ -12,6 +12,7 @@ from uuid import uuid4
 from sqlalchemy import String, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
+from musicpilot.core.defaults import DEFAULT_SEARCH_EXCLUDE_KEYWORDS
 from musicpilot.infra.db.models import (
     Artist,
     ArtistAlias,
@@ -33,6 +34,11 @@ from musicpilot.infra.db.models import (
 )
 from musicpilot.infra.db.session import Database
 from musicpilot.ports.metadata import TrackMetadata
+
+DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
+    "proxy": {},
+    "search": {"exclude_keywords": DEFAULT_SEARCH_EXCLUDE_KEYWORDS},
+}
 
 logger = logging.getLogger(__name__)
 SLOW_DB_OPERATION_SECONDS = float(os.getenv("MP_SLOW_DB_OPERATION_SECONDS", "0.5"))
@@ -98,6 +104,7 @@ class SqlAlchemyMediaRepository:
         torrent_hash: str | None,
         source_path: Path,
         library_path: Path | None,
+        operation_type: str = "mapped",
         metadata: TrackMetadata,
         status: str,
         error_message: str | None = None,
@@ -127,6 +134,7 @@ class SqlAlchemyMediaRepository:
             media_file.torrent_hash = torrent_hash
             media_file.source_path = str(source_path)
             media_file.library_path = result_path
+            media_file.operation_type = operation_type
             media_file.title = metadata.title
             media_file.artist = metadata.artist
             media_file.album = metadata.album
@@ -343,7 +351,7 @@ class SqlAlchemyMediaRepository:
     async def get_system_settings(self) -> dict[str, Any]:
         async with self.database.session() as session:
             row = await session.get(SystemSetting, "runtime")
-            return row.value if row is not None else {"proxy": {}}
+            return _merge_system_settings_defaults(row.value if row is not None else {})
 
     async def update_system_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         async with self.database.session() as session:
@@ -356,7 +364,7 @@ class SqlAlchemyMediaRepository:
             row.value = current
             await session.commit()
             await session.refresh(row)
-            return row.value
+            return _merge_system_settings_defaults(row.value)
 
     async def create_system_task(
         self,
@@ -1312,6 +1320,22 @@ class SqlAlchemyMediaRepository:
             )
             return row
 
+    async def reset_waiting_playlist_tracks(self) -> int:
+        now = datetime.now(UTC)
+        async with self.database.session() as session:
+            result = await session.execute(
+                update(PlaylistTrack)
+                .where(PlaylistTrack.download_status == "waiting")
+                .values(
+                    download_status="pending",
+                    torrent_record_id=None,
+                    last_error=None,
+                    updated_at=now,
+                )
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
+
     async def list_playlist_tracks_by_torrent_record(
         self,
         task_id: int,
@@ -1356,7 +1380,7 @@ class SqlAlchemyMediaRepository:
         for track in tracks:
             if track.exists_in_library or track.download_status == "existing":
                 counts["existing_count"] += 1
-            if track.download_status in {"waiting", "queue"}:
+            if track.download_status == "queue":
                 counts["waiting_count"] += 1
             if track.download_status in {
                 "submitted",
@@ -1842,6 +1866,25 @@ def _assign_config_fields(row: object, payload: dict[str, Any], fields: tuple[st
     for field in fields:
         if field in payload:
             setattr(row, field, payload[field])
+
+
+def _merge_system_settings_defaults(value: object) -> dict[str, Any]:
+    settings = dict(value) if isinstance(value, dict) else {}
+    return _merge_dict_defaults(settings, DEFAULT_SYSTEM_SETTINGS)
+
+
+def _merge_dict_defaults(value: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(value)
+    for key, default_value in defaults.items():
+        current = merged.get(key)
+        if isinstance(default_value, dict):
+            merged[key] = _merge_dict_defaults(
+                current if isinstance(current, dict) else {},
+                default_value,
+            )
+        elif key not in merged:
+            merged[key] = default_value
+    return merged
 
 
 def _optional_string(value: object) -> str | None:

@@ -199,7 +199,6 @@ PLAYLIST_TRACK_RETRYABLE_STATUSES = {
     "source_directory_not_found",
 }
 PLAYLIST_TRACK_ACTIVE_STATUSES = {
-    "waiting",
     "queue",
     "searching",
     "submitted",
@@ -800,6 +799,12 @@ def create_app() -> FastAPI:
         await state.database.create_all()
         await state.database.migrate_phase_one_schema()
         await state.migrate_legacy_runtime_config()
+        migrated_waiting_tracks = await state.repository.reset_waiting_playlist_tracks()
+        if migrated_waiting_tracks:
+            state.add_log(
+                "playlist",
+                f"Reset legacy waiting playlist tracks to pending: count={migrated_waiting_tracks}",
+            )
         # Auto-build artist library from existing media files if empty (background,
         # so startup does not block on MusicBrainz API calls)
         artists = await state.repository.list_all_artists()
@@ -1781,7 +1786,7 @@ def create_app() -> FastAPI:
         if playlist is None:
             raise HTTPException(status_code=404, detail="Playlist not found.")
         try:
-            library_playlist_id, synced_count = await _sync_playlist_to_media_server(
+            library_playlist_id, synced_count, mode = await _sync_playlist_to_media_server(
                 state,
                 playlist,
             )
@@ -1794,6 +1799,7 @@ def create_app() -> FastAPI:
             playlist_id=playlist.id,
             library_playlist_id=library_playlist_id,
             synced_count=synced_count,
+            mode=mode,
         )
 
     @app.post("/api/playlists/{playlist_id}/download", response_model=PlaylistDownloadResponse)
@@ -2466,6 +2472,7 @@ def _media_file_response(row: MediaFile) -> MediaFileResponse:
         torrent_hash=row.torrent_hash,
         source_path=row.source_path,
         library_path=row.library_path,
+        operation_type=row.operation_type,
         status=row.status,
         operation_time=row.updated_at,
         remark=row.error_message,
@@ -2680,14 +2687,19 @@ async def _refresh_playlist_library_matches(
 
 
 async def _restore_playlist_download_tasks(state: AppState) -> None:
-    restored = 0
+    active = 0
     for playlist in await state.repository.list_playlists():
         if playlist.status != "downloading":
             continue
-        await _download_playlist_tracks(state, playlist.id)
-        restored += 1
-    if restored:
-        state.add_log("playlist", f"Restored {restored} playlist download queue(s).")
+        tracks = await state.repository.list_playlist_tracks(playlist.id)
+        if any(track.download_status in PLAYLIST_TRACK_ACTIVE_STATUSES for track in tracks):
+            active += 1
+        await _update_playlist_download_completion(state, playlist.id)
+    if active:
+        state.add_log(
+            "playlist",
+            f"Restored playlist download state: active={active}",
+        )
 
 
 async def _match_library_track(
@@ -2801,6 +2813,7 @@ async def _download_playlist_tracks(state: AppState, playlist_id: int) -> None:
             "playlist",
             f"Playlist tracks checked: playlist_id={playlist_id}, total={len(tracks)}",
         )
+        track_ids_to_enqueue: list[int] = []
         for track in tracks:
             if track.exists_in_library:
                 await state.repository.update_playlist_track(
@@ -2812,23 +2825,16 @@ async def _download_playlist_tracks(state: AppState, playlist_id: int) -> None:
                     f"{_playlist_track_log_text(track)}",
                 )
             elif _playlist_track_can_start_download(track):
-                await state.repository.update_playlist_track(
-                    track.id,
-                    download_status="waiting",
-                    last_download_attempt_at=datetime.now(UTC),
-                    last_error=None,
-                )
+                track_ids_to_enqueue.append(track.id)
 
-        waiting_tracks = await state.repository.list_playlist_tracks(playlist_id)
-        waiting_count = sum(1 for track in waiting_tracks if track.download_status == "waiting")
         state.add_log(
             "playlist",
-            f"Playlist tracks enqueueing: playlist_id={playlist_id}, waiting={waiting_count}",
+            f"Playlist tracks enqueueing: playlist_id={playlist_id}, "
+            f"count={len(track_ids_to_enqueue)}",
         )
         jobs = [
-            _enqueue_playlist_track_download(state, playlist_id, track.id)
-            for track in waiting_tracks
-            if track.download_status == "waiting"
+            _enqueue_playlist_track_download(state, playlist_id, track_id)
+            for track_id in track_ids_to_enqueue
         ]
         if jobs:
             await asyncio.gather(*jobs)
@@ -3135,7 +3141,9 @@ async def _playlist_media_candidates(
         f"Playlist metadata candidates: track={_playlist_track_log_text(track)}, "
         f"aggregated={len(aggregated)}, artist_matched={len(matched)}",
     )
-    return (matched or aggregated or [fallback])[:10]
+    if track.artist:
+        return (matched or [fallback])[:10]
+    return (aggregated or [fallback])[:10]
 
 
 async def _metadata_download_results(
@@ -4421,11 +4429,13 @@ def _download_task_response(item: TorrentRecord) -> DownloadTaskResponse:
 
 
 def _download_task_item_response(item: TorrentRecordItem) -> DownloadTaskItemResponse:
+    raw_payload = item.raw_payload or {}
     return DownloadTaskItemResponse(
         id=item.id,
         torrent_record_id=item.torrent_record_id,
         file_name=item.file_name,
         file_path=item.file_path,
+        size_bytes=_optional_int(raw_payload.get("size")),
         artist=item.artist,
         parsed_title=item.parsed_title,
         metadata_title=item.metadata_title,
@@ -4728,7 +4738,7 @@ def _media_server_track_payload(track: object) -> dict[str, Any]:
 async def _sync_playlist_to_media_server(
     state: AppState,
     playlist: Playlist,
-) -> tuple[str | None, int]:
+) -> tuple[str | None, int, str]:
     server = await state.repository.default_media_server()
     if server is None:
         raise ValueError("请先配置并启用默认媒体服务器。")
@@ -4746,9 +4756,10 @@ async def _sync_playlist_to_media_server(
         "playlist",
         "Playlist synced to music library: "
         f"playlist_id={playlist.id}, name={playlist.name}, "
-        f"library_playlist_id={result.playlist_id or '-'}, tracks={result.synced_count}",
+        f"library_playlist_id={result.playlist_id or '-'}, "
+        f"mode={result.mode}, tracks={result.synced_count}",
     )
-    return result.playlist_id, result.synced_count
+    return result.playlist_id, result.synced_count, result.mode
 
 
 async def _delete_task_torrent(
@@ -5041,6 +5052,7 @@ async def _scrape_manual_source_files(
             torrent_hash=None,
             source_path=item.source_path,
             library_path=item.library_path,
+            operation_type=config.mode,
             metadata=item.metadata,
             status=item.status,
             error_message=item.error_message,
@@ -5425,6 +5437,7 @@ async def _scrape_download_for_task(
             torrent_hash=task.torrent_hash,
             source_path=item.source_path,
             library_path=item.library_path,
+            operation_type=config.mode,
             metadata=item.metadata,
             status=item.status,
             error_message=item.error_message,
