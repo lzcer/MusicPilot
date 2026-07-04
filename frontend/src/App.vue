@@ -677,14 +677,29 @@ const playlistTrackLibraryStatusOptions = [
 const navItems = [
   { title: '搜索', value: 'search', icon: 'mdi-magnify' },
   { title: '下载', value: 'downloads', icon: 'mdi-download' },
+  { title: '歌单', value: 'playlists', icon: 'mdi-playlist-music-outline' },
   { title: '整理', value: 'media', icon: 'mdi-music-box-multiple' },
   { title: '文件管理', value: 'files', icon: 'mdi-folder-music-outline' },
   { title: '音乐库', value: 'musicLibrary', icon: 'mdi-music-circle-outline' },
-  { title: '歌单', value: 'playlists', icon: 'mdi-playlist-music-outline' },
   { title: '歌手库', value: 'artists', icon: 'mdi-account-music-outline' },
   { title: '站点', value: 'sites', icon: 'mdi-server-network' },
   { title: '日志', value: 'logs', icon: 'mdi-text-box-search-outline' },
   { title: '设置', value: 'settings', icon: 'mdi-cog-outline' }
+]
+
+const navGroups = [
+  {
+    title: '任务',
+    items: navItems.filter((item) => ['search', 'downloads', 'media'].includes(item.value))
+  },
+  {
+    title: '曲库',
+    items: navItems.filter((item) => ['playlists', 'musicLibrary', 'artists'].includes(item.value))
+  },
+  {
+    title: '管理',
+    items: navItems.filter((item) => ['files', 'sites', 'logs', 'settings'].includes(item.value))
+  }
 ]
 
 const pageTitle = computed(() => navItems.find((item) => item.value === activePage.value)?.title ?? 'MusicPilot')
@@ -2751,16 +2766,19 @@ onUnmounted(() => {
           <div class="brand-title">MusicPilot</div>
           <div class="brand-subtitle">音乐库自动化</div>
         </div>
-        <v-list nav density="compact">
-          <v-list-item
-            v-for="item in navItems"
-            :key="item.value"
-            :active="activePage === item.value"
-            :prepend-icon="item.icon"
-            :title="item.title"
-            rounded="lg"
-            @click="switchPage(item.value)"
-          />
+        <v-list nav density="compact" class="nav-list">
+          <template v-for="group in navGroups" :key="group.title">
+            <v-list-subheader class="nav-group-title">{{ group.title }}</v-list-subheader>
+            <v-list-item
+              v-for="item in group.items"
+              :key="item.value"
+              :active="activePage === item.value"
+              :prepend-icon="item.icon"
+              :title="item.title"
+              rounded="lg"
+              @click="switchPage(item.value)"
+            />
+          </template>
         </v-list>
       </v-navigation-drawer>
 
@@ -4764,6 +4782,19 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.nav-list {
+  padding: 4px 12px 16px;
+}
+
+.nav-group-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 28px;
+  min-height: 28px;
+  padding-inline-start: 12px !important;
+}
+
 .delete-action-buttons {
   display: flex;
   flex-wrap: wrap;
