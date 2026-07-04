@@ -1087,7 +1087,28 @@ def _classify_or_rename(
     if overwritten_existing:
         _remove_existing_target(target)
     shutil.move(str(path), str(target))
+    # Clean up empty parent directories left behind after the move
+    _remove_empty_parents(path.parent, config)
     return _PathOperationResult(target, overwritten_existing=overwritten_existing)
+
+
+def _remove_empty_parents(source_dir: Path, config: ScrapingConfig) -> None:
+    """Remove empty ancestor directories up to the configured root."""
+    parent = source_dir
+    while parent != parent.parent:  # stop at filesystem root
+        if not parent.is_dir():
+            break
+        try:
+            if any(parent.iterdir()):
+                break
+            parent.rmdir()
+        except (OSError, PermissionError):
+            break
+        # Stop at the mapped/source root directory — don't remove it
+        root = config.mapped_directory or config.source_directory
+        if root and parent == root:
+            break
+        parent = parent.parent
 
 
 def _remove_existing_target(target: Path) -> None:
