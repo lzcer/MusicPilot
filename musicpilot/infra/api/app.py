@@ -388,23 +388,7 @@ class SearchMediaExecutor:
         payload = getattr(task, "payload", {}) or {}
         query = str(payload.get("query") or "")
         limit = _optional_int(payload.get("limit")) or 10
-        candidates: list[MediaCandidate] = []
-        for provider in self.state.metadata.providers:
-            search = getattr(provider, "search", None)
-            if search is None:
-                continue
-            try:
-                provider_candidates = await search(
-                    query,
-                    limit=min(max(limit * 5, limit), 50),
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.state.add_log("metadata", f"Metadata provider failed: {exc}", "WARNING")
-                continue
-            candidates.extend(provider_candidates)
-            if len(candidates) >= limit:
-                break
-        aggregated = _aggregate_media_candidates(candidates, limit=limit)
+        aggregated = await _search_media_candidates_direct(self.state, query, limit)
         return TaskExecutionResult(
             result={"candidates": [item.model_dump() for item in aggregated]}
         )
@@ -426,16 +410,11 @@ class SearchSiteCandidatesExecutor:
         indexer = _find_indexer(self.state, site_id)
         if indexer is None:
             raise RuntimeError(f"Indexer is unavailable: {site_id}")
-        site_name = str(getattr(indexer, "name", site_id))
-        results: list[SearchResult] = []
-        errors: list[str] = []
-        for keyword in keywords:
-            try:
-                keyword_results = await indexer.search(keyword, limit=limit)
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{keyword}: {exc}")
-                continue
-            results.extend(keyword_results)
+        site_name, results, errors = await _search_site_candidates_direct(
+            indexer,
+            keywords,
+            limit,
+        )
         return TaskExecutionResult(
             result={
                 "source": site_name,
@@ -3143,6 +3122,7 @@ async def _playlist_media_candidates(
         query,
         10,
         log_category="playlist",
+        use_task_manager=False,
     )
     matched = [
         candidate
@@ -3168,7 +3148,7 @@ async def _metadata_download_results(
     raw_results: list[SearchResult] = []
     groups = await asyncio.gather(
         *(
-            _search_site_candidates(state, indexer, media, keywords, 50)
+            _search_site_candidates(state, indexer, media, keywords, 50, use_task_manager=False)
             for indexer in state.indexers
         ),
         return_exceptions=True,
@@ -3283,24 +3263,35 @@ async def _scrape_playlist_candidate_items(
     item_ids: list[int],
 ) -> TorrentRecord | None:
     submitted_task: TorrentRecord | None = None
-    submit_lock = asyncio.Lock()
     state.add_log(
         "playlist",
         "Playlist candidate pre-scraping started: "
         f"task={task.id}, items={len(item_ids)}, track={_playlist_track_log_text(track)}",
     )
 
-    async def scrape_one(item_id: int) -> None:
-        nonlocal submitted_task
-        task_id = await _enqueue_download_item_scrape(state, task.id, item_id)
-        scrape_task = await state.task_manager.wait_for_task(task_id)
-        if scrape_task.status != "SUCCEEDED":
-            raise RuntimeError(
-                scrape_task.error_message or f"Download item scrape failed: item={item_id}"
+    for item_id in item_ids:
+        try:
+            item = await state.task_manager.run_exclusive(
+                task_type="DOWNLOAD_ITEM_SCRAPE",
+                resource_keys=["scraper"],
+                payload={
+                    "torrent_record_id": task.id,
+                    "item_id": item_id,
+                },
+                runner=lambda item_id=item_id: _scrape_download_task_item(state, item_id),
+                wait_log_message="Playlist candidate waiting for scraper resource.",
             )
-        item = await state.repository.get_download_task_item(item_id)
-        if item is None or not await _download_task_item_matches_playlist_track(state, item, track):
-            return
+        except Exception as exc:  # noqa: BLE001
+            state.add_log(
+                "playlist",
+                f"Playlist candidate item scrape failed: task={task.id}, error={exc}",
+                "WARNING",
+            )
+            continue
+        if item is None:
+            continue
+        if not await _download_task_item_matches_playlist_track(state, item, track):
+            continue
         state.add_log(
             "playlist",
             "Playlist candidate target matched: "
@@ -3308,38 +3299,24 @@ async def _scrape_playlist_candidate_items(
             f"track={_playlist_track_log_text(track)}, "
             f"item_title={item.metadata_title or item.parsed_title or item.file_name}",
         )
-        async with submit_lock:
-            if submitted_task is not None:
-                return
-            updated_item = await state.repository.update_download_task_item(
-                item.id,
-                playlist_track_id=track.id,
-            )
-            submitted_task = await _submit_playlist_candidate_to_downloader(
-                state,
-                task,
-                resource,
-                torrent_data,
-            )
-            await _bind_playlist_track_to_task(state, track.id, submitted_task, last_error=None)
-            state.add_log(
-                "playlist",
-                "Playlist candidate accepted: "
-                f"task={submitted_task.id}, track={track.title}, "
-                f"item={updated_item.id if updated_item else item.id}",
-            )
-
-    results = await asyncio.gather(
-        *(scrape_one(item_id) for item_id in item_ids),
-        return_exceptions=True,
-    )
-    for result in results:
-        if isinstance(result, Exception):
-            state.add_log(
-                "playlist",
-                f"Playlist candidate item scrape failed: task={task.id}, error={result}",
-                "WARNING",
-            )
+        updated_item = await state.repository.update_download_task_item(
+            item.id,
+            playlist_track_id=track.id,
+        )
+        submitted_task = await _submit_playlist_candidate_to_downloader(
+            state,
+            task,
+            resource,
+            torrent_data,
+        )
+        await _bind_playlist_track_to_task(state, track.id, submitted_task, last_error=None)
+        state.add_log(
+            "playlist",
+            "Playlist candidate accepted: "
+            f"task={submitted_task.id}, track={track.title}, "
+            f"item={updated_item.id if updated_item else item.id}",
+        )
+        break
     if submitted_task is None:
         state.add_log(
             "playlist",
@@ -3547,6 +3524,8 @@ async def _search_site_candidates(
     media: MediaCandidateResponse,
     keywords: list[str],
     limit: int,
+    *,
+    use_task_manager: bool = True,
 ) -> tuple[str, tuple[SearchResult, ...]]:
     site_id = str(
         getattr(getattr(indexer, "config", None), "site_id", "") or indexer.name
@@ -3556,6 +3535,33 @@ async def _search_site_candidates(
         f"site:{site_id}",
         *await _media_candidate_artist_resource_keys(state, media),
     ]
+    if not use_task_manager:
+        source, results_list, errors = await state.task_manager.run_exclusive(
+            task_type="SEARCH_SITE_CANDIDATES",
+            resource_keys=resource_keys,
+            payload={
+                "site_id": site_id,
+                "site_name": site_name,
+                "media": media.model_dump(),
+                "keywords": keywords,
+                "limit": limit,
+            },
+            runner=lambda: _search_site_candidates_direct(indexer, keywords, limit),
+            wait_log_message="Playlist site candidate search waiting for resources.",
+        )
+        for error in errors:
+            state.add_log(
+                "playlist",
+                f"Playlist site candidate search failed: site={site_name}, error={error}",
+                "WARNING",
+            )
+        results = tuple(results_list)
+        state.add_log(
+            "search",
+            "Playlist site candidate search completed: "
+            f"site={site_name}, media={_media_candidate_log_text(media)}, raw={len(results)}",
+        )
+        return source, results
     task_id = await state.task_manager.enqueue(
         TaskCreate(
             task_type="SEARCH_SITE_CANDIDATES",
@@ -3592,13 +3598,44 @@ async def _search_site_candidates(
     return str(result_payload.get("source") or site_name), results
 
 
+async def _search_site_candidates_direct(
+    indexer: object,
+    keywords: list[str],
+    limit: int,
+) -> tuple[str, list[SearchResult], list[str]]:
+    site_name = str(getattr(indexer, "name", ""))
+    results: list[SearchResult] = []
+    errors: list[str] = []
+    for keyword in keywords:
+        try:
+            keyword_results = await indexer.search(keyword, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{keyword}: {exc}")
+            continue
+        results.extend(keyword_results)
+    return site_name, results, errors
+
+
 async def _search_media_candidates(
     state: AppState,
     query: str,
     limit: int,
     *,
     log_category: str,
+    use_task_manager: bool = True,
 ) -> list[MediaCandidateResponse]:
+    if not use_task_manager:
+        return await state.task_manager.run_exclusive(
+            task_type="SEARCH_MEDIA",
+            resource_keys=["media-search"],
+            payload={
+                "query": query,
+                "limit": limit,
+                "log_category": log_category,
+            },
+            runner=lambda: _search_media_candidates_direct(state, query, limit),
+            wait_log_message="Playlist metadata search waiting for media-search resource.",
+        )
     task_id = await state.task_manager.enqueue(
         TaskCreate(
             task_type="SEARCH_MEDIA",
@@ -3619,6 +3656,30 @@ async def _search_media_candidates(
             continue
         candidates.append(MediaCandidateResponse(**item))
     return candidates
+
+
+async def _search_media_candidates_direct(
+    state: AppState,
+    query: str,
+    limit: int,
+) -> list[MediaCandidateResponse]:
+    candidates: list[MediaCandidate] = []
+    for provider in state.metadata.providers:
+        search = getattr(provider, "search", None)
+        if search is None:
+            continue
+        try:
+            provider_candidates = await search(
+                query,
+                limit=min(max(limit * 5, limit), 50),
+            )
+        except Exception as exc:  # noqa: BLE001
+            state.add_log("metadata", f"Metadata provider failed: {exc}", "WARNING")
+            continue
+        candidates.extend(provider_candidates)
+        if len(candidates) >= limit:
+            break
+    return _aggregate_media_candidates(candidates, limit=limit)
 
 
 def _find_indexer(state: AppState, site_id: str) -> object | None:
