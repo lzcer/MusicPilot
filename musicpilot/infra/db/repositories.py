@@ -4,12 +4,13 @@ import logging
 import os
 import time
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import String, delete, func, or_, select
+from sqlalchemy import String, delete, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 
 from musicpilot.infra.db.models import (
     Artist,
@@ -25,6 +26,8 @@ from musicpilot.infra.db.models import (
     PlaylistTrack,
     Subscription,
     SystemSetting,
+    SystemTask,
+    SystemTaskResourceLease,
     TorrentRecord,
     TorrentRecordItem,
 )
@@ -354,6 +357,447 @@ class SqlAlchemyMediaRepository:
             await session.commit()
             await session.refresh(row)
             return row.value
+
+    async def create_system_task(
+        self,
+        *,
+        task_type: str,
+        payload: dict[str, Any],
+        resource_keys: list[str],
+        chain_id: str | None = None,
+        parent_task_id: int | None = None,
+        inheritable_key: str | None = None,
+        priority: int = 0,
+        max_attempts: int = 1,
+        available_at: datetime | None = None,
+        idempotency_key: str | None = None,
+    ) -> SystemTask:
+        async with self.database.session() as session:
+            if idempotency_key:
+                existing_result = await session.execute(
+                    select(SystemTask).where(SystemTask.idempotency_key == idempotency_key)
+                )
+                existing = existing_result.scalars().first()
+                if existing is not None:
+                    return existing
+            now = datetime.now(UTC)
+            row = SystemTask(
+                task_type=task_type,
+                status="WAIT",
+                chain_id=chain_id or uuid4().hex,
+                parent_task_id=parent_task_id,
+                priority=priority,
+                resource_keys=_unique_strings(resource_keys),
+                inheritable_key=inheritable_key,
+                payload=payload,
+                result={},
+                error_message=None,
+                attempts=0,
+                max_attempts=max(1, max_attempts),
+                available_at=available_at or now,
+                idempotency_key=idempotency_key,
+            )
+            session.add(row)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                if not idempotency_key:
+                    raise
+                existing_result = await session.execute(
+                    select(SystemTask).where(SystemTask.idempotency_key == idempotency_key)
+                )
+                existing = existing_result.scalars().first()
+                if existing is None:
+                    raise
+                return existing
+            await session.refresh(row)
+            return row
+
+    async def list_ready_system_tasks(self, *, limit: int = 20) -> list[SystemTask]:
+        now = datetime.now(UTC)
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(SystemTask)
+                .where(
+                    SystemTask.status == "WAIT",
+                    SystemTask.available_at <= now,
+                )
+                .order_by(SystemTask.priority.desc(), SystemTask.created_at, SystemTask.id)
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def get_system_task(self, task_id: int) -> SystemTask | None:
+        async with self.database.session() as session:
+            return await session.get(SystemTask, task_id)
+
+    async def get_system_task_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> SystemTask | None:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(SystemTask).where(SystemTask.idempotency_key == idempotency_key)
+            )
+            return result.scalars().first()
+
+    async def try_claim_system_task(
+        self,
+        task_id: int,
+        *,
+        lease_seconds: int,
+    ) -> SystemTask | None:
+        now = datetime.now(UTC)
+        lease_until = now + timedelta(seconds=lease_seconds)
+        async with self.database.session() as session:
+            task = await session.get(SystemTask, task_id)
+            if task is None or task.status != "WAIT" or _as_utc(task.available_at) > now:
+                return None
+            resource_keys = _unique_strings(task.resource_keys or [])
+            if task.inheritable_key and task.inheritable_key not in resource_keys:
+                resource_keys.append(task.inheritable_key)
+            claimed_keys: list[str] = []
+            try:
+                for resource_key in resource_keys:
+                    lease = await session.get(SystemTaskResourceLease, resource_key)
+                    if lease is not None and _as_utc(lease.lease_until) <= now:
+                        await session.delete(lease)
+                        await session.flush()
+                        lease = None
+                    if resource_key == task.inheritable_key:
+                        if (
+                            lease is not None
+                            and lease.holder_kind == "chain"
+                            and lease.holder_id == task.chain_id
+                        ):
+                            lease.lease_until = lease_until
+                            continue
+                        if lease is not None:
+                            return None
+                        session.add(
+                            SystemTaskResourceLease(
+                                resource_key=resource_key,
+                                holder_kind="chain",
+                                holder_id=task.chain_id,
+                                task_id=None,
+                                chain_id=task.chain_id,
+                                lease_until=lease_until,
+                            )
+                        )
+                        claimed_keys.append(resource_key)
+                        continue
+                    if lease is not None:
+                        return None
+                    session.add(
+                        SystemTaskResourceLease(
+                            resource_key=resource_key,
+                            holder_kind="task",
+                            holder_id=str(task.id),
+                            task_id=task.id,
+                            chain_id=task.chain_id,
+                            lease_until=lease_until,
+                        )
+                    )
+                    claimed_keys.append(resource_key)
+                task.status = "RUNNING"
+                task.attempts += 1
+                task.started_at = now
+                task.heartbeat_at = now
+                task.lease_until = lease_until
+                task.error_message = None
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                return None
+            await session.refresh(task)
+            logger.info(
+                "System task claimed: id=%s type=%s resources=%s",
+                task.id,
+                task.task_type,
+                claimed_keys,
+            )
+            return task
+
+    async def try_start_system_task(
+        self,
+        *,
+        task_type: str,
+        payload: dict[str, Any],
+        resource_keys: list[str],
+        lease_seconds: int,
+        chain_id: str | None = None,
+        parent_task_id: int | None = None,
+        inheritable_key: str | None = None,
+        priority: int = 0,
+        max_attempts: int = 1,
+        idempotency_key: str | None = None,
+    ) -> SystemTask | None:
+        now = datetime.now(UTC)
+        lease_until = now + timedelta(seconds=lease_seconds)
+        chain_value = chain_id or uuid4().hex
+        claimed_keys: list[str] = []
+        async with self.database.session() as session:
+            resource_values = _unique_strings(resource_keys or [])
+            if inheritable_key and inheritable_key not in resource_values:
+                resource_values.append(inheritable_key)
+            try:
+                row = SystemTask(
+                    task_type=task_type,
+                    status="RUNNING",
+                    chain_id=chain_value,
+                    parent_task_id=parent_task_id,
+                    priority=priority,
+                    resource_keys=resource_values,
+                    inheritable_key=inheritable_key,
+                    payload=dict(payload or {}),
+                    result={},
+                    error_message=None,
+                    attempts=1,
+                    max_attempts=max(1, max_attempts),
+                    available_at=now,
+                    started_at=now,
+                    heartbeat_at=now,
+                    lease_until=lease_until,
+                    idempotency_key=idempotency_key,
+                )
+                session.add(row)
+                await session.flush()
+                for resource_key in resource_values:
+                    lease = await session.get(SystemTaskResourceLease, resource_key)
+                    if lease is not None and _as_utc(lease.lease_until) <= now:
+                        await session.delete(lease)
+                        await session.flush()
+                        lease = None
+                    if resource_key == inheritable_key:
+                        if lease is not None:
+                            await session.rollback()
+                            return None
+                        session.add(
+                            SystemTaskResourceLease(
+                                resource_key=resource_key,
+                                holder_kind="chain",
+                                holder_id=chain_value,
+                                task_id=None,
+                                chain_id=chain_value,
+                                lease_until=lease_until,
+                            )
+                        )
+                        claimed_keys.append(resource_key)
+                        continue
+                    if lease is not None:
+                        await session.rollback()
+                        return None
+                    session.add(
+                        SystemTaskResourceLease(
+                            resource_key=resource_key,
+                            holder_kind="task",
+                            holder_id=str(row.id),
+                            task_id=row.id,
+                            chain_id=chain_value,
+                            lease_until=lease_until,
+                        )
+                    )
+                    claimed_keys.append(resource_key)
+                await session.commit()
+                await session.refresh(row)
+                logger.info(
+                    "System task started: id=%s type=%s resources=%s",
+                    row.id,
+                    row.task_type,
+                    claimed_keys,
+                )
+                return row
+            except IntegrityError:
+                await session.rollback()
+                return None
+
+    async def complete_system_task(
+        self,
+        task_id: int,
+        *,
+        result: dict[str, Any],
+        next_tasks: list[dict[str, Any]],
+    ) -> SystemTask | None:
+        now = datetime.now(UTC)
+        async with self.database.session() as session:
+            task = await session.get(SystemTask, task_id)
+            if task is None:
+                return None
+            task.status = "SUCCEEDED"
+            task.result = result
+            task.error_message = None
+            task.finished_at = now
+            task.heartbeat_at = now
+            task.lease_until = None
+            created_next: list[SystemTask] = []
+            for payload in next_tasks:
+                next_task = SystemTask(
+                    task_type=str(payload["task_type"]),
+                    status="WAIT",
+                    chain_id=str(payload.get("chain_id") or task.chain_id),
+                    parent_task_id=_optional_int(payload.get("parent_task_id")) or task.id,
+                    priority=_optional_int(payload.get("priority")) or task.priority,
+                    resource_keys=_unique_strings(payload.get("resource_keys") or []),
+                    inheritable_key=_optional_string(payload.get("inheritable_key")),
+                    payload=dict(payload.get("payload") or {}),
+                    result={},
+                    error_message=None,
+                    attempts=0,
+                    max_attempts=max(1, _optional_int(payload.get("max_attempts")) or 1),
+                    available_at=payload.get("available_at") or now,
+                    idempotency_key=_optional_string(payload.get("idempotency_key")),
+                )
+                session.add(next_task)
+                created_next.append(next_task)
+            await session.execute(
+                delete(SystemTaskResourceLease).where(
+                    SystemTaskResourceLease.holder_kind == "task",
+                    SystemTaskResourceLease.task_id == task.id,
+                )
+            )
+            await session.flush()
+            if not created_next:
+                active = await _system_task_chain_has_active_tasks(session, task.chain_id, task.id)
+                if not active:
+                    await session.execute(
+                        delete(SystemTaskResourceLease).where(
+                            SystemTaskResourceLease.holder_kind == "chain",
+                            SystemTaskResourceLease.chain_id == task.chain_id,
+                        )
+                    )
+            await session.commit()
+            await session.refresh(task)
+            return task
+
+    async def fail_system_task(
+        self,
+        task_id: int,
+        *,
+        error_message: str,
+        retry_delay_seconds: int = 60,
+    ) -> SystemTask | None:
+        now = datetime.now(UTC)
+        async with self.database.session() as session:
+            task = await session.get(SystemTask, task_id)
+            if task is None:
+                return None
+            should_retry = task.attempts < task.max_attempts
+            task.status = "WAIT" if should_retry else "FAILED"
+            task.error_message = error_message
+            task.heartbeat_at = now
+            task.lease_until = None
+            task.finished_at = None if should_retry else now
+            if should_retry:
+                task.available_at = now + timedelta(seconds=retry_delay_seconds)
+            await session.execute(
+                delete(SystemTaskResourceLease).where(
+                    SystemTaskResourceLease.holder_kind == "task",
+                    SystemTaskResourceLease.task_id == task.id,
+                )
+            )
+            await session.flush()
+            if not should_retry:
+                active = await _system_task_chain_has_active_tasks(session, task.chain_id, task.id)
+                if not active:
+                    await session.execute(
+                        delete(SystemTaskResourceLease).where(
+                            SystemTaskResourceLease.holder_kind == "chain",
+                            SystemTaskResourceLease.chain_id == task.chain_id,
+                        )
+                    )
+            await session.commit()
+            await session.refresh(task)
+            return task
+
+    async def refresh_system_task_lease(
+        self,
+        task_id: int,
+        *,
+        lease_seconds: int,
+    ) -> bool:
+        now = datetime.now(UTC)
+        lease_until = now + timedelta(seconds=lease_seconds)
+        async with self.database.session() as session:
+            task = await session.get(SystemTask, task_id)
+            if task is None or task.status != "RUNNING":
+                return False
+            task.heartbeat_at = now
+            task.lease_until = lease_until
+            await session.execute(
+                update(SystemTaskResourceLease)
+                .where(
+                    or_(
+                        SystemTaskResourceLease.task_id == task.id,
+                        SystemTaskResourceLease.chain_id == task.chain_id,
+                    )
+                )
+                .values(lease_until=lease_until)
+            )
+            await session.commit()
+            return True
+
+    async def requeue_system_task(
+        self,
+        task_id: int,
+        *,
+        error_message: str,
+    ) -> SystemTask | None:
+        now = datetime.now(UTC)
+        async with self.database.session() as session:
+            task = await session.get(SystemTask, task_id)
+            if task is None:
+                return None
+            task.status = "WAIT"
+            task.error_message = error_message
+            task.available_at = now
+            task.heartbeat_at = now
+            task.lease_until = None
+            await session.execute(
+                delete(SystemTaskResourceLease).where(
+                    SystemTaskResourceLease.holder_kind == "task",
+                    SystemTaskResourceLease.task_id == task.id,
+                )
+            )
+            await session.commit()
+            await session.refresh(task)
+            return task
+
+    async def recover_stale_system_tasks(self, *, recover_all_running: bool = False) -> int:
+        now = datetime.now(UTC)
+        recovered = 0
+        async with self.database.session() as session:
+            filters = [SystemTask.status == "RUNNING"]
+            if not recover_all_running:
+                filters.extend(
+                    [
+                        SystemTask.lease_until.isnot(None),
+                        SystemTask.lease_until <= now,
+                    ]
+                )
+            result = await session.execute(
+                select(SystemTask).where(*filters)
+            )
+            for task in result.scalars().all():
+                task.status = "WAIT"
+                task.lease_until = None
+                task.heartbeat_at = now
+                task.error_message = (
+                    "Task restored after scheduler restart."
+                    if recover_all_running
+                    else "Task lease expired; restored to WAIT."
+                )
+                recovered += 1
+            if recover_all_running:
+                await session.execute(delete(SystemTaskResourceLease))
+            else:
+                await session.execute(
+                    delete(SystemTaskResourceLease).where(
+                        SystemTaskResourceLease.lease_until <= now
+                    )
+                )
+            await session.commit()
+        return recovered
 
     async def create_download_task(
         self,
@@ -1410,6 +1854,43 @@ def _optional_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _unique_strings(values: object) -> list[str]:
+    if not isinstance(values, list | tuple | set):
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+async def _system_task_chain_has_active_tasks(
+    session: object,
+    chain_id: str,
+    excluding_task_id: int,
+) -> bool:
+    result = await session.execute(
+        select(func.count())
+        .select_from(SystemTask)
+        .where(
+            SystemTask.chain_id == chain_id,
+            SystemTask.id != excluding_task_id,
+            SystemTask.status.in_(("WAIT", "RUNNING")),
+        )
+    )
+    return int(result.scalar_one()) > 0
 
 
 async def _clear_other_defaults(session: object, model: type[object], active_id: str) -> None:

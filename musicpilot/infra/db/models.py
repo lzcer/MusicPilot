@@ -277,6 +277,45 @@ class SystemSetting(TimestampMixin, Base):
     value: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class SystemTask(TimestampMixin, Base):
+    __tablename__ = "system_tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_type: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="WAIT", index=True)
+    chain_id: Mapped[str] = mapped_column(String(64), index=True)
+    parent_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    resource_keys: Mapped[list[str]] = mapped_column(JSON, default=list)
+    inheritable_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=1)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(256),
+        unique=True,
+        nullable=True,
+    )
+
+
+class SystemTaskResourceLease(TimestampMixin, Base):
+    __tablename__ = "system_task_resource_leases"
+
+    resource_key: Mapped[str] = mapped_column(String(256), primary_key=True)
+    holder_kind: Mapped[str] = mapped_column(String(32))
+    holder_id: Mapped[str] = mapped_column(String(64), index=True)
+    task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    chain_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    lease_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class Artist(TimestampMixin, Base):
     __tablename__ = "artists"
 

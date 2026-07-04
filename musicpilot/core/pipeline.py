@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 
 from musicpilot.core.event_bus import EventBus
 from musicpilot.core.events import (
@@ -23,6 +23,7 @@ from musicpilot.ports.indexer import Indexer
 from musicpilot.ports.notifier import Notifier
 
 logger = logging.getLogger(__name__)
+SearchRunner = Callable[[Indexer, str, int], Awaitable[tuple[str, tuple[SearchResult, ...]]]]
 
 
 class MusicPipeline:
@@ -34,12 +35,14 @@ class MusicPipeline:
         downloader: Downloader | None = None,
         media_processor: MediaProcessor | None = None,
         notifiers: Iterable[Notifier] = (),
+        search_runner: SearchRunner | None = None,
     ) -> None:
         self.event_bus = event_bus
         self.indexers = tuple(indexers)
         self.downloader = downloader
         self.media_processor = media_processor
         self.notifiers = tuple(notifiers)
+        self.search_runner = search_runner
         self._worker: asyncio.Task[None] | None = None
 
     async def search(self, event: SearchEvent) -> tuple[SearchResult, ...]:
@@ -48,16 +51,28 @@ class MusicPipeline:
             return ()
 
         logger.info("Searching %s indexer(s) for %s", len(self.indexers), event.query)
-        result_groups = await asyncio.gather(
-            *(indexer.search(event.query, limit=event.limit) for indexer in self.indexers),
-            return_exceptions=True,
-        )
+        if self.search_runner is None:
+            result_groups = await asyncio.gather(
+                *(indexer.search(event.query, limit=event.limit) for indexer in self.indexers),
+                return_exceptions=True,
+            )
+        else:
+            result_groups = await asyncio.gather(
+                *(
+                    self.search_runner(indexer, event.query, event.limit)
+                    for indexer in self.indexers
+                ),
+                return_exceptions=True,
+            )
         results: list[SearchResult] = []
         for indexer, group in zip(self.indexers, result_groups, strict=True):
             if isinstance(group, Exception):
                 logger.warning("Indexer %s failed: %s", indexer.name, group)
                 continue
-            results.extend(group)
+            if self.search_runner is None:
+                results.extend(group)
+            else:
+                results.extend(group[1])
 
         ranked = self._dedupe_and_rank(results, event.limit)
         logger.info("Search finished for %s with %s result(s)", event.query, len(ranked))
