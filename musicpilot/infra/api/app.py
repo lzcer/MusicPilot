@@ -3258,7 +3258,7 @@ async def _download_playlist_candidate_torrent_file(
         "Playlist candidate torrent downloading: "
         f"site={site.name}, title={resource.get('title') or ''}",
     )
-    proxy_url = _resolve_proxy_for_site(state, site)
+    proxy_url = await _resolve_proxy_for_site(state, site)
     return await _download_torrent_file(download_url, site, proxy_url=proxy_url)
 
 
@@ -3743,7 +3743,7 @@ async def _submit_torrent_to_downloader(
     if site is None:
         torrent_hash = await state.downloader.add_torrent(download_url, category=category)
         return SubmittedTorrent(torrent_hash=torrent_hash)
-    proxy_url = _resolve_proxy_for_site(state, site)
+    proxy_url = await _resolve_proxy_for_site(state, site)
     torrent_data = await _download_torrent_file(download_url, site, proxy_url=proxy_url)
     torrent_hash = await state.downloader.add_torrent_file(
         torrent_data,
