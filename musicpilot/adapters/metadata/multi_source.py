@@ -3,9 +3,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import random
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TypeVar
 from uuid import uuid1
 
 import httpx
@@ -14,6 +15,8 @@ from opencc import OpenCC
 from musicpilot.ports.metadata import TrackMetadata
 
 _OPENCC_T2S = OpenCC("t2s")
+_RESOURCE_ORDER = ("qmusic", "netease", "migu", "kuwo")
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,11 +31,17 @@ class _SourceSong:
 
 
 class MultiSourceMusicProvider:
-    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        client: httpx.AsyncClient | None = None,
+        source_gate: Callable[[str, Callable[[], Awaitable[T]]], Awaitable[T]] | None = None,
+    ) -> None:
         self._client = client or httpx.AsyncClient(timeout=20, follow_redirects=True)
         self._owns_client = client is None
         self._kuwo_token = _generate_kw_token()
         self._kuwo_cross = _sha1_and_md5(self._kuwo_token)
+        self._source_gate = source_gate
+        self._source_rotation = random.randrange(len(_RESOURCE_ORDER))
 
     @property
     def name(self) -> str:
@@ -68,16 +77,51 @@ class MultiSourceMusicProvider:
         artist: str | None = None,
         limit: int = 5,
     ) -> AsyncIterator[tuple[TrackMetadata, ...]]:
-        for resource in ("qmusic", "netease", "migu", "kuwo"):
-            songs = await self._fetch_id3_by_title(resource, title, artist=artist)
-            matched = _matched_songs(title, artist or "", songs, limit)
-            if not matched:
+        for resource in self._next_resource_order():
+            batch = await self._run_with_source_gate(
+                resource,
+                lambda resource=resource: self._metadata_batch_for_resource(
+                    resource,
+                    title=title,
+                    artist=artist,
+                    limit=limit,
+                ),
+            )
+            if not batch:
                 continue
-            results = []
-            for song in matched:
-                lyrics = await self._fetch_lyric(song)
-                results.append(_song_metadata(song, lyrics))
-            yield tuple(results)
+            yield batch
+
+    async def _run_with_source_gate(
+        self,
+        resource: str,
+        runner: Callable[[], Awaitable[T]],
+    ) -> T:
+        if self._source_gate is None:
+            return await runner()
+        return await self._source_gate(resource, runner)
+
+    def _next_resource_order(self) -> tuple[str, ...]:
+        start = self._source_rotation % len(_RESOURCE_ORDER)
+        self._source_rotation += 1
+        return (*_RESOURCE_ORDER[start:], *_RESOURCE_ORDER[:start])
+
+    async def _metadata_batch_for_resource(
+        self,
+        resource: str,
+        *,
+        title: str,
+        artist: str | None,
+        limit: int,
+    ) -> tuple[TrackMetadata, ...]:
+        songs = await self._fetch_id3_by_title(resource, title, artist=artist)
+        matched = _matched_songs(title, artist or "", songs, limit)
+        if not matched:
+            return ()
+        results = []
+        for song in matched:
+            lyrics = await self._fetch_lyric(song)
+            results.append(_song_metadata(song, lyrics))
+        return tuple(results)
 
     async def _fetch_id3_by_title(
         self,
@@ -112,7 +156,11 @@ class MultiSourceMusicProvider:
             return None
         return None
 
-    async def _fetch_qmusic_id3_by_title(self, title: str, artist: str | None = None) -> tuple[_SourceSong, ...]:
+    async def _fetch_qmusic_id3_by_title(
+        self,
+        title: str,
+        artist: str | None = None,
+    ) -> tuple[_SourceSong, ...]:
         query = _search_query(title, artist)
         payload = {
             "comm": {
@@ -209,7 +257,11 @@ class MultiSourceMusicProvider:
             return None
         return base64.b64decode(lyric).decode("utf-8", errors="ignore").strip() or None
 
-    async def _fetch_netease_id3_by_title(self, title: str, artist: str | None = None) -> tuple[_SourceSong, ...]:
+    async def _fetch_netease_id3_by_title(
+        self,
+        title: str,
+        artist: str | None = None,
+    ) -> tuple[_SourceSong, ...]:
         query = _search_query(title, artist)
         response = await self._client.get(
             "https://music.163.com/api/search/get/web",
@@ -251,7 +303,11 @@ class MultiSourceMusicProvider:
         lyric = response.json().get("lrc", {}).get("lyric")
         return lyric.strip() if isinstance(lyric, str) and lyric.strip() else None
 
-    async def _fetch_migu_id3_by_title(self, title: str, artist: str | None = None) -> tuple[_SourceSong, ...]:
+    async def _fetch_migu_id3_by_title(
+        self,
+        title: str,
+        artist: str | None = None,
+    ) -> tuple[_SourceSong, ...]:
         query = _search_query(title, artist)
         response = await self._client.get(
             "https://m.music.migu.cn/migu/remoting/scr_search_tag",
@@ -289,7 +345,11 @@ class MultiSourceMusicProvider:
         lyric = response.json().get("lyric")
         return lyric.strip() if isinstance(lyric, str) and lyric.strip() else None
 
-    async def _fetch_kuwo_id3_by_title(self, title: str, artist: str | None = None) -> tuple[_SourceSong, ...]:
+    async def _fetch_kuwo_id3_by_title(
+        self,
+        title: str,
+        artist: str | None = None,
+    ) -> tuple[_SourceSong, ...]:
         query = _search_query(title, artist)
         response = await self._client.get(
             "http://www.kuwo.cn/api/www/search/searchMusicBykeyWord",

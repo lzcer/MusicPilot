@@ -2573,6 +2573,34 @@ function playlistStatusColor(status: string) {
   }[status] ?? 'secondary'
 }
 
+function downloadStatusText(status: string) {
+  return {
+    queued: '队列中',
+    submitted: '已提交',
+    downloading: '下载中',
+    completed: '下载完成',
+    refreshing_library: '整理中',
+    library_refreshed: '曲库已刷新',
+    source_directory_not_found: '目录未找到',
+    failed: '失败',
+    deleted: '已删除'
+  }[status] ?? status
+}
+
+function downloadStatusColor(status: string) {
+  return {
+    queued: 'warning',
+    submitted: 'primary',
+    downloading: 'info',
+    completed: 'success',
+    refreshing_library: 'info',
+    library_refreshed: 'success',
+    source_directory_not_found: 'error',
+    failed: 'error',
+    deleted: 'error'
+  }[status] ?? 'secondary'
+}
+
 function playlistTrackStatusText(status: string) {
   return {
     pending: '待处理',
@@ -2962,7 +2990,15 @@ onUnmounted(() => {
                       />
                     </td>
                     <td>{{ row.name }}</td>
-                    <td><v-chip size="small" variant="tonal">{{ row.state }}</v-chip></td>
+                    <td>
+                      <v-chip
+                        :color="downloadStatusColor(row.state)"
+                        size="small"
+                        variant="tonal"
+                      >
+                        {{ downloadStatusText(row.state) }}
+                      </v-chip>
+                    </td>
                     <td><v-progress-linear :model-value="progressPercent(row.progress)" height="8" rounded /></td>
                     <td class="path-cell">{{ row.save_path || '-' }}</td>
                     <td class="table-actions">

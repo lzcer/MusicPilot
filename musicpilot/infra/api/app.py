@@ -11,7 +11,7 @@ import shutil
 import time
 import unicodedata
 from collections import deque
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from html import escape
@@ -544,7 +544,7 @@ class AppState:
         self.downloader: QBittorrentClient | None = None
         self.metadata = MetadataCascade(
             [
-                MultiSourceMusicProvider(),
+                MultiSourceMusicProvider(source_gate=self.run_metadata_source),
                 NetEaseMusicProvider(),
                 MusicBrainzProvider(user_agent=settings.musicbrainz_user_agent),
             ]
@@ -560,7 +560,9 @@ class AppState:
         self.artist_build_finished_at: datetime | None = None
         self.artist_build_last_error: str | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
-        self.scraping_metadata = MetadataCascade([MultiSourceMusicProvider()])
+        self.scraping_metadata = MetadataCascade(
+            [MultiSourceMusicProvider(source_gate=self.run_metadata_source)]
+        )
         self.scraper = LocalMusicScraper(
             metadata=self.scraping_metadata,
             tag_writer=MutagenTagWriter(),
@@ -738,6 +740,19 @@ class AppState:
         self.music_library_sync_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await self.music_library_sync_task
+
+    async def run_metadata_source(
+        self,
+        source: str,
+        runner: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        return await self.task_manager.run_exclusive(
+            task_type="METADATA_SOURCE",
+            resource_keys=[await _metadata_source_resource_key(self, source)],
+            payload={"source": source},
+            runner=runner,
+            wait_log_message=f"Metadata source waiting for resources: source={source}",
+        )
 
     def add_log(self, category: str, message: str, level: str = "INFO") -> None:
         self.logs.appendleft(
@@ -2953,6 +2968,19 @@ async def _media_search_resource_key(state: AppState) -> str:
     return f"pool:{concurrency}:media-search"
 
 
+async def _metadata_source_resource_key(state: AppState, source: str) -> str:
+    settings = await state.repository.get_system_settings()
+    search_settings = settings.get("search") if isinstance(settings, dict) else {}
+    concurrency = _optional_int(
+        search_settings.get("metadata_concurrency")
+        if isinstance(search_settings, dict)
+        else None
+    ) or 3
+    concurrency = min(max(concurrency, 1), 20)
+    source_key = _compact_search_text(normalize_search_text(source)) or "unknown"
+    return f"pool:{concurrency}:metadata-source:{source_key}"
+
+
 async def _playlist_has_active_downloads(state: AppState, playlist_id: int) -> bool:
     tracks = await state.repository.list_playlist_tracks(playlist_id)
     return any(track.download_status in PLAYLIST_TRACK_ACTIVE_STATUSES for track in tracks)
@@ -3286,13 +3314,13 @@ async def _scrape_playlist_candidate_items(
         try:
             item = await state.task_manager.run_exclusive(
                 task_type="DOWNLOAD_ITEM_SCRAPE",
-                resource_keys=["scraper"],
+                resource_keys=[f"download-item:{item_id}"],
                 payload={
                     "torrent_record_id": task.id,
                     "item_id": item_id,
                 },
                 runner=lambda item_id=item_id: _scrape_download_task_item(state, item_id),
-                wait_log_message="Playlist candidate waiting for scraper resource.",
+                wait_log_message="Playlist candidate metadata scraping waiting for resources.",
             )
         except Exception as exc:  # noqa: BLE001
             state.add_log(
@@ -3887,7 +3915,7 @@ async def _enqueue_download_item_scrape(
                 "torrent_record_id": task_id,
                 "item_id": item_id,
             },
-            resource_keys=["scraper"],
+            resource_keys=[f"download-item:{item_id}"],
             max_attempts=3,
             idempotency_key=f"download-item-scrape:{item_id}",
         )
