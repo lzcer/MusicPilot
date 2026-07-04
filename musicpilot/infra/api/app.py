@@ -2941,11 +2941,16 @@ def _site_resource_key(indexer: object, site_id: str) -> str:
     return f"pool:{max_concurrency}:site:{site_id}"
 
 
-def _media_search_resource_key(query: str) -> str:
-    normalized = _compact_search_text(normalize_search_text(query))
-    if normalized:
-        return f"media-search:{normalized[:120]}"
-    return "media-search:empty"
+async def _media_search_resource_key(state: AppState) -> str:
+    settings = await state.repository.get_system_settings()
+    search_settings = settings.get("search") if isinstance(settings, dict) else {}
+    concurrency = _optional_int(
+        search_settings.get("metadata_concurrency")
+        if isinstance(search_settings, dict)
+        else None
+    ) or 3
+    concurrency = min(max(concurrency, 1), 20)
+    return f"pool:{concurrency}:media-search"
 
 
 async def _playlist_has_active_downloads(state: AppState, playlist_id: int) -> bool:
@@ -3632,7 +3637,7 @@ async def _search_media_candidates(
     if not use_task_manager:
         return await state.task_manager.run_exclusive(
             task_type="SEARCH_MEDIA",
-            resource_keys=[_media_search_resource_key(query)],
+            resource_keys=[await _media_search_resource_key(state)],
             payload={
                 "query": query,
                 "limit": limit,
@@ -3644,7 +3649,7 @@ async def _search_media_candidates(
     task_id = await state.task_manager.enqueue(
         TaskCreate(
             task_type="SEARCH_MEDIA",
-            resource_keys=[_media_search_resource_key(query)],
+            resource_keys=[await _media_search_resource_key(state)],
             payload={
                 "query": query,
                 "limit": limit,

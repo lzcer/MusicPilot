@@ -477,6 +477,7 @@ class ScrapingSettings(BaseModel):
 
 class SearchSettings(BaseModel):
     exclude_keywords: str = DEFAULT_SEARCH_EXCLUDE_KEYWORDS
+    metadata_concurrency: int = Field(default=3, ge=1, le=20)
 
 
 class SystemSettingsRequest(BaseModel):

@@ -341,6 +341,7 @@ type SystemSettings = {
   }
   search: {
     exclude_keywords: string
+    metadata_concurrency: number
   }
 }
 
@@ -617,7 +618,8 @@ const systemForm = ref<SystemSettings>({
     duplicate_handling: 'ignore'
   },
   search: {
-    exclude_keywords: '整轨|整軌|WAV|wav'
+    exclude_keywords: '整轨|整軌|WAV|wav',
+    metadata_concurrency: 3
   }
 })
 
@@ -2453,6 +2455,12 @@ async function loadSystemSettings() {
 async function saveSystemSettings() {
   systemSaving.value = true
   try {
+    systemForm.value.search.metadata_concurrency = clampInteger(
+      systemForm.value.search.metadata_concurrency,
+      1,
+      20,
+      3
+    )
     systemForm.value = await api<SystemSettings>('/api/settings/system', {
       method: 'POST',
       body: JSON.stringify(systemForm.value)
@@ -2463,6 +2471,11 @@ async function saveSystemSettings() {
   } finally {
     systemSaving.value = false
   }
+}
+
+function clampInteger(value: number, min: number, max: number, fallback: number) {
+  const normalized = Number.isFinite(value) ? Math.trunc(value) : fallback
+  return Math.min(Math.max(normalized, min), max)
 }
 
 function progressPercent(value: number) {
@@ -3964,6 +3977,15 @@ onUnmounted(() => {
                         persistent-hint
                         auto-grow
                         rows="2"
+                      />
+                      <v-text-field
+                        v-model.number="systemForm.search.metadata_concurrency"
+                        label="元数据搜索并发数"
+                        type="number"
+                        min="1"
+                        max="20"
+                        hint="限制同时访问元数据源的搜索任务数量。默认 3；遇到频率限制可降到 1 或 2。"
+                        persistent-hint
                       />
                     </div>
                   </v-card-text>

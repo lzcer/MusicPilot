@@ -37,7 +37,10 @@ from musicpilot.ports.metadata import TrackMetadata
 
 DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "proxy": {},
-    "search": {"exclude_keywords": DEFAULT_SEARCH_EXCLUDE_KEYWORDS},
+    "search": {
+        "exclude_keywords": DEFAULT_SEARCH_EXCLUDE_KEYWORDS,
+        "metadata_concurrency": 3,
+    },
 }
 
 logger = logging.getLogger(__name__)
