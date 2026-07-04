@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -614,7 +614,13 @@ class AppState:
     async def reload_indexers(self) -> None:
         self.reload_parser_catalog()
         sites = [_site_payload(site) for site in await self.repository.list_indexer_sites()]
-        self.indexers = build_nexusphp_indexers(sites, self.parser_catalog)
+        system_settings = await self.repository.get_system_settings()
+        proxy_url = _proxy_url(system_settings)
+        self.indexers = build_nexusphp_indexers(
+            sites,
+            self.parser_catalog,
+            proxy_url=proxy_url,
+        )
         self.pipeline.indexers = self.indexers
 
     async def migrate_legacy_runtime_config(self) -> None:
@@ -1173,6 +1179,10 @@ def create_app() -> FastAPI:
     @app.post("/api/sites/test", response_model=TestResponse)
     async def test_site(payload: SiteCreateRequest) -> TestResponse:
         parser = _supported_parser_or_422(state, payload.base_url)
+        proxy_url = None
+        if payload.use_proxy:
+            system_settings = await state.repository.get_system_settings()
+            proxy_url = _proxy_url(system_settings)
         crawler = NexusPHPCrawler(
             NexusPHPSiteConfig(
                 name=payload.name,
@@ -1181,7 +1191,8 @@ def create_app() -> FastAPI:
                 user_agent=payload.user_agent,
                 parser=parser,
                 max_concurrency=payload.max_concurrency,
-            )
+            ),
+            proxy_url=proxy_url,
         )
         result = await crawler.test_auth()
         return TestResponse(ok=result.ok, message=result.message)
@@ -3259,7 +3270,8 @@ async def _download_playlist_candidate_torrent_file(
         "Playlist candidate torrent downloading: "
         f"site={site.name}, title={resource.get('title') or ''}",
     )
-    return await _download_torrent_file(download_url, site)
+    proxy_url = _resolve_proxy_for_site(state, site)
+    return await _download_torrent_file(download_url, site, proxy_url=proxy_url)
 
 
 async def _scrape_playlist_candidate_items(
@@ -3665,7 +3677,8 @@ async def _submit_torrent_to_downloader(
     if site is None:
         torrent_hash = await state.downloader.add_torrent(download_url, category=category)
         return SubmittedTorrent(torrent_hash=torrent_hash)
-    torrent_data = await _download_torrent_file(download_url, site)
+    proxy_url = _resolve_proxy_for_site(state, site)
+    torrent_data = await _download_torrent_file(download_url, site, proxy_url=proxy_url)
     torrent_hash = await state.downloader.add_torrent_file(
         torrent_data,
         filename=_torrent_filename(resource, download_url),
@@ -3700,13 +3713,22 @@ async def _match_torrent_site(
     return None
 
 
-async def _download_torrent_file(download_url: str, site: IndexerSite) -> bytes:
+async def _download_torrent_file(
+    download_url: str,
+    site: IndexerSite,
+    proxy_url: str | None = None,
+) -> bytes:
     headers: dict[str, str] = {}
     if site.cookie:
         headers["Cookie"] = site.cookie
     if site.user_agent:
         headers["User-Agent"] = site.user_agent
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True, http2=True) as client:
+    async with httpx.AsyncClient(
+        timeout=30,
+        follow_redirects=True,
+        http2=True,
+        proxy=proxy_url,
+    ) as client:
         response = await client.get(download_url, headers=headers)
     response.raise_for_status()
     content = response.content
@@ -4397,6 +4419,7 @@ def _site_payload(site: IndexerSite) -> dict[str, object]:
         "cookie": site.cookie,
         "user_agent": site.user_agent,
         "max_concurrency": site.max_concurrency,
+        "use_proxy": site.use_proxy,
     }
 
 
@@ -5855,6 +5878,16 @@ def _proxy_url(settings_payload: dict[str, object]) -> str | None:
     if port:
         return f"http://{auth}{host}:{port}"
     return f"http://{auth}{host}"
+
+
+async def _resolve_proxy_for_site(
+    state: AppState,
+    site: IndexerSite | None,
+) -> str | None:
+    if site is None or not site.use_proxy:
+        return None
+    system_settings = await state.repository.get_system_settings()
+    return _proxy_url(system_settings)
 
 
 def _category_from_logger(name: str) -> str:

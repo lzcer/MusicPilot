@@ -1584,6 +1584,7 @@ class SqlAlchemyMediaRepository:
         cookie: str | None = None,
         user_agent: str | None = None,
         max_concurrency: int = 2,
+        use_proxy: bool = False,
     ) -> IndexerSite:
         async with self.database.session() as session:
             site = IndexerSite(
@@ -1592,6 +1593,7 @@ class SqlAlchemyMediaRepository:
                 cookie=cookie,
                 user_agent=user_agent,
                 max_concurrency=max_concurrency,
+                use_proxy=use_proxy,
             )
             session.add(site)
             await session.commit()
@@ -1607,6 +1609,7 @@ class SqlAlchemyMediaRepository:
         cookie: str | None = None,
         user_agent: str | None = None,
         max_concurrency: int = 2,
+        use_proxy: bool = False,
     ) -> IndexerSite | None:
         async with self.database.session() as session:
             result = await session.execute(select(IndexerSite).where(IndexerSite.id == site_id))
@@ -1618,6 +1621,7 @@ class SqlAlchemyMediaRepository:
             site.cookie = cookie
             site.user_agent = user_agent
             site.max_concurrency = max_concurrency
+            site.use_proxy = use_proxy
             await session.commit()
             await session.refresh(site)
             return site

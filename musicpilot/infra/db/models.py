@@ -222,6 +222,7 @@ class IndexerSite(TimestampMixin, Base):
     cookie: Mapped[str | None] = mapped_column(Text, nullable=True)
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
     max_concurrency: Mapped[int] = mapped_column(Integer, default=2)
+    use_proxy: Mapped[bool] = mapped_column(Boolean, default=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
 

@@ -189,6 +189,7 @@ type Site = {
   user_agent?: string | null
   parser?: ParserConfig
   max_concurrency: number
+  use_proxy: boolean
 }
 
 type DownloaderConfig = {
@@ -542,7 +543,8 @@ const siteForm = ref({
   base_url: '',
   cookie: '',
   user_agent: '',
-  max_concurrency: 2
+  max_concurrency: 2,
+  use_proxy: false
 })
 
 const downloaderForm = ref({
@@ -2046,7 +2048,8 @@ function openNewSiteDialog() {
     base_url: '',
     cookie: '',
     user_agent: '',
-    max_concurrency: 2
+    max_concurrency: 2,
+    use_proxy: false
   }
   siteDialog.value = true
 }
@@ -2058,7 +2061,8 @@ function editSite(site: Site) {
     base_url: site.base_url,
     cookie: site.cookie ?? '',
     user_agent: site.user_agent ?? '',
-    max_concurrency: site.max_concurrency
+    max_concurrency: site.max_concurrency,
+    use_proxy: site.use_proxy
   }
   siteDialog.value = true
 }
@@ -3623,7 +3627,16 @@ onUnmounted(() => {
                 </v-card-title>
                 <v-card-text>
                   <div class="muted">{{ site.base_url }}</div>
-                  <v-chip size="small" variant="tonal">{{ site.max_concurrency }} 并发</v-chip>
+                  <div class="mt-1">
+                    <v-chip size="small" variant="tonal">{{ site.max_concurrency }} 并发</v-chip>
+                    <v-chip
+                      v-if="site.use_proxy"
+                      size="small"
+                      color="primary"
+                      variant="tonal"
+                      class="ml-1"
+                    >代理</v-chip>
+                  </div>
                 </v-card-text>
               </v-card>
             </div>
@@ -4328,6 +4341,14 @@ onUnmounted(() => {
           <v-textarea v-model="siteForm.cookie" label="Cookie" rows="3" />
           <v-text-field v-model="siteForm.user_agent" label="User-Agent" />
           <v-text-field v-model.number="siteForm.max_concurrency" label="最大并发" type="number" />
+          <v-switch
+            v-model="siteForm.use_proxy"
+            color="primary"
+            density="compact"
+            hide-details
+            inset
+            label="使用系统代理"
+          />
         </v-card-text>
         <v-card-actions>
           <v-spacer />

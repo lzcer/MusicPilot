@@ -233,6 +233,7 @@ class SiteCreateRequest(BaseModel):
     cookie: str | None = None
     user_agent: str | None = None
     max_concurrency: int = Field(default=2, ge=1, le=10)
+    use_proxy: bool = False
 
 
 class SiteResponse(SiteCreateRequest):

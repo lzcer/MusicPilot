@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import re
@@ -48,9 +48,15 @@ class SiteAuthCheck:
 
 
 class NexusPHPCrawler:
-    def __init__(self, config: NexusPHPSiteConfig, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        config: NexusPHPSiteConfig,
+        client: httpx.AsyncClient | None = None,
+        proxy_url: str | None = None,
+    ) -> None:
         self.config = config
         self._client = client
+        self._proxy_url = proxy_url
         self._semaphore = asyncio.Semaphore(config.max_concurrency)
 
     @property
@@ -67,7 +73,7 @@ class NexusPHPCrawler:
 
         async with self._semaphore:
             if self._client is None:
-                async with httpx.AsyncClient(http2=True, timeout=20) as client:
+                async with httpx.AsyncClient(http2=True, timeout=20, proxy=self._proxy_url) as client:
                     html = await self._fetch(client, query, headers)
             else:
                 html = await self._fetch(self._client, query, headers)
@@ -84,6 +90,7 @@ class NexusPHPCrawler:
                     http2=True,
                     timeout=20,
                     follow_redirects=True,
+                    proxy=self._proxy_url,
                 ) as client:
                     response = await client.get(
                         urljoin(self.config.base_url, "torrents.php"),

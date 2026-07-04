@@ -62,13 +62,20 @@ def load_parser_catalog(path: Path) -> ParserCatalog:
 def build_nexusphp_indexers(
     sites: list[dict[str, Any]],
     catalog: ParserCatalog,
+    proxy_url: str | None = None,
 ) -> tuple[NexusPHPCrawler, ...]:
     crawlers: list[NexusPHPCrawler] = []
     for site in sites:
         entry = catalog.match(str(site.get("base_url", "")))
         if entry is None:
             continue
-        crawlers.append(NexusPHPCrawler(_site_config(site, entry)))
+        use_proxy = bool(site.get("use_proxy", False))
+        crawlers.append(
+            NexusPHPCrawler(
+                _site_config(site, entry),
+                proxy_url=proxy_url if use_proxy else None,
+            )
+        )
     return tuple(crawlers)
 
 
