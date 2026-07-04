@@ -3,6 +3,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        UV_DEFAULT_INDEX: ${UV_DEFAULT_INDEX:-https://pypi.org/simple}
+        UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:latest}
     environment:
       MP_APP_NAME: ${MP_APP_NAME:-MusicPilot}
       MP_LOG_LEVEL: ${MP_LOG_LEVEL:-INFO}

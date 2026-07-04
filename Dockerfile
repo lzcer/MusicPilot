@@ -1,3 +1,4 @@
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:latest
 FROM node:22-alpine AS frontend
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
@@ -5,8 +6,11 @@ RUN npm ci
 COPY frontend ./
 RUN npm run build
 
+FROM ${UV_IMAGE} AS uv
+
 FROM python:3.12-slim AS runtime
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+COPY --from=uv /uv /uvx /usr/local/bin/
+ARG UV_DEFAULT_INDEX=https://pypi.org/simple
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONMALLOC=malloc \
@@ -19,18 +23,35 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MP_INDEXER_PARSER_CONFIG=/config/sites.parser.yaml \
     MP_RUNTIME_CONFIG=/config/runtime.json
 WORKDIR /app
-COPY pyproject.toml README.md LICENSE ./
-COPY musicpilot ./musicpilot
-COPY config ./config
+COPY pyproject.toml ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     UV_HTTP_TIMEOUT=120 \
     UV_HTTP_RETRIES=5 \
     uv pip install \
       --system \
       --verbose \
-      --default-index https://pypi.org/simple \
-      . \
-    && mkdir -p /data /music /downloads /config \
+      --default-index "${UV_DEFAULT_INDEX}" \
+      "setuptools>=68" \
+      wheel \
+    && uv pip install \
+      --system \
+      --verbose \
+      --default-index "${UV_DEFAULT_INDEX}" \
+      -r pyproject.toml
+COPY README.md LICENSE ./
+COPY musicpilot ./musicpilot
+RUN --mount=type=cache,target=/root/.cache/uv \
+    UV_HTTP_TIMEOUT=120 \
+    UV_HTTP_RETRIES=5 \
+    uv pip install \
+      --system \
+      --verbose \
+      --default-index "${UV_DEFAULT_INDEX}" \
+      --no-deps \
+      --no-build-isolation \
+      .
+COPY config ./config
+RUN mkdir -p /data /music /downloads /config \
     && cp -n /app/config/sites.parser.yaml /config/sites.parser.yaml
 COPY --from=frontend /app/frontend/dist /app/frontend/dist
 EXPOSE 8000
