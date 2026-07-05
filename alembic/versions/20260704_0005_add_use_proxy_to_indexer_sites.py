@@ -20,7 +20,7 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     with op.batch_alter_table("indexer_sites") as batch_op:
         batch_op.add_column(
-            sa.Column("use_proxy", sa.Boolean(), nullable=False, server_default=sa.text("0")),
+            sa.Column("use_proxy", sa.Boolean(), nullable=False, server_default=sa.false()),
         )
 
 

@@ -124,7 +124,17 @@ git pull
 docker compose up -d --build
 ```
 
-### 4.1. Configuration Guide
+### 4.1. Optional PostgreSQL Database
+
+MusicPilot uses SQLite by default, which fits single-host and NAS deployments. For higher concurrency or an external database, change `MP_DATABASE_URL` in `.env` to a PostgreSQL connection string:
+
+```text
+MP_DATABASE_URL=postgresql+asyncpg://musicpilot:change-this-password@postgres:5432/musicpilot
+```
+
+Create the PostgreSQL database and user before starting MusicPilot. On startup, MusicPilot runs Alembic to initialize or upgrade the schema.
+
+### 4.2. Configuration Guide
 
 After the first startup, configure sites, downloaders, music libraries, organization rules, and notification channels in the Web UI.
 

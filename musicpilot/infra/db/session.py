@@ -8,8 +8,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+from alembic.config import Config
 from sqlalchemy import event
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from alembic import command
 from musicpilot.infra.db.models import Base
 
 logger = logging.getLogger(__name__)
@@ -45,8 +47,15 @@ class Database:
             _install_sqlite_timing(engine=self.engine)
 
     async def create_all(self) -> None:
+        if not self.database_url.startswith("sqlite"):
+            await self.run_migrations()
+            return
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+
+    async def run_migrations(self) -> None:
+        async with self.engine.begin() as conn:
+            await conn.run_sync(_run_alembic_upgrade)
 
     async def migrate_phase_one_schema(self) -> None:
         if not self.database_url.startswith("sqlite"):
@@ -173,6 +182,18 @@ def _ensure_sqlite_parent_dir(database_url: str) -> None:
     if path.parent == Path("."):
         return
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _run_alembic_upgrade(connection: Connection) -> None:
+    root = Path(__file__).resolve().parents[3]
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "alembic"))
+    config.set_main_option(
+        "sqlalchemy.url",
+        connection.engine.url.render_as_string(hide_password=False),
+    )
+    config.attributes["connection"] = connection
+    command.upgrade(config, "head")
 
 
 async def dispose_engine(engine: AsyncEngine) -> None:
