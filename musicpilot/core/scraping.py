@@ -106,6 +106,7 @@ class ScrapingFileResult:
     library_path: Path | None
     metadata: TrackMetadata
     status: Literal["success", "failed", "skipped"]
+    operation_type: ScrapingMode
     error_message: str | None = None
     stage: str = "completed"
     needs_metadata_update: bool = False
@@ -125,6 +126,7 @@ class ScrapingSummary:
 @dataclass(frozen=True, slots=True)
 class _PathOperationResult:
     path: Path
+    operation_type: ScrapingMode
     overwritten_existing: bool = False
 
 
@@ -216,6 +218,7 @@ class LocalMusicScraper:
                     library_path=None,
                     metadata=source_metadata,
                     status="failed",
+                    operation_type=config.mode,
                     error_message=str(exc) or exc.__class__.__name__,
                     stage=exc.__class__.__name__,
                 )
@@ -370,6 +373,7 @@ class LocalMusicScraper:
                             library_path=None,
                             metadata=source_metadata,
                             status="failed",
+                            operation_type=config.mode,
                             error_message=error_message,
                             stage=candidate_stage,
                             needs_metadata_update=needs_scrape,
@@ -402,6 +406,7 @@ class LocalMusicScraper:
                         library_path=None,
                         metadata=source_metadata,
                         status="failed",
+                        operation_type=config.mode,
                         error_message=error_message,
                         stage=candidate_stage,
                         needs_metadata_update=needs_scrape,
@@ -432,6 +437,7 @@ class LocalMusicScraper:
                             library_path=None,
                             metadata=source_metadata,
                             status="failed",
+                            operation_type=config.mode,
                             error_message="标签写入器不可用。",
                             stage="tag_writer",
                             needs_metadata_update=needs_scrape,
@@ -485,6 +491,7 @@ class LocalMusicScraper:
                         library_path=None,
                         metadata=metadata,
                         status="skipped",
+                        operation_type=config.mode,
                         error_message=error_message,
                         stage="skip_duplicate",
                         needs_metadata_update=needs_scrape,
@@ -520,6 +527,7 @@ class LocalMusicScraper:
                             library_path=None,
                             metadata=metadata,
                             status="skipped",
+                            operation_type=config.mode,
                             error_message=error_message,
                             stage="skip_smaller_duplicate",
                             needs_metadata_update=needs_scrape,
@@ -534,6 +542,7 @@ class LocalMusicScraper:
                 overwrite_duplicate = True
 
         overwritten_existing_target = False
+        operation_type = config.mode
         if config.mode == "mapped":
             mapped_result = await asyncio.to_thread(
                 _copy_to_mapping,
@@ -543,6 +552,7 @@ class LocalMusicScraper:
                 overwrite=not _will_classify_or_rename(config),
             )
             working_file = mapped_result.path
+            operation_type = mapped_result.operation_type
             overwritten_existing_target = mapped_result.overwritten_existing
             mapped_files += 1
         elif config.mode == "copy":
@@ -554,6 +564,7 @@ class LocalMusicScraper:
                 overwrite=not _will_classify_or_rename(config),
             )
             working_file = mapped_result.path
+            operation_type = mapped_result.operation_type
             overwritten_existing_target = mapped_result.overwritten_existing
             mapped_files += 1
 
@@ -597,6 +608,7 @@ class LocalMusicScraper:
                 library_path=final_file,
                 metadata=metadata,
                 status="success",
+                operation_type=operation_type,
                 error_message=remark,
                 needs_metadata_update=needs_scrape,
                 candidate_count=candidate_count,
@@ -1040,7 +1052,7 @@ def _copy_to_mapping(
     if not overwrite:
         target = _unique_path(target)
     elif _same_existing_file(source_file, target):
-        return _PathOperationResult(target)
+        return _PathOperationResult(target, operation_type="mapped")
     overwritten_existing = overwrite and target.exists()
     target.parent.mkdir(parents=True, exist_ok=True)
     if hardlink:
@@ -1048,13 +1060,21 @@ def _copy_to_mapping(
             if overwritten_existing:
                 _remove_existing_target(target)
             os.link(source_file, target)
-            return _PathOperationResult(target, overwritten_existing=overwritten_existing)
+            return _PathOperationResult(
+                target,
+                operation_type="mapped",
+                overwritten_existing=overwritten_existing,
+            )
         except OSError:
             pass
     if overwritten_existing:
         _remove_existing_target(target)
     shutil.copy2(source_file, target)
-    return _PathOperationResult(target, overwritten_existing=overwritten_existing)
+    return _PathOperationResult(
+        target,
+        operation_type="copy",
+        overwritten_existing=overwritten_existing,
+    )
 
 
 def _classify_or_rename(
@@ -1081,7 +1101,7 @@ def _classify_or_rename(
     if not overwrite:
         target = _unique_path(target, current=path)
     if target == path or _same_existing_file(path, target):
-        return _PathOperationResult(path)
+        return _PathOperationResult(path, operation_type=config.mode)
     target.parent.mkdir(parents=True, exist_ok=True)
     overwritten_existing = overwrite and target.exists()
     if overwritten_existing:
@@ -1089,7 +1109,11 @@ def _classify_or_rename(
     shutil.move(str(path), str(target))
     # Clean up empty parent directories left behind after the move
     _remove_empty_parents(path.parent, config)
-    return _PathOperationResult(target, overwritten_existing=overwritten_existing)
+    return _PathOperationResult(
+        target,
+        operation_type=config.mode,
+        overwritten_existing=overwritten_existing,
+    )
 
 
 def _remove_empty_parents(source_dir: Path, config: ScrapingConfig) -> None:
