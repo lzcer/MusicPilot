@@ -70,6 +70,26 @@ class MultiSourceMusicProvider:
             return candidates
         return ()
 
+    async def search_metadata_from_source(
+        self,
+        source: str,
+        *,
+        title: str,
+        artist: str | None = None,
+        limit: int = 5,
+    ) -> tuple[TrackMetadata, ...]:
+        if source not in _RESOURCE_ORDER:
+            raise ValueError(f"Unsupported metadata source: {source}")
+        return await self._run_with_source_gate(
+            source,
+            lambda: self._metadata_batch_for_resource(
+                source,
+                title=title,
+                artist=artist,
+                limit=limit,
+            ),
+        )
+
     async def iter_metadata_batches(
         self,
         *,

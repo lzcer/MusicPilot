@@ -119,6 +119,8 @@ from musicpilot.infra.api.schemas import (
     MediaDeleteMode,
     MediaFilePageResponse,
     MediaFileResponse,
+    MediaManualOrganizeRequest,
+    MediaMetadataSearchResponse,
     MediaRetryRequest,
     MediaRetryResponse,
     MediaServerCreateRequest,
@@ -144,6 +146,7 @@ from musicpilot.infra.api.schemas import (
     PlaylistImportUrlPreviewRequest,
     PlaylistImportUrlPreviewResponse,
     PlaylistImportUrlRequest,
+    PlaylistLibrarySyncRequest,
     PlaylistLibrarySyncResponse,
     PlaylistResponse,
     PlaylistTrackDownloadResponse,
@@ -160,6 +163,8 @@ from musicpilot.infra.api.schemas import (
     SystemSettingsRequest,
     SystemSettingsResponse,
     TestResponse,
+    TrackMetadataResponse,
+    UpdateArtistRequest,
 )
 from musicpilot.infra.auth import issue_session, require_session
 from musicpilot.infra.config import Settings
@@ -492,6 +497,7 @@ class ManualScrapeExecutor:
             for item in payload.get("source_files", [])
             if isinstance(item, str) and item
         )
+        manual_metadata = _manual_metadata_by_source_file(payload.get("manual_metadata"))
         if not source_files:
             raise ValueError("Manual scrape task payload is incomplete.")
         settings_payload = await self.state.repository.get_system_settings()
@@ -503,6 +509,7 @@ class ManualScrapeExecutor:
             config,
             task_name,
             source_files,
+            manual_metadata=manual_metadata,
             use_task_manager=False,
         )
         return TaskExecutionResult(result=_scraping_summary_result(summary))
@@ -1809,7 +1816,10 @@ def create_app() -> FastAPI:
         "/api/playlists/{playlist_id}/sync-to-library",
         response_model=PlaylistLibrarySyncResponse,
     )
-    async def sync_playlist_to_library(playlist_id: int) -> PlaylistLibrarySyncResponse:
+    async def sync_playlist_to_library(
+        playlist_id: int,
+        payload: PlaylistLibrarySyncRequest | None = None,
+    ) -> PlaylistLibrarySyncResponse:
         playlist = await state.repository.get_playlist(playlist_id)
         if playlist is None:
             raise HTTPException(status_code=404, detail="Playlist not found.")
@@ -1817,6 +1827,8 @@ def create_app() -> FastAPI:
             library_playlist_id, synced_count, mode = await _sync_playlist_to_media_server(
                 state,
                 playlist,
+                media_server_id=payload.media_server_id if payload else None,
+                public=payload.public if payload else True,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -2083,6 +2095,78 @@ def create_app() -> FastAPI:
             failed_files=summary.failed_files,
         )
 
+    @app.get("/api/media/metadata-search", response_model=MediaMetadataSearchResponse)
+    async def search_media_metadata(
+        q: str = Query(min_length=1),
+        source: str = Query(default="qmusic"),
+        limit: int = Query(default=8, ge=1, le=20),
+    ) -> MediaMetadataSearchResponse:
+        query = q.strip()
+        source_name = source.strip() or "qmusic"
+        try:
+            results = await _search_manual_metadata_candidates(
+                state,
+                query=query,
+                source=source_name,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"元数据搜索失败：{exc}") from exc
+        return MediaMetadataSearchResponse(
+            query=query,
+            source=source_name,
+            results=[_track_metadata_response(item) for item in results],
+        )
+
+    @app.post("/api/media/{media_id}/manual-organize", response_model=FileOrganizeResponse)
+    async def manual_organize_media(
+        media_id: int,
+        payload: MediaManualOrganizeRequest,
+    ) -> FileOrganizeResponse:
+        media = await state.repository.get_media_file(media_id)
+        if media is None:
+            raise HTTPException(status_code=404, detail="Media record not found.")
+        source_path = Path(media.source_path)
+        source_is_file = await asyncio.to_thread(
+            lambda: source_path.exists() and source_path.is_file()
+        )
+        if not source_is_file:
+            raise HTTPException(status_code=404, detail="源文件不存在，无法手动整理。")
+        settings_payload = await state.repository.get_system_settings()
+        config = scraping_config_from_payload(settings_payload)
+        if not config.enabled:
+            raise HTTPException(status_code=409, detail="请先在刮削设置中开启刮削")
+        metadata = _track_metadata_from_manual_payload(payload)
+        try:
+            task_id = await state.task_manager.enqueue(
+                TaskCreate(
+                    task_type="MANUAL_SCRAPE",
+                    payload={
+                        "task_name": f"manual metadata {source_path.name}",
+                        "source_files": [str(source_path)],
+                        "manual_metadata": {
+                            str(source_path): [_track_metadata_payload(metadata)],
+                        },
+                    },
+                    resource_keys=["scraper"],
+                )
+            )
+            task = await state.task_manager.wait_for_task(task_id)
+            if task.status != "SUCCEEDED":
+                raise RuntimeError(
+                    task.error_message or f"Manual scrape failed: {source_path.name}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            state.add_log(
+                "metadata",
+                f"Manual metadata scraping failed for {source_path}: {exc}",
+                "ERROR",
+            )
+            raise HTTPException(status_code=502, detail=f"手动整理失败：{exc}") from exc
+        return _file_organize_response_from_task_result(task.result or {})
+
     @app.delete("/api/media/{media_id}", status_code=204)
     async def delete_media_file(media_id: int, mode: MediaDeleteMode = "record_only") -> None:
         media = await state.repository.get_media_file(media_id)
@@ -2213,6 +2297,28 @@ def create_app() -> FastAPI:
             state.add_log(
                 "artist",
                 f"已合并歌手 {payload.source_id} → {payload.target_id} ({artist_info.name})",
+                "INFO",
+            )
+            return ArtistResponse(
+                id=artist_info.id,
+                name=artist_info.name,
+                normalized_name=artist_info.normalized_name,
+                aliases=[ArtistAliasResponse(alias=a) for a in artist_info.aliases],
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.patch("/api/artists/{artist_id}", response_model=ArtistResponse)
+    async def update_artist(artist_id: int, payload: UpdateArtistRequest) -> ArtistResponse:
+        try:
+            artist_info = await state.artist_service.update_artist(
+                artist_id,
+                name=payload.name,
+                aliases=tuple(payload.aliases),
+            )
+            state.add_log(
+                "artist",
+                f"已更新歌手 {artist_id}: {artist_info.name}",
                 "INFO",
             )
             return ArtistResponse(
@@ -4021,6 +4127,70 @@ def _track_metadata_payload(metadata: TrackMetadata) -> dict[str, object]:
     return dataclasses.asdict(metadata)
 
 
+def _track_metadata_response(metadata: TrackMetadata) -> TrackMetadataResponse:
+    extra = dict(metadata.extra or {})
+    return TrackMetadataResponse(
+        title=metadata.title,
+        artist=metadata.artist,
+        album=metadata.album,
+        year=metadata.year,
+        track_number=metadata.track_number,
+        lyrics=metadata.lyrics,
+        cover_url=metadata.cover_url,
+        source=extra.get("source"),
+        source_id=extra.get("source_id"),
+        extra=extra,
+    )
+
+
+def _track_metadata_from_manual_payload(payload: MediaManualOrganizeRequest) -> TrackMetadata:
+    return TrackMetadata(
+        title=payload.title.strip(),
+        artist=_optional_string(payload.artist),
+        album=_optional_string(payload.album),
+        year=payload.year,
+        track_number=payload.track_number,
+        lyrics=_optional_string(payload.lyrics),
+        cover_url=_optional_string(payload.cover_url),
+        extra=dict(payload.extra or {}),
+    )
+
+
+async def _search_manual_metadata_candidates(
+    state: AppState,
+    *,
+    query: str,
+    source: str,
+    limit: int,
+) -> tuple[TrackMetadata, ...]:
+    if source not in {"qmusic", "netease", "migu", "kuwo"}:
+        raise ValueError("不支持的元数据源。")
+    for provider in state.scraping_metadata.providers:
+        search = getattr(provider, "search_metadata_from_source", None)
+        if search is not None:
+            return await search(source, title=query, artist=None, limit=limit)
+    return await state.scraping_metadata.search_metadata(title=query, limit=limit)
+
+
+def _manual_metadata_by_source_file(value: object) -> dict[Path, tuple[TrackMetadata, ...]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[Path, tuple[TrackMetadata, ...]] = {}
+    for raw_path, raw_items in value.items():
+        if not isinstance(raw_path, str):
+            continue
+        items = raw_items if isinstance(raw_items, list) else [raw_items]
+        metadata_items = tuple(
+            metadata
+            for item in items
+            if isinstance(item, dict)
+            and (metadata := _track_metadata_from_payload(item)) is not None
+        )
+        if metadata_items:
+            result[Path(raw_path)] = metadata_items
+    return result
+
+
 async def _auto_build_artist_library(state: AppState) -> None:
     """Build artist library in background with a timeout."""
     if state.artist_build_lock.locked():
@@ -4829,10 +4999,21 @@ def _media_server_track_payload(track: object) -> dict[str, Any]:
 async def _sync_playlist_to_media_server(
     state: AppState,
     playlist: Playlist,
+    *,
+    media_server_id: str | None = None,
+    public: bool = True,
 ) -> tuple[str | None, int, str]:
-    server = await state.repository.default_media_server()
+    server = (
+        await state.repository.get_media_server(media_server_id)
+        if media_server_id
+        else await state.repository.default_media_server()
+    )
     if server is None:
+        if media_server_id:
+            raise ValueError("选择的媒体服务器用户不存在。")
         raise ValueError("请先配置并启用默认媒体服务器。")
+    if not server.enabled:
+        raise ValueError("请选择已启用的媒体服务器用户。")
     matched_tracks = await state.repository.list_matched_playlist_library_tracks(playlist.id)
     song_ids = [
         library_track.navidrome_id
@@ -4842,11 +5023,12 @@ async def _sync_playlist_to_media_server(
     if not song_ids:
         raise ValueError("该歌单没有已匹配到音乐库的歌曲。")
     client = build_media_server_client(server)
-    result = await client.sync_playlist(name=playlist.name, song_ids=song_ids, public=True)
+    result = await client.sync_playlist(name=playlist.name, song_ids=song_ids, public=public)
     state.add_log(
         "playlist",
         "Playlist synced to music library: "
         f"playlist_id={playlist.id}, name={playlist.name}, "
+        f"media_server={server.name}, username={server.username or '-'}, public={public}, "
         f"library_playlist_id={result.playlist_id or '-'}, "
         f"mode={result.mode}, tracks={result.synced_count}",
     )
@@ -5098,6 +5280,7 @@ async def _scrape_manual_source_files(
     task_name: str,
     source_files: tuple[Path, ...],
     *,
+    manual_metadata: dict[Path, tuple[TrackMetadata, ...]] | None = None,
     use_task_manager: bool = True,
 ) -> ScrapingSummary:
     try:
@@ -5155,6 +5338,11 @@ async def _scrape_manual_source_files(
         )
 
     async def run_scrape() -> ScrapingSummary:
+        forced_metadata = {
+            source_file: candidates[0]
+            for source_file, candidates in (manual_metadata or {}).items()
+            if candidates
+        }
         return await state.scraper.process_download(
             task_name=task_name,
             save_path=None,
@@ -5162,6 +5350,7 @@ async def _scrape_manual_source_files(
             source_files=source_files,
             library_tracks=library_tracks,
             media_history=media_history,
+            forced_metadata=forced_metadata,
             on_file_result=record_file_result,
         )
 

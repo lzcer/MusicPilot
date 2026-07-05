@@ -163,6 +163,7 @@ class LocalMusicScraper:
         library_tracks: tuple[LibraryTrackSnapshot, ...] = (),
         media_history: tuple[LibraryTrackSnapshot, ...] = (),
         cached_metadata: dict[Path, tuple[TrackMetadata, ...]] | None = None,
+        forced_metadata: dict[Path, TrackMetadata] | None = None,
         on_file_result: Callable[[ScrapingFileResult], Awaitable[None]] | None = None,
     ) -> ScrapingSummary:
         if not config.enabled:
@@ -206,6 +207,7 @@ class LocalMusicScraper:
                     media_history,
                     dir_inferred=dir_inferred,
                     cached_candidates=(cached_metadata or {}).get(source_file, ()),
+                    forced_metadata=(forced_metadata or {}).get(source_file),
                 )
             except Exception as exc:
                 logger.exception("Scraping file failed unexpectedly: source=%s", source_file)
@@ -247,6 +249,7 @@ class LocalMusicScraper:
         media_history: tuple[LibraryTrackSnapshot, ...],
         dir_inferred: dict[Path, TrackMetadata] | None = None,
         cached_candidates: tuple[TrackMetadata, ...] = (),
+        forced_metadata: TrackMetadata | None = None,
     ) -> tuple[ScrapingFileResult, int, int, int]:
         working_file = source_file
         mapped_files = 0
@@ -270,10 +273,11 @@ class LocalMusicScraper:
         candidate_stage = "metadata_candidate"
         tag_writer = self.tag_writer
         metadata_gain: tuple[RequiredMetadata, ...] = ()
+        should_write_tags = forced_metadata is not None
         logger.info(
             "Scraping file input: source=%s, source_metadata=%s, dir_inferred=%s, "
             "match_metadata=%s, fallback_metadata=%s, scrape_fields=%s, "
-            "missing_before=%s, cached_candidates=%s",
+            "missing_before=%s, cached_candidates=%s, forced_metadata=%s",
             source_file,
             _metadata_log_text(source_metadata),
             _metadata_log_text(dir_meta),
@@ -282,8 +286,39 @@ class LocalMusicScraper:
             scrape_fields,
             missing_before,
             _metadata_candidates_log_text(cached_candidates),
+            _metadata_log_text(forced_metadata),
         )
-        if needs_scrape:
+        if forced_metadata is not None:
+            metadata = _merge_metadata(source_metadata, forced_metadata)
+            candidate_count = 1
+            candidate_stage = "manual_metadata"
+            missing_required = _missing_metadata_fields(metadata, config.required_metadata)
+            if missing_required:
+                error_message = f"手动元数据缺少必需字段：{', '.join(missing_required)}"
+                logger.info(
+                    "Scraping file result: source=%s, status=failed, stage=manual_metadata, "
+                    "metadata=%s, error=%s",
+                    source_file,
+                    _metadata_log_text(metadata),
+                    error_message,
+                )
+                return (
+                    ScrapingFileResult(
+                        source_path=source_file,
+                        library_path=None,
+                        metadata=metadata,
+                        status="failed",
+                        operation_type=config.mode,
+                        error_message=error_message,
+                        stage=candidate_stage,
+                        needs_metadata_update=True,
+                        candidate_count=candidate_count,
+                    ),
+                    0,
+                    0,
+                    0,
+                )
+        elif needs_scrape:
             candidates = cached_candidates
             looked_up = await _select_metadata_candidate(
                 match_metadata,
@@ -422,31 +457,30 @@ class LocalMusicScraper:
                     metadata,
                     missing_before,
                 )
-            if tag_writer is None:
-                if metadata_gain:
-                    logger.info(
-                        "Scraping file result: source=%s, status=failed, stage=tag_writer, "
-                        "metadata=%s, metadata_gain=%s",
-                        source_file,
-                        _metadata_log_text(source_metadata),
-                        metadata_gain,
-                    )
-                    return (
-                        ScrapingFileResult(
-                            source_path=source_file,
-                            library_path=None,
-                            metadata=source_metadata,
-                            status="failed",
-                            operation_type=config.mode,
-                            error_message="标签写入器不可用。",
-                            stage="tag_writer",
-                            needs_metadata_update=needs_scrape,
-                            candidate_count=candidate_count,
-                        ),
-                        0,
-                        0,
-                        0,
-                    )
+        if tag_writer is None and (should_write_tags or metadata_gain):
+            logger.info(
+                "Scraping file result: source=%s, status=failed, stage=tag_writer, "
+                "metadata=%s, metadata_gain=%s",
+                source_file,
+                _metadata_log_text(source_metadata),
+                metadata_gain,
+            )
+            return (
+                ScrapingFileResult(
+                    source_path=source_file,
+                    library_path=None,
+                    metadata=source_metadata,
+                    status="failed",
+                    operation_type=config.mode,
+                    error_message="标签写入器不可用。",
+                    stage="tag_writer",
+                    needs_metadata_update=forced_metadata is not None or needs_scrape,
+                    candidate_count=candidate_count,
+                ),
+                0,
+                0,
+                0,
+            )
 
         # Resolve artist to canonical name
         if self.artist_service is not None:
@@ -568,7 +602,7 @@ class LocalMusicScraper:
             overwritten_existing_target = mapped_result.overwritten_existing
             mapped_files += 1
 
-        if metadata_gain:
+        if should_write_tags or metadata_gain:
             assert tag_writer is not None
             await tag_writer.write(working_file, metadata)
             updated_files += 1
@@ -610,7 +644,7 @@ class LocalMusicScraper:
                 status="success",
                 operation_type=operation_type,
                 error_message=remark,
-                needs_metadata_update=needs_scrape,
+                needs_metadata_update=forced_metadata is not None or needs_scrape,
                 candidate_count=candidate_count,
             ),
             mapped_files,

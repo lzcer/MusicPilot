@@ -257,6 +257,10 @@ class SqlAlchemyMediaRepository:
             )
             return list(result.scalars().all())
 
+    async def get_media_server(self, server_id: str) -> MediaServerConfig | None:
+        async with self.database.session() as session:
+            return await session.get(MediaServerConfig, server_id)
+
     async def delete_media_server(self, server_id: str) -> bool:
         async with self.database.session() as session:
             row = await session.get(MediaServerConfig, server_id)
@@ -1838,6 +1842,32 @@ class SqlAlchemyMediaRepository:
                 external_ids=external_ids,
             )
             session.add(artist)
+            await session.commit()
+            await session.refresh(artist)
+            return artist
+
+    async def update_artist_profile(
+        self,
+        artist_id: int,
+        *,
+        name: str,
+        normalized_name: str,
+        aliases: tuple[tuple[str, str], ...],
+    ) -> Artist | None:
+        async with self.database.session() as session:
+            artist = await session.get(Artist, artist_id)
+            if artist is None:
+                return None
+            artist.name = name
+            artist.normalized_name = normalized_name
+            await session.execute(delete(ArtistAlias).where(ArtistAlias.artist_id == artist_id))
+            seen: set[str] = set()
+            for alias, source in aliases:
+                alias_name = alias.strip()
+                if not alias_name or alias_name in seen:
+                    continue
+                session.add(ArtistAlias(artist_id=artist_id, alias=alias_name, source=source))
+                seen.add(alias_name)
             await session.commit()
             await session.refresh(artist)
             return artist

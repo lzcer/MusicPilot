@@ -271,6 +271,53 @@ class ArtistService:
         await self._repo.delete_artist(source_id)
         return await self._get_artist_info(target_id)
 
+    async def update_artist(
+        self,
+        artist_id: int,
+        *,
+        name: str,
+        aliases: tuple[str, ...],
+    ) -> ArtistInfo:
+        artist = await self._repo.get_artist(artist_id)
+        if artist is None:
+            raise ValueError("Artist not found")
+        canonical_name = name.strip()
+        if not canonical_name:
+            raise ValueError("Artist name cannot be empty")
+        normalized = normalize_artist_name(canonical_name)
+        existing = await self._repo.find_artist_by_normalized(normalized)
+        if existing is not None and existing.id != artist_id:
+            raise ValueError(f"Artist name already exists: {canonical_name}")
+        alias_owner = await self._repo.find_artist_id_by_alias(canonical_name)
+        if alias_owner is not None and alias_owner != artist_id:
+            raise ValueError(f"Artist name already exists as alias: {canonical_name}")
+
+        clean_aliases: list[str] = []
+        for alias in _unique_artist_names(aliases):
+            alias_normalized = normalize_artist_name(alias)
+            if alias_normalized == normalized:
+                continue
+            alias_owner = await self._repo.find_artist_id_by_alias(alias)
+            if alias_owner is not None and alias_owner != artist_id:
+                raise ValueError(f"Artist alias already belongs to another artist: {alias}")
+            alias_artist = await self._repo.find_artist_by_normalized(alias_normalized)
+            if alias_artist is not None and alias_artist.id != artist_id:
+                raise ValueError(f"Artist alias conflicts with another artist: {alias}")
+            clean_aliases.append(alias)
+
+        updated = await self._repo.update_artist_profile(
+            artist_id,
+            name=canonical_name,
+            normalized_name=normalized,
+            aliases=(
+                (canonical_name, "primary"),
+                *((alias, "user") for alias in clean_aliases),
+            ),
+        )
+        if updated is None:
+            raise ValueError("Artist not found")
+        return await self._get_artist_info(artist_id)
+
     async def build_library_from_media_files(
         self,
         user_agent: str = "MusicPilot/0.1.0",

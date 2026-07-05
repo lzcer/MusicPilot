@@ -115,6 +115,25 @@ type MediaFile = {
   track_number?: number | null
 }
 
+type TrackMetadata = {
+  title: string
+  artist?: string | null
+  album?: string | null
+  year?: number | null
+  track_number?: number | null
+  lyrics?: string | null
+  cover_url?: string | null
+  source?: string | null
+  source_id?: string | null
+  extra: Record<string, string>
+}
+
+type MetadataSearchResponse = {
+  query: string
+  source: string
+  results: TrackMetadata[]
+}
+
 type FileEntry = {
   name: string
   path: string
@@ -376,6 +395,12 @@ type PlaylistLibrarySyncResponse = {
   mode?: string
 }
 
+type PlaylistLibrarySyncForm = {
+  playlist: Playlist | null
+  media_server_id: string
+  public: boolean
+}
+
 type PageResponse<T> = {
   items: T[]
   total: number
@@ -500,6 +525,24 @@ const mediaRetrying = ref(false)
 const mediaRetryDialog = ref(false)
 const pendingMediaRetryIds = ref<number[]>([])
 const pendingMediaRetryLabel = ref('')
+const mediaManualDialog = ref(false)
+const mediaMetadataSearchDialog = ref(false)
+const mediaManualSubmitting = ref(false)
+const mediaMetadataSearching = ref(false)
+const manualMedia = ref<MediaFile | null>(null)
+const manualMetadataSearchQuery = ref('')
+const manualMetadataSource = ref('qmusic')
+const manualMetadataResults = ref<TrackMetadata[]>([])
+const manualMetadataForm = ref({
+  title: '',
+  artist: '',
+  album: '',
+  year: null as number | null,
+  track_number: null as number | null,
+  lyrics: '',
+  cover_url: '',
+  extra: {} as Record<string, string>
+})
 const mediaTableHeaders = [
   { title: '', key: 'select', sortable: false, width: 48 },
   { title: '标题', key: 'title', sortable: false, width: 160 },
@@ -510,7 +553,7 @@ const mediaTableHeaders = [
   { title: '状态', key: 'status', sortable: false, width: 90 },
   { title: '文件路径', key: 'path', sortable: false, width: 520 },
   { title: '备注', key: 'remark', sortable: false, width: 180 },
-  { title: '操作', key: 'actions', sortable: false, width: 80 },
+  { title: '操作', key: 'actions', sortable: false, width: 120 },
 ]
 const fileRootType = ref<FileRootType>('source')
 const fileEntries = ref<FileEntry[]>([])
@@ -565,7 +608,13 @@ const availablePlaylistLoading = ref(false)
 const playlistTrackLoading = ref(false)
 const downloadItemsLoading = ref(false)
 const playlistDownloading = ref(false)
+const playlistLibrarySyncDialog = ref(false)
 const playlistLibrarySyncingIds = ref<number[]>([])
+const playlistLibrarySyncForm = ref<PlaylistLibrarySyncForm>({
+  playlist: null,
+  media_server_id: '',
+  public: true
+})
 const playlistTrackDownloadingIds = ref<number[]>([])
 const deleting = ref(false)
 const downloadDeleting = ref(false)
@@ -582,6 +631,9 @@ const artistPageSize = ref(20)
 const artistTotal = ref(0)
 const artistLoading = ref(false)
 const artistBuilding = ref(false)
+const artistEditDialog = ref(false)
+const artistEditSaving = ref(false)
+const artistEditForm = ref({ id: 0, name: '', aliases: '' })
 const artistAliasDialog = ref(false)
 const artistAliasForm = ref({ artist_id: 0, alias: '', source: 'user' })
 const artistMergeDialog = ref(false)
@@ -717,6 +769,17 @@ const fileRootTypeOptions = [
   { title: '映射目录', value: 'mapped' }
 ]
 
+const metadataSourceOptions = [
+  { title: 'QQ音乐', value: 'qmusic' },
+  { title: '网易云音乐', value: 'netease' },
+  { title: '咪咕音乐', value: 'migu' },
+  { title: '酷我音乐', value: 'kuwo' }
+]
+
+function metadataSourceLabel(source?: string | null) {
+  return metadataSourceOptions.find((option) => option.value === source)?.title || source || 'QQ音乐'
+}
+
 const playlistTrackDownloadStatusOptions = [
   { title: '全部下载状态', value: '' },
   { title: '等待', value: 'waiting' },
@@ -772,6 +835,16 @@ const navGroups = [
 const pageTitle = computed(() => navItems.find((item) => item.value === activePage.value)?.title ?? 'MusicPilot')
 
 const searchLoading = computed(() => metadataSearchLoading.value || torrentSearchLoading.value)
+
+const enabledMediaServerOptions = computed(() =>
+  mediaServers.value
+    .filter((item) => item.enabled && item.id)
+    .map((item) => ({
+      title: `${item.username || item.name}${item.is_default ? '（默认）' : ''}`,
+      subtitle: item.name,
+      value: item.id || ''
+    }))
+)
 
 const dashboardMetricCards = computed<DashboardMetric[]>(() => {
   const data = dashboard.value
@@ -1455,6 +1528,98 @@ function retrySingleMedia(row: MediaFile) {
   mediaRetryDialog.value = true
 }
 
+function openManualOrganize(row: MediaFile) {
+  manualMedia.value = row
+  manualMetadataForm.value = {
+    title: row.title || '',
+    artist: row.artist || '',
+    album: row.album || '',
+    year: row.year ?? null,
+    track_number: row.track_number ?? null,
+    lyrics: '',
+    cover_url: '',
+    extra: {}
+  }
+  manualMetadataSearchQuery.value = [row.title, row.artist].filter(Boolean).join(' ') || row.source_path
+  manualMetadataSource.value = 'qmusic'
+  manualMetadataResults.value = []
+  mediaManualDialog.value = true
+}
+
+async function searchManualMetadata() {
+  const query = trimmedInput(manualMetadataSearchQuery.value)
+  if (!query) {
+    notify('请输入搜索关键词', 'warning')
+    return
+  }
+  mediaMetadataSearching.value = true
+  mediaMetadataSearchDialog.value = true
+  try {
+    const params = new URLSearchParams({
+      q: query,
+      source: manualMetadataSource.value,
+      limit: '12'
+    })
+    const response = await api<MetadataSearchResponse>(`/api/media/metadata-search?${params.toString()}`)
+    manualMetadataResults.value = response.results
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '元数据搜索失败', 'error')
+    manualMetadataResults.value = []
+  } finally {
+    mediaMetadataSearching.value = false
+  }
+}
+
+function selectManualMetadata(metadata: TrackMetadata) {
+  manualMetadataForm.value = {
+    title: metadata.title || manualMetadataForm.value.title,
+    artist: metadata.artist || '',
+    album: metadata.album || '',
+    year: metadata.year ?? null,
+    track_number: metadata.track_number ?? null,
+    lyrics: metadata.lyrics || '',
+    cover_url: metadata.cover_url || '',
+    extra: metadata.extra || {}
+  }
+  mediaMetadataSearchDialog.value = false
+}
+
+async function confirmManualOrganize() {
+  const row = manualMedia.value
+  if (!row || mediaManualSubmitting.value) return
+  const title = trimmedInput(manualMetadataForm.value.title)
+  if (!title) {
+    notify('标题不能为空', 'warning')
+    return
+  }
+  mediaManualSubmitting.value = true
+  try {
+    const form = manualMetadataForm.value
+    const result = await api<FileOrganizeResponse>(`/api/media/${row.id}/manual-organize`, {
+      method: 'POST',
+      body: JSON.stringify({
+        title,
+        artist: trimmedInput(form.artist) || null,
+        album: trimmedInput(form.album) || null,
+        year: form.year,
+        track_number: form.track_number,
+        lyrics: trimmedInput(form.lyrics) || null,
+        cover_url: trimmedInput(form.cover_url) || null,
+        extra: form.extra || {}
+      })
+    })
+    mediaManualDialog.value = false
+    manualMedia.value = null
+    await loadMedia()
+    notify(`手动整理完成：文件 ${result.source_files}，失败 ${result.failed_files}`)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '手动整理失败', 'error')
+    await loadMedia()
+  } finally {
+    mediaManualSubmitting.value = false
+  }
+}
+
 function retrySelectedMedia() {
   const ids = [...selectedMediaIds.value]
   if (!ids.length) return
@@ -1789,6 +1954,53 @@ async function confirmClearAndRebuildArtistLibrary() {
   }
 }
 
+function openArtistEditDialog(artist: Artist) {
+  artistEditForm.value = {
+    id: artist.id,
+    name: artist.name,
+    aliases: artist.aliases.map((item) => item.alias).join('\n')
+  }
+  artistEditDialog.value = true
+}
+
+function artistEditAliases() {
+  const seen = new Set<string>()
+  const aliases: string[] = []
+  for (const line of artistEditForm.value.aliases.split(/\r?\n/)) {
+    const alias = trimmedInput(line)
+    if (!alias || alias === trimmedInput(artistEditForm.value.name) || seen.has(alias)) continue
+    seen.add(alias)
+    aliases.push(alias)
+  }
+  return aliases
+}
+
+async function saveArtistEdit() {
+  const id = artistEditForm.value.id
+  const name = trimmedInput(artistEditForm.value.name)
+  if (!id || !name) {
+    notify('歌手名不能为空', 'warning')
+    return
+  }
+  artistEditSaving.value = true
+  try {
+    await api<Artist>(`/api/artists/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        name,
+        aliases: artistEditAliases()
+      })
+    })
+    await loadArtists()
+    artistEditDialog.value = false
+    notify('歌手已更新')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '更新歌手失败', 'error')
+  } finally {
+    artistEditSaving.value = false
+  }
+}
+
 async function openArtistAliasDialog(artist: Artist) {
   artistAliasForm.value = { artist_id: artist.id, alias: '', source: 'user' }
   artistAliasDialog.value = true
@@ -2068,15 +2280,43 @@ function isPlaylistSyncingToLibrary(playlistId: number) {
   return playlistLibrarySyncingIds.value.includes(playlistId)
 }
 
-async function syncPlaylistToLibrary(playlist: Playlist) {
+async function openPlaylistLibrarySyncDialog(playlist: Playlist) {
+  if (!mediaServers.value.length) {
+    await loadMediaServers()
+  }
+  const defaultServer = mediaServers.value.find((item) => item.enabled && item.is_default && item.id)
+  const firstEnabled = mediaServers.value.find((item) => item.enabled && item.id)
+  playlistLibrarySyncForm.value = {
+    playlist,
+    media_server_id: defaultServer?.id || firstEnabled?.id || '',
+    public: true
+  }
+  playlistLibrarySyncDialog.value = true
+}
+
+async function syncPlaylistToLibrary() {
+  const playlist = playlistLibrarySyncForm.value.playlist
+  if (!playlist) return
   if (isPlaylistSyncingToLibrary(playlist.id)) return
+  if (!playlistLibrarySyncForm.value.media_server_id) {
+    notify('请选择同步用户', 'warning')
+    return
+  }
   playlistLibrarySyncingIds.value = [...playlistLibrarySyncingIds.value, playlist.id]
   try {
     const response = await api<PlaylistLibrarySyncResponse>(
       `/api/playlists/${playlist.id}/sync-to-library`,
-      { method: 'POST' }
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          media_server_id: playlistLibrarySyncForm.value.media_server_id,
+          public: playlistLibrarySyncForm.value.public
+        })
+      }
     )
     const actionText = response.mode === 'created' ? '创建' : '更新'
+    playlistLibrarySyncDialog.value = false
+    playlistLibrarySyncForm.value.playlist = null
     notify(`已${actionText}音乐库歌单：${response.synced_count} 首`)
   } catch (error) {
     notify(error instanceof Error ? error.message : '同步到音乐库失败', 'error')
@@ -3462,6 +3702,15 @@ onUnmounted(() => {
                 </template>
                 <template #item.actions="{ item }">
                   <v-btn
+                    icon="mdi-pencil-box-outline"
+                    color="primary"
+                    variant="text"
+                    size="small"
+                    title="手动整理"
+                    :disabled="mediaManualSubmitting"
+                    @click="openManualOrganize(mediaTableRow(item))"
+                  />
+                  <v-btn
                     icon="mdi-refresh"
                     color="primary"
                     variant="text"
@@ -3845,7 +4094,7 @@ onUnmounted(() => {
                         size="small"
                         title="同步到音乐库"
                         :loading="isPlaylistSyncingToLibrary(playlist.id)"
-                        @click="syncPlaylistToLibrary(playlist)"
+                        @click="openPlaylistLibrarySyncDialog(playlist)"
                       />
                       <v-btn
                         icon="mdi-download"
@@ -3951,6 +4200,14 @@ onUnmounted(() => {
                       <span v-else class="muted">-</span>
                     </td>
                     <td>
+                      <v-btn
+                        icon="mdi-pencil-outline"
+                        color="primary"
+                        variant="text"
+                        size="small"
+                        title="编辑"
+                        @click="openArtistEditDialog(artist)"
+                      />
                       <v-btn
                         icon="mdi-book-plus"
                         color="primary"
@@ -4737,6 +4994,44 @@ onUnmounted(() => {
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="playlistLibrarySyncDialog" max-width="520">
+      <v-card title="同步到音乐库">
+        <v-card-text class="dialog-stack">
+          <div class="muted">
+            {{ playlistLibrarySyncForm.playlist?.name || '-' }}
+          </div>
+          <v-select
+            v-model="playlistLibrarySyncForm.media_server_id"
+            :items="enabledMediaServerOptions"
+            item-title="title"
+            item-value="value"
+            label="同步用户"
+            no-data-text="暂无已启用的媒体服务器用户"
+          />
+          <v-switch
+            v-model="playlistLibrarySyncForm.public"
+            color="primary"
+            density="compact"
+            hide-details
+            inset
+            label="公开"
+          />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="playlistLibrarySyncDialog = false">取消</v-btn>
+          <v-btn
+            color="primary"
+            :disabled="!playlistLibrarySyncForm.media_server_id || !playlistLibrarySyncForm.playlist"
+            :loading="playlistLibrarySyncForm.playlist ? isPlaylistSyncingToLibrary(playlistLibrarySyncForm.playlist.id) : false"
+            @click="syncPlaylistToLibrary"
+          >
+            同步
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="siteDialog" max-width="820">
       <v-card :title="editingSiteId ? '编辑站点' : '新增站点'">
         <v-card-text class="dialog-stack">
@@ -5016,6 +5311,130 @@ onUnmounted(() => {
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="mediaManualDialog" max-width="760">
+      <v-card title="手动整理">
+        <v-card-text class="dialog-stack">
+          <div class="manual-source-path">{{ manualMedia?.source_path || '-' }}</div>
+          <div class="manual-search-row">
+            <v-text-field
+              v-model="manualMetadataSearchQuery"
+              class="manual-search-input"
+              density="comfortable"
+              hide-details
+              label="搜索元数据"
+              prepend-inner-icon="mdi-magnify"
+              @keyup.enter="searchManualMetadata"
+            />
+            <v-btn
+              color="primary"
+              prepend-icon="mdi-magnify"
+              :loading="mediaMetadataSearching"
+              @click="searchManualMetadata"
+            >
+              搜索
+            </v-btn>
+          </div>
+          <div class="manual-metadata-grid">
+            <v-text-field v-model="manualMetadataForm.title" label="标题" />
+            <v-text-field v-model="manualMetadataForm.artist" label="歌手" />
+            <v-text-field v-model="manualMetadataForm.album" label="专辑" />
+            <v-text-field v-model.number="manualMetadataForm.year" label="年份" type="number" />
+            <v-text-field
+              v-model.number="manualMetadataForm.track_number"
+              label="曲序"
+              type="number"
+            />
+            <v-text-field v-model="manualMetadataForm.cover_url" label="封面地址" />
+          </div>
+          <v-textarea
+            v-model="manualMetadataForm.lyrics"
+            auto-grow
+            label="歌词"
+            rows="5"
+          />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="mediaManualSubmitting" @click="mediaManualDialog = false">
+            取消
+          </v-btn>
+          <v-btn color="primary" :loading="mediaManualSubmitting" @click="confirmManualOrganize">
+            确认整理
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="mediaMetadataSearchDialog" max-width="920">
+      <v-card title="选择元数据">
+        <v-card-text class="dialog-stack">
+          <div class="manual-search-row">
+            <v-select
+              v-model="manualMetadataSource"
+              class="metadata-source-select"
+              density="comfortable"
+              hide-details
+              :items="metadataSourceOptions"
+              label="来源"
+            />
+            <v-text-field
+              v-model="manualMetadataSearchQuery"
+              class="manual-search-input"
+              density="comfortable"
+              hide-details
+              label="搜索元数据"
+              prepend-inner-icon="mdi-magnify"
+              @keyup.enter="searchManualMetadata"
+            />
+            <v-btn
+              color="primary"
+              prepend-icon="mdi-magnify"
+              :loading="mediaMetadataSearching"
+              @click="searchManualMetadata"
+            >
+              搜索
+            </v-btn>
+          </div>
+          <div v-if="mediaMetadataSearching" class="loading-panel">
+            <v-progress-circular indeterminate color="primary" size="34" width="3" />
+            <span>正在搜索元数据</span>
+          </div>
+          <div v-else-if="manualMetadataResults.length" class="metadata-result-grid">
+            <article
+              v-for="item in manualMetadataResults"
+              :key="`${item.source || manualMetadataSource}:${item.source_id || item.title}:${item.album || ''}`"
+              class="metadata-result-card"
+              @click="selectManualMetadata(item)"
+            >
+              <img
+                v-if="item.cover_url"
+                class="metadata-result-cover"
+                :src="item.cover_url"
+                alt=""
+              />
+              <div class="metadata-result-body">
+                <div class="metadata-result-title">{{ item.title || '-' }}</div>
+                <div class="metadata-result-meta">{{ item.artist || '未知歌手' }}</div>
+                <div class="metadata-result-meta">{{ item.album || '未知专辑' }}</div>
+                <div class="metadata-result-tags">
+                  <v-chip size="small" variant="tonal">{{ item.year || '-' }}</v-chip>
+                  <v-chip size="small" variant="tonal">
+                    {{ metadataSourceLabel(item.source || manualMetadataSource) }}
+                  </v-chip>
+                </div>
+                <p v-if="item.lyrics" class="metadata-result-lyrics">{{ item.lyrics }}</p>
+              </div>
+            </article>
+          </div>
+          <div v-else class="empty-cell">暂无元数据结果</div>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="mediaMetadataSearchDialog = false">关闭</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="fileOrganizeDialog" max-width="460">
       <v-card title="确认整理">
         <v-card-text>
@@ -5047,6 +5466,40 @@ onUnmounted(() => {
           </v-btn>
           <v-btn color="error" :loading="fileDeleting" @click="confirmFileDelete">
             删除
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="artistEditDialog" max-width="560">
+      <v-card title="编辑歌手">
+        <v-card-text class="dialog-stack">
+          <v-text-field
+            v-model="artistEditForm.name"
+            label="歌手名（权威名）"
+            autofocus
+            @keyup.enter="saveArtistEdit"
+          />
+          <v-textarea
+            v-model="artistEditForm.aliases"
+            auto-grow
+            label="别名"
+            placeholder="一行一个别名"
+            rows="6"
+          />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="artistEditSaving" @click="artistEditDialog = false">
+            取消
+          </v-btn>
+          <v-btn
+            color="primary"
+            :disabled="!artistEditForm.name.trim()"
+            :loading="artistEditSaving"
+            @click="saveArtistEdit"
+          >
+            保存
           </v-btn>
         </v-card-actions>
       </v-card>
@@ -5544,6 +5997,110 @@ onUnmounted(() => {
 .media-tooltip-text {
   white-space: pre-line;
   word-break: break-all;
+}
+
+.manual-source-path {
+  background: rgba(var(--v-theme-on-surface), 0.05);
+  border-radius: 8px;
+  color: rgba(var(--v-theme-on-surface), 0.72);
+  font-size: 13px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+  padding: 10px 12px;
+}
+
+.manual-search-row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.manual-search-input {
+  flex: 1 1 280px;
+  min-width: 220px;
+}
+
+.metadata-source-select {
+  flex: 0 1 180px;
+  min-width: 160px;
+}
+
+.manual-metadata-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.metadata-result-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+}
+
+.metadata-result-card {
+  align-items: flex-start;
+  border: 1px solid rgba(var(--v-theme-on-surface), 0.14);
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  gap: 12px;
+  min-height: 132px;
+  padding: 12px;
+  transition: border-color 0.16s ease, background-color 0.16s ease;
+}
+
+.metadata-result-card:hover {
+  background: rgba(var(--v-theme-primary), 0.06);
+  border-color: rgba(var(--v-theme-primary), 0.45);
+}
+
+.metadata-result-cover {
+  aspect-ratio: 1;
+  border-radius: 6px;
+  flex: 0 0 72px;
+  object-fit: cover;
+  width: 72px;
+}
+
+.metadata-result-body {
+  min-width: 0;
+}
+
+.metadata-result-title {
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 22px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metadata-result-meta {
+  color: rgba(var(--v-theme-on-surface), 0.68);
+  font-size: 13px;
+  line-height: 20px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metadata-result-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.metadata-result-lyrics {
+  color: rgba(var(--v-theme-on-surface), 0.62);
+  display: -webkit-box;
+  font-size: 12px;
+  line-height: 18px;
+  margin: 8px 0 0;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .playlist-track-table :deep(table) {

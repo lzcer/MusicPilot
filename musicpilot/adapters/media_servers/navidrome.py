@@ -85,19 +85,17 @@ class NavidromeMediaServerClient:
             params.extend(("songId", song_id) for song_id in song_ids)
             response = await client.get("/rest/createPlaylist.view", params=params)
             body = _validate_navidrome_json_response(response)
-            if public:
-                playlist_id = _playlist_id_from_body(body) or existing_playlist_id
-                if playlist_id:
-                    response = await client.get(
-                        "/rest/updatePlaylist.view",
-                        params={
-                            **self._params(),
-                            "playlistId": playlist_id,
-                            "public": "true",
-                        },
-                    )
-                    _validate_navidrome_json_response(response)
-        playlist_id = _playlist_id_from_body(body) or existing_playlist_id
+            playlist_id = _playlist_id_from_body(body) or existing_playlist_id
+            if playlist_id:
+                response = await client.get(
+                    "/rest/updatePlaylist.view",
+                    params={
+                        **self._params(),
+                        "playlistId": playlist_id,
+                        "public": "true" if public else "false",
+                    },
+                )
+                _validate_navidrome_json_response(response)
         return MediaServerPlaylistSyncResult(
             playlist_id=playlist_id,
             synced_count=len(song_ids),

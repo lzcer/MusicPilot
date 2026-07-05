@@ -274,6 +274,36 @@ class MediaRetryResponse(BaseModel):
     failed_files: int
 
 
+class TrackMetadataResponse(BaseModel):
+    title: str
+    artist: str | None = None
+    album: str | None = None
+    year: int | None = None
+    track_number: int | None = None
+    lyrics: str | None = None
+    cover_url: str | None = None
+    source: str | None = None
+    source_id: str | None = None
+    extra: dict[str, str] = Field(default_factory=dict)
+
+
+class MediaMetadataSearchResponse(BaseModel):
+    query: str
+    source: str
+    results: list[TrackMetadataResponse]
+
+
+class MediaManualOrganizeRequest(BaseModel):
+    title: str = Field(min_length=1)
+    artist: str | None = None
+    album: str | None = None
+    year: int | None = None
+    track_number: int | None = None
+    lyrics: str | None = None
+    cover_url: str | None = None
+    extra: dict[str, str] = Field(default_factory=dict)
+
+
 class IndexerResponse(BaseModel):
     name: str
 
@@ -512,6 +542,11 @@ class PlaylistTrackDownloadResponse(BaseModel):
     track_id: int
 
 
+class PlaylistLibrarySyncRequest(BaseModel):
+    media_server_id: str | None = None
+    public: bool = True
+
+
 class PlaylistLibrarySyncResponse(BaseModel):
     status: str
     playlist_id: int
@@ -676,3 +711,8 @@ class AddArtistAliasRequest(BaseModel):
     artist_id: int
     alias: str = Field(min_length=1)
     source: str = "user"
+
+
+class UpdateArtistRequest(BaseModel):
+    name: str = Field(min_length=1)
+    aliases: list[str] = Field(default_factory=list)
