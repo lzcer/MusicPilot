@@ -1878,11 +1878,6 @@ def _identity_score_is_trusted(
         return False
     if reference.artist and score.artist <= 0:
         return False
-    if reference.album:
-        if not candidate.album:
-            return False
-        if score.album <= 0:
-            return False
     return True
 
 
@@ -1996,12 +1991,12 @@ async def _candidate_diagnostics_text(
     for index, candidate in enumerate(candidates[:5], start=1):
         score = await _metadata_match_score(metadata, candidate, artist_service=artist_service)
         missing = _candidate_missing_required(metadata, candidate, required)
-        album_conflict = _candidate_has_conflicting_album(metadata, candidate)
+        album_mismatch = _candidate_has_conflicting_album(metadata, candidate)
         reasons: list[str] = []
         if missing:
             reasons.append(f"missing={','.join(missing)}")
-        if album_conflict:
-            reasons.append("album_conflict")
+        if album_mismatch:
+            reasons.append("album_mismatch")
         if score.total < _MATCH_SCORE_THRESHOLD:
             reasons.append(f"score_below_threshold={_MATCH_SCORE_THRESHOLD}")
         reason_text = ";".join(reasons) if reasons else "eligible"
