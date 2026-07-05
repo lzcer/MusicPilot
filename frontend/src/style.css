@@ -486,8 +486,8 @@ body {
   height: calc(100vh - 230px);
   min-height: 420px;
   overflow: auto;
-  background: #0f172a;
-  color: #dbeafe;
+  background: #fff;
+  color: #344054;
   font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 12px;
 }
@@ -499,19 +499,23 @@ body {
   align-items: center;
   min-height: 34px;
   padding: 6px 14px;
-  border-bottom: 1px solid rgb(148 163 184 / 14%);
+  border-bottom: 1px solid #edf0f5;
+}
+
+.log-line:hover {
+  background: #f8fafc;
 }
 
 .log-time {
-  color: #93c5fd;
+  color: #475467;
 }
 
 .log-category {
-  color: #c4b5fd;
+  color: #667085;
 }
 
 .log-message {
-  color: #e5e7eb;
+  color: #1d2939;
   white-space: pre-wrap;
   word-break: break-word;
 }

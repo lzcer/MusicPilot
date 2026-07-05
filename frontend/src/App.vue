@@ -5670,7 +5670,12 @@ onUnmounted(() => {
 }
 
 .nav-group-divider {
-  margin: 10px 8px 8px;
+  background: rgba(var(--v-theme-on-surface), 0.14);
+  border: 0;
+  display: block;
+  height: 1px;
+  margin: 14px 8px 10px;
+  opacity: 1;
 }
 
 .nav-group-title {
