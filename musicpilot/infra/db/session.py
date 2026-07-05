@@ -92,6 +92,14 @@ class Database:
                     "operation_type": "VARCHAR(32) NOT NULL DEFAULT 'mapped'",
                 },
             )
+            await _add_sqlite_columns(
+                conn,
+                "playlist_tracks",
+                {
+                    "source_key": "VARCHAR(768) NOT NULL DEFAULT ''",
+                    "original_title": "VARCHAR(512) NOT NULL DEFAULT ''",
+                },
+            )
             await _ensure_media_files_library_path_nullable(conn)
             await conn.exec_driver_sql(
                 "UPDATE media_files SET library_path = NULL WHERE status != 'success'"

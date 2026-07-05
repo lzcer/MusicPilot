@@ -152,6 +152,7 @@ from musicpilot.infra.api.schemas import (
     PlaylistTrackDownloadResponse,
     PlaylistTrackPageResponse,
     PlaylistTrackResponse,
+    PlaylistTrackUpdateRequest,
     QBittorrentWebhookRequest,
     SearchRequest,
     SearchResponse,
@@ -829,6 +830,13 @@ def create_app() -> FastAPI:
         await state.database.create_all()
         await state.database.migrate_phase_one_schema()
         await state.migrate_legacy_runtime_config()
+        migrated_playlist_track_keys = await state.repository.migrate_playlist_track_source_keys()
+        if migrated_playlist_track_keys:
+            state.add_log(
+                "playlist",
+                "Migrated playlist track source keys: "
+                f"count={migrated_playlist_track_keys}",
+            )
         migrated_waiting_tracks = await state.repository.reset_waiting_playlist_tracks()
         if migrated_waiting_tracks:
             state.add_log(
@@ -1762,6 +1770,34 @@ def create_app() -> FastAPI:
             page_size=page_size,
         )
 
+    @app.patch(
+        "/api/playlists/{playlist_id}/tracks/{track_id}",
+        response_model=PlaylistTrackResponse,
+    )
+    async def update_playlist_track_metadata(
+        playlist_id: int,
+        track_id: int,
+        payload: PlaylistTrackUpdateRequest,
+    ) -> PlaylistTrackResponse:
+        track = await state.repository.get_playlist_track(track_id)
+        if track is None or track.playlist_id != playlist_id:
+            raise HTTPException(status_code=404, detail="Playlist track not found.")
+        title = payload.title.strip()
+        if not title:
+            raise HTTPException(status_code=422, detail="歌名不能为空。")
+        updated = await state.repository.update_playlist_track(
+            track_id,
+            title=title,
+            artist=_optional_string(payload.artist),
+            album=_optional_string(payload.album),
+            last_error=None,
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Playlist track not found.")
+        await _refresh_playlist_library_matches(state, playlist_id)
+        refreshed = await state.repository.get_playlist_track(track_id)
+        return _playlist_track_response(refreshed or updated)
+
     @app.delete("/api/playlists/{playlist_id}", status_code=204)
     async def delete_playlist(playlist_id: int) -> None:
         deleted = await state.repository.delete_playlist(playlist_id)
@@ -2583,7 +2619,9 @@ def _playlist_track_response(item: PlaylistTrack) -> PlaylistTrackResponse:
         playlist_id=item.playlist_id,
         platform=item.platform,
         external_id=item.external_id,
+        source_key=item.source_key,
         position=item.position,
+        original_title=item.original_title,
         title=item.title,
         artist=item.artist,
         album=item.album,

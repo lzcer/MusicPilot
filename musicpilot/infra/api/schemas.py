@@ -504,7 +504,9 @@ class PlaylistTrackResponse(BaseModel):
     playlist_id: int
     platform: str
     external_id: str
+    source_key: str = ""
     position: int
+    original_title: str = ""
     title: str
     artist: str | None = None
     album: str | None = None
@@ -525,6 +527,12 @@ class PlaylistTrackPageResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class PlaylistTrackUpdateRequest(BaseModel):
+    title: str = Field(min_length=1)
+    artist: str | None = None
+    album: str | None = None
 
 
 class PlaylistImportResponse(BaseModel):

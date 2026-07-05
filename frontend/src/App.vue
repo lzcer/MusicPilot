@@ -371,7 +371,9 @@ type PlaylistTrack = {
   playlist_id: number
   platform: string
   external_id: string
+  source_key: string
   position: number
+  original_title: string
   title: string
   artist?: string | null
   album?: string | null
@@ -592,6 +594,7 @@ const notifierDialog = ref(false)
 const musicPlatformDialog = ref(false)
 const playlistImportDialog = ref(false)
 const playlistTracksDialog = ref(false)
+const playlistTrackEditDialog = ref(false)
 const deleteDialog = ref(false)
 const downloadItemsDialog = ref(false)
 const downloadDeleteDialog = ref(false)
@@ -606,6 +609,7 @@ const musicPlatformConnecting = ref(false)
 const playlistLoading = ref(false)
 const availablePlaylistLoading = ref(false)
 const playlistTrackLoading = ref(false)
+const playlistTrackEditSaving = ref(false)
 const downloadItemsLoading = ref(false)
 const playlistDownloading = ref(false)
 const playlistLibrarySyncDialog = ref(false)
@@ -614,6 +618,12 @@ const playlistLibrarySyncForm = ref<PlaylistLibrarySyncForm>({
   playlist: null,
   media_server_id: '',
   public: true
+})
+const playlistTrackEditForm = ref({
+  id: 0,
+  title: '',
+  artist: '',
+  album: ''
 })
 const playlistTrackDownloadingIds = ref<number[]>([])
 const deleting = ref(false)
@@ -2260,6 +2270,45 @@ function applyPlaylistTrackFilters() {
   playlistTrackPage.value = 1
   if (selectedPlaylist.value) {
     void loadPlaylistTracks(selectedPlaylist.value)
+  }
+}
+
+function openPlaylistTrackEditDialog(track: PlaylistTrack) {
+  playlistTrackEditForm.value = {
+    id: track.id,
+    title: track.title || '',
+    artist: track.artist || '',
+    album: track.album || ''
+  }
+  playlistTrackEditDialog.value = true
+}
+
+async function savePlaylistTrackEdit() {
+  const playlist = selectedPlaylist.value
+  const form = playlistTrackEditForm.value
+  const title = trimmedInput(form.title)
+  if (!playlist || !form.id) return
+  if (!title) {
+    notify('歌名不能为空', 'warning')
+    return
+  }
+  playlistTrackEditSaving.value = true
+  try {
+    await api<PlaylistTrack>(`/api/playlists/${playlist.id}/tracks/${form.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        title,
+        artist: trimmedInput(form.artist) || null,
+        album: trimmedInput(form.album) || null
+      })
+    })
+    playlistTrackEditDialog.value = false
+    await loadPlaylistTracks(playlist)
+    notify('歌单条目已更新')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '歌单条目更新失败', 'error')
+  } finally {
+    playlistTrackEditSaving.value = false
   }
 }
 
@@ -4915,23 +4964,21 @@ onUnmounted(() => {
                 <th class="track-title-col">歌曲</th>
                 <th class="track-artist-col">艺人</th>
                 <th class="track-album-col">专辑</th>
-                <th class="track-duration-col">时长</th>
                 <th class="track-error-col">错误</th>
                 <th class="sticky-track-col sticky-track-library-col">音乐库</th>
                 <th class="sticky-track-col sticky-track-status-col">下载状态</th>
-                <th class="sticky-track-col sticky-track-download-col">下载</th>
+                <th class="sticky-track-col sticky-track-download-col">操作</th>
               </tr>
             </thead>
             <tbody>
               <tr v-if="!playlistTracks.length && !playlistTrackLoading">
-                <td colspan="9" class="empty-cell">暂无歌曲</td>
+                <td colspan="8" class="empty-cell">暂无歌曲</td>
               </tr>
               <tr v-for="track in playlistTracks" :key="track.id">
                 <td>{{ track.position }}</td>
                 <td class="truncate-cell" :title="track.title">{{ track.title }}</td>
                 <td class="truncate-cell" :title="track.artist || '-'">{{ track.artist || '-' }}</td>
                 <td class="truncate-cell" :title="track.album || '-'">{{ track.album || '-' }}</td>
-                <td>{{ formatDuration(track.duration ? Math.round(track.duration / 1000) : null) }}</td>
                 <td class="truncate-cell" :title="track.last_error || '-'">{{ track.last_error || '-' }}</td>
                 <td class="sticky-track-col sticky-track-library-col">
                   <v-icon
@@ -4953,6 +5000,14 @@ onUnmounted(() => {
                   </v-chip>
                 </td>
                 <td class="sticky-track-col sticky-track-download-col">
+                  <v-btn
+                    icon="mdi-pencil-outline"
+                    color="primary"
+                    variant="text"
+                    size="small"
+                    title="编辑"
+                    @click="openPlaylistTrackEditDialog(track)"
+                  />
                   <v-btn
                     :icon="playlistTrackActionIcon(track)"
                     color="primary"
@@ -4990,6 +5045,35 @@ onUnmounted(() => {
         <v-card-actions>
           <v-spacer />
           <v-btn variant="text" @click="playlistTracksDialog = false">关闭</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="playlistTrackEditDialog" max-width="620">
+      <v-card title="编辑歌单条目">
+        <v-card-text class="dialog-stack">
+          <v-text-field
+            v-model="playlistTrackEditForm.title"
+            label="歌名"
+            autofocus
+            @keyup.enter="savePlaylistTrackEdit"
+          />
+          <v-text-field v-model="playlistTrackEditForm.artist" label="歌手" />
+          <v-text-field v-model="playlistTrackEditForm.album" label="专辑" />
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="playlistTrackEditSaving" @click="playlistTrackEditDialog = false">
+            取消
+          </v-btn>
+          <v-btn
+            color="primary"
+            :loading="playlistTrackEditSaving"
+            :disabled="!playlistTrackEditForm.title.trim()"
+            @click="savePlaylistTrackEdit"
+          >
+            保存
+          </v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -6120,22 +6204,18 @@ onUnmounted(() => {
   width: 180px;
 }
 
-.track-duration-col {
-  width: 76px;
-}
-
 .track-error-col {
   width: 230px;
 }
 
 .sticky-track-library-col {
-  right: 182px;
+  right: 214px;
   text-align: center;
   width: 72px;
 }
 
 .sticky-track-status-col {
-  right: 72px;
+  right: 104px;
   text-align: center;
   width: 110px;
 }
@@ -6143,7 +6223,7 @@ onUnmounted(() => {
 .sticky-track-download-col {
   right: 0;
   text-align: center;
-  width: 72px;
+  width: 104px;
 }
 
 .select-cell {

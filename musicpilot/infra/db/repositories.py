@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
+import unicodedata
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1232,6 +1234,33 @@ class SqlAlchemyMediaRepository:
         async with self.database.session() as session:
             return await session.get(PlaylistTrack, track_id)
 
+    async def migrate_playlist_track_source_keys(self) -> int:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(PlaylistTrack).order_by(
+                    PlaylistTrack.playlist_id,
+                    PlaylistTrack.position,
+                    PlaylistTrack.id,
+                )
+            )
+            rows = list(result.scalars().all())
+            counters: dict[int, dict[str, int]] = {}
+            updated = 0
+            for row in rows:
+                original_title = row.original_title or row.title
+                normalized = _normalize_playlist_source_title(original_title)
+                playlist_counters = counters.setdefault(row.playlist_id, {})
+                occurrence_index = playlist_counters.get(normalized, 0) + 1
+                playlist_counters[normalized] = occurrence_index
+                source_key = _playlist_track_source_key(original_title, occurrence_index)
+                if row.original_title != original_title or row.source_key != source_key:
+                    row.original_title = original_title
+                    row.source_key = source_key
+                    updated += 1
+            if updated:
+                await session.commit()
+            return updated
+
     async def upsert_playlist_tracks(
         self,
         *,
@@ -1239,35 +1268,41 @@ class SqlAlchemyMediaRepository:
         platform: str,
         tracks: list[dict[str, Any]],
     ) -> list[PlaylistTrack]:
-        seen_external_ids = {str(item["external_id"]) for item in tracks}
+        prepared_tracks = _playlist_tracks_with_source_keys(tracks)
+        seen_source_keys = {item["source_key"] for item in prepared_tracks}
         async with self.database.session() as session:
             result = await session.execute(
                 select(PlaylistTrack).where(PlaylistTrack.playlist_id == playlist_id)
             )
-            existing = {item.external_id: item for item in result.scalars().all()}
+            existing = {item.source_key: item for item in result.scalars().all()}
             rows: list[PlaylistTrack] = []
-            for item in tracks:
+            for item in prepared_tracks:
                 external_id = str(item["external_id"])
-                row = existing.get(external_id)
+                source_key = str(item["source_key"])
+                original_title = str(item["original_title"])
+                row = existing.get(source_key)
                 if row is None:
                     row = PlaylistTrack(
                         playlist_id=playlist_id,
                         platform=platform,
                         external_id=external_id,
+                        source_key=source_key,
+                        original_title=original_title,
                         title=str(item["title"]),
                     )
                     session.add(row)
+                    row.artist = _optional_string(item.get("artist"))
+                    row.album = _optional_string(item.get("album"))
+                    row.duration = _optional_int(item.get("duration"))
+                    row.isrc = _optional_string(item.get("isrc"))
+                    row.cover_url = _optional_string(item.get("cover_url"))
+                row.platform = platform
+                row.external_id = external_id
                 row.position = int(item.get("position") or 0)
-                row.title = str(item.get("title") or "")
-                row.artist = _optional_string(item.get("artist"))
-                row.album = _optional_string(item.get("album"))
-                row.duration = _optional_int(item.get("duration"))
-                row.isrc = _optional_string(item.get("isrc"))
-                row.cover_url = _optional_string(item.get("cover_url"))
                 row.raw_payload = dict(item.get("raw_payload") or {})
                 rows.append(row)
-            for external_id, row in existing.items():
-                if external_id not in seen_external_ids:
+            for source_key, row in existing.items():
+                if source_key not in seen_source_keys:
                     await session.delete(row)
             await session.commit()
             for row in rows:
@@ -2101,6 +2136,35 @@ def _pooled_resource_slots(resource_key: str) -> tuple[str, ...]:
     if not base_key:
         return ()
     return tuple(f"{base_key}:slot:{index}" for index in range(limit))
+
+
+def _playlist_tracks_with_source_keys(tracks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    counters: dict[str, int] = {}
+    result: list[dict[str, Any]] = []
+    for item in tracks:
+        original_title = str(item.get("original_title") or item.get("title") or "").strip()
+        normalized = _normalize_playlist_source_title(original_title)
+        occurrence_index = counters.get(normalized, 0) + 1
+        counters[normalized] = occurrence_index
+        result.append(
+            {
+                **item,
+                "original_title": original_title,
+                "source_key": _playlist_track_source_key(original_title, occurrence_index),
+            }
+        )
+    return result
+
+
+def _playlist_track_source_key(original_title: str, occurrence_index: int) -> str:
+    normalized = _normalize_playlist_source_title(original_title)
+    return f"title:{normalized}:{occurrence_index}"
+
+
+def _normalize_playlist_source_title(value: str | None) -> str:
+    text = unicodedata.normalize("NFKC", value or "").casefold()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or "untitled"
 
 
 async def _get_active_resource_lease(
