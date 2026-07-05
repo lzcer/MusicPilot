@@ -138,6 +138,71 @@ class DownloadTaskItemResponse(BaseModel):
     updated_at: datetime
 
 
+class DashboardLibrarySummaryResponse(BaseModel):
+    songs: int
+    albums: int
+    artists: int
+    recent_7d_songs: int
+    last_synced_at: datetime | None = None
+
+
+class DashboardPlaylistSummaryResponse(BaseModel):
+    playlists: int
+    tracks: int
+    existing_tracks: int
+    pending_tracks: int
+    failed_tracks: int
+
+
+class DashboardDownloadItemResponse(BaseModel):
+    id: int | None = None
+    name: str
+    state: str
+    progress: float
+    updated_at: datetime
+
+
+class DashboardDownloadSummaryResponse(BaseModel):
+    total: int
+    active: int
+    completed_7d: int
+    failed: int
+    status_counts: dict[str, int] = Field(default_factory=dict)
+    recent: list[DashboardDownloadItemResponse] = Field(default_factory=list)
+
+
+class DashboardMediaItemResponse(BaseModel):
+    id: int
+    title: str | None = None
+    artist: str | None = None
+    source_path: str
+    operation_type: str
+    status: str
+    updated_at: datetime
+
+
+class DashboardMediaSummaryResponse(BaseModel):
+    total: int
+    success: int
+    failed: int
+    recent_7d: int
+    recent: list[DashboardMediaItemResponse] = Field(default_factory=list)
+
+
+class DashboardTaskSummaryResponse(BaseModel):
+    waiting: int
+    running: int
+    failed: int
+
+
+class DashboardResponse(BaseModel):
+    library: DashboardLibrarySummaryResponse
+    playlists: DashboardPlaylistSummaryResponse
+    downloads: DashboardDownloadSummaryResponse
+    media: DashboardMediaSummaryResponse
+    tasks: DashboardTaskSummaryResponse
+
+
 class FileEntryResponse(BaseModel):
     name: str
     path: str

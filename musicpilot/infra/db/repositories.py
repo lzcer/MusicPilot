@@ -1438,6 +1438,158 @@ class SqlAlchemyMediaRepository:
             )
             return list(result.scalars().all()), int(total_result.scalar_one())
 
+    async def dashboard_summary(self) -> dict[str, Any]:
+        since = datetime.now(UTC) - timedelta(days=7)
+        async with self.database.session() as session:
+            library_total = await session.execute(
+                select(func.count()).select_from(MusicLibraryTrack)
+            )
+            library_albums = await session.execute(
+                select(func.count(func.distinct(func.lower(func.trim(MusicLibraryTrack.album)))))
+                .select_from(MusicLibraryTrack)
+                .where(
+                    MusicLibraryTrack.album.isnot(None),
+                    func.trim(MusicLibraryTrack.album) != "",
+                )
+            )
+            library_artists = await session.execute(
+                select(func.count(func.distinct(func.lower(func.trim(MusicLibraryTrack.artist)))))
+                .select_from(MusicLibraryTrack)
+                .where(
+                    MusicLibraryTrack.artist.isnot(None),
+                    func.trim(MusicLibraryTrack.artist) != "",
+                )
+            )
+            recent_library = await session.execute(
+                select(func.count())
+                .select_from(MusicLibraryTrack)
+                .where(MusicLibraryTrack.created_at >= since)
+            )
+            last_library_synced = await session.execute(
+                select(func.max(MusicLibraryTrack.last_synced_at)).select_from(MusicLibraryTrack)
+            )
+
+            playlist_total = await session.execute(select(func.count()).select_from(Playlist))
+            playlist_tracks = await session.execute(
+                select(func.count()).select_from(PlaylistTrack)
+            )
+            playlist_existing = await session.execute(
+                select(func.count())
+                .select_from(PlaylistTrack)
+                .where(
+                    or_(
+                        PlaylistTrack.exists_in_library.is_(True),
+                        PlaylistTrack.download_status == "existing",
+                    )
+                )
+            )
+            playlist_pending = await session.execute(
+                select(func.count())
+                .select_from(PlaylistTrack)
+                .where(PlaylistTrack.download_status.in_(("pending", "queue", "searching")))
+            )
+            playlist_failed = await session.execute(
+                select(func.count())
+                .select_from(PlaylistTrack)
+                .where(
+                    PlaylistTrack.download_status.in_(
+                        ("failed", "not_found", "deleted", "source_directory_not_found")
+                    )
+                )
+            )
+
+            download_total = await session.execute(
+                select(func.count()).select_from(TorrentRecord)
+            )
+            download_active = await session.execute(
+                select(func.count())
+                .select_from(TorrentRecord)
+                .where(TorrentRecord.status != "library_refreshed")
+            )
+            download_completed_7d = await session.execute(
+                select(func.count())
+                .select_from(TorrentRecord)
+                .where(
+                    or_(
+                        TorrentRecord.completed_at >= since,
+                        TorrentRecord.library_refreshed_at >= since,
+                    )
+                )
+            )
+            download_failed = await session.execute(
+                select(func.count())
+                .select_from(TorrentRecord)
+                .where(TorrentRecord.status.in_(("failed", "source_directory_not_found")))
+            )
+            download_status_rows = await session.execute(
+                select(TorrentRecord.status, func.count())
+                .select_from(TorrentRecord)
+                .group_by(TorrentRecord.status)
+            )
+            recent_downloads = await session.execute(
+                select(TorrentRecord).order_by(TorrentRecord.updated_at.desc()).limit(5)
+            )
+
+            media_total = await session.execute(select(func.count()).select_from(MediaFile))
+            media_success = await session.execute(
+                select(func.count()).select_from(MediaFile).where(MediaFile.status == "success")
+            )
+            media_failed = await session.execute(
+                select(func.count()).select_from(MediaFile).where(MediaFile.status == "failed")
+            )
+            media_recent_7d = await session.execute(
+                select(func.count()).select_from(MediaFile).where(MediaFile.created_at >= since)
+            )
+            recent_media = await session.execute(
+                select(MediaFile).order_by(MediaFile.updated_at.desc()).limit(5)
+            )
+
+            task_status_rows = await session.execute(
+                select(SystemTask.status, func.count())
+                .select_from(SystemTask)
+                .group_by(SystemTask.status)
+            )
+
+            task_counts = {str(status): int(count) for status, count in task_status_rows.all()}
+            return {
+                "library": {
+                    "songs": int(library_total.scalar_one()),
+                    "albums": int(library_albums.scalar_one()),
+                    "artists": int(library_artists.scalar_one()),
+                    "recent_7d_songs": int(recent_library.scalar_one()),
+                    "last_synced_at": last_library_synced.scalar_one(),
+                },
+                "playlists": {
+                    "playlists": int(playlist_total.scalar_one()),
+                    "tracks": int(playlist_tracks.scalar_one()),
+                    "existing_tracks": int(playlist_existing.scalar_one()),
+                    "pending_tracks": int(playlist_pending.scalar_one()),
+                    "failed_tracks": int(playlist_failed.scalar_one()),
+                },
+                "downloads": {
+                    "total": int(download_total.scalar_one()),
+                    "active": int(download_active.scalar_one()),
+                    "completed_7d": int(download_completed_7d.scalar_one()),
+                    "failed": int(download_failed.scalar_one()),
+                    "status_counts": {
+                        str(status): int(count) for status, count in download_status_rows.all()
+                    },
+                    "recent": list(recent_downloads.scalars().all()),
+                },
+                "media": {
+                    "total": int(media_total.scalar_one()),
+                    "success": int(media_success.scalar_one()),
+                    "failed": int(media_failed.scalar_one()),
+                    "recent_7d": int(media_recent_7d.scalar_one()),
+                    "recent": list(recent_media.scalars().all()),
+                },
+                "tasks": {
+                    "waiting": task_counts.get("WAIT", 0),
+                    "running": task_counts.get("RUNNING", 0),
+                    "failed": task_counts.get("FAILED", 0),
+                },
+            }
+
     async def get_media_file(self, media_id: int) -> MediaFile | None:
         async with self.database.session() as session:
             return await session.get(MediaFile, media_id)

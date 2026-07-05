@@ -85,6 +85,14 @@ from musicpilot.infra.api.schemas import (
     ArtistResponse,
     BuildArtistLibraryResponse,
     ClearArtistLibraryResponse,
+    DashboardDownloadItemResponse,
+    DashboardDownloadSummaryResponse,
+    DashboardLibrarySummaryResponse,
+    DashboardMediaItemResponse,
+    DashboardMediaSummaryResponse,
+    DashboardPlaylistSummaryResponse,
+    DashboardResponse,
+    DashboardTaskSummaryResponse,
     DownloadDeleteMode,
     DownloaderCreateRequest,
     DownloaderResponse,
@@ -880,6 +888,11 @@ def create_app() -> FastAPI:
     @app.get("/api/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
         return HealthResponse(app=settings.app_name)
+
+    @app.get("/api/dashboard", response_model=DashboardResponse)
+    async def dashboard() -> DashboardResponse:
+        summary = await state.repository.dashboard_summary()
+        return _dashboard_response(summary)
 
     @app.post("/api/auth/login", response_model=LoginResponse)
     async def login(payload: LoginRequest, response: Response) -> LoginResponse:
@@ -4441,6 +4454,54 @@ def _notifier_response(item: NotifierChannel) -> NotifierResponse:
         enable_download_notify=item.enable_download_notify,
         enable_library_notify=item.enable_library_notify,
         enabled=item.enabled,
+    )
+
+
+def _dashboard_response(summary: dict[str, Any]) -> DashboardResponse:
+    library = summary["library"]
+    playlists = summary["playlists"]
+    downloads = summary["downloads"]
+    media = summary["media"]
+    tasks = summary["tasks"]
+    return DashboardResponse(
+        library=DashboardLibrarySummaryResponse(**library),
+        playlists=DashboardPlaylistSummaryResponse(**playlists),
+        downloads=DashboardDownloadSummaryResponse(
+            total=downloads["total"],
+            active=downloads["active"],
+            completed_7d=downloads["completed_7d"],
+            failed=downloads["failed"],
+            status_counts=downloads["status_counts"],
+            recent=[
+                DashboardDownloadItemResponse(
+                    id=item.id,
+                    name=item.name,
+                    state=item.status,
+                    progress=item.progress,
+                    updated_at=item.updated_at,
+                )
+                for item in downloads["recent"]
+            ],
+        ),
+        media=DashboardMediaSummaryResponse(
+            total=media["total"],
+            success=media["success"],
+            failed=media["failed"],
+            recent_7d=media["recent_7d"],
+            recent=[
+                DashboardMediaItemResponse(
+                    id=item.id,
+                    title=item.title,
+                    artist=item.artist,
+                    source_path=item.source_path,
+                    operation_type=item.operation_type,
+                    status=item.status,
+                    updated_at=item.updated_at,
+                )
+                for item in media["recent"]
+            ],
+        ),
+        tasks=DashboardTaskSummaryResponse(**tasks),
     )
 
 

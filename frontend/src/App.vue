@@ -183,6 +183,69 @@ type MusicLibraryTrackPageResponse = PageResponse<MusicLibraryTrack> & {
   stats: MusicLibraryStats
 }
 
+type DashboardDownloadItem = {
+  id?: number | null
+  name: string
+  state: string
+  progress: number
+  updated_at: string
+}
+
+type DashboardMediaItem = {
+  id: number
+  title?: string | null
+  artist?: string | null
+  source_path: string
+  operation_type: string
+  status: string
+  updated_at: string
+}
+
+type DashboardSummary = {
+  library: {
+    songs: number
+    albums: number
+    artists: number
+    recent_7d_songs: number
+    last_synced_at?: string | null
+  }
+  playlists: {
+    playlists: number
+    tracks: number
+    existing_tracks: number
+    pending_tracks: number
+    failed_tracks: number
+  }
+  downloads: {
+    total: number
+    active: number
+    completed_7d: number
+    failed: number
+    status_counts: Record<string, number>
+    recent: DashboardDownloadItem[]
+  }
+  media: {
+    total: number
+    success: number
+    failed: number
+    recent_7d: number
+    recent: DashboardMediaItem[]
+  }
+  tasks: {
+    waiting: number
+    running: number
+    failed: number
+  }
+}
+
+type DashboardMetric = {
+  title: string
+  value: number
+  subtitle: string
+  icon: string
+  color: string
+}
+
 type Site = {
   id?: string | null
   name: string
@@ -380,9 +443,11 @@ type ConfigMenuKind = DeleteTarget['kind']
 const loggedIn = ref(false)
 const loginLoading = ref(false)
 const loginForm = ref({ username: 'admin', password: 'musicpilot' })
-const activePage = ref('search')
+const activePage = ref('dashboard')
 const settingsTab = ref('downloaders')
 const drawer = ref(true)
+const dashboard = ref<DashboardSummary | null>(null)
+const dashboardLoading = ref(false)
 
 const searchDialog = ref(false)
 const metadataSearchLoading = ref(false)
@@ -676,6 +741,7 @@ const playlistTrackLibraryStatusOptions = [
 ]
 
 const navItems = [
+  { title: '仪表盘', value: 'dashboard', icon: 'mdi-view-dashboard-outline' },
   { title: '搜索', value: 'search', icon: 'mdi-magnify' },
   { title: '下载', value: 'downloads', icon: 'mdi-download' },
   { title: '歌单', value: 'playlists', icon: 'mdi-playlist-music-outline' },
@@ -706,6 +772,55 @@ const navGroups = [
 const pageTitle = computed(() => navItems.find((item) => item.value === activePage.value)?.title ?? 'MusicPilot')
 
 const searchLoading = computed(() => metadataSearchLoading.value || torrentSearchLoading.value)
+
+const dashboardMetricCards = computed<DashboardMetric[]>(() => {
+  const data = dashboard.value
+  if (!data) return []
+  return [
+    {
+      title: '歌曲库',
+      value: data.library.songs,
+      subtitle: `专辑 ${data.library.albums} / 歌手 ${data.library.artists}`,
+      icon: 'mdi-music-circle-outline',
+      color: 'primary'
+    },
+    {
+      title: '近 7 天新增',
+      value: data.library.recent_7d_songs,
+      subtitle: `最近同步 ${formatOptionalTime(data.library.last_synced_at)}`,
+      icon: 'mdi-calendar-plus',
+      color: 'success'
+    },
+    {
+      title: '歌单',
+      value: data.playlists.playlists,
+      subtitle: `歌曲 ${data.playlists.tracks} / 已在库 ${data.playlists.existing_tracks}`,
+      icon: 'mdi-playlist-music-outline',
+      color: 'info'
+    },
+    {
+      title: '活跃下载',
+      value: data.downloads.active,
+      subtitle: `总任务 ${data.downloads.total} / 近 7 天完成 ${data.downloads.completed_7d}`,
+      icon: 'mdi-download',
+      color: 'warning'
+    },
+    {
+      title: '整理记录',
+      value: data.media.total,
+      subtitle: `成功 ${data.media.success} / 失败 ${data.media.failed}`,
+      icon: 'mdi-music-box-multiple',
+      color: 'secondary'
+    },
+    {
+      title: '任务队列',
+      value: data.tasks.waiting + data.tasks.running,
+      subtitle: `运行 ${data.tasks.running} / 等待 ${data.tasks.waiting} / 失败 ${data.tasks.failed}`,
+      icon: 'mdi-timeline-clock-outline',
+      color: data.tasks.failed ? 'error' : 'primary'
+    }
+  ]
+})
 
 const torrentSearchProgressText = computed(() => {
   const siteText = `站点 ${searchProgress.value.completed_sites}/${searchProgress.value.total_sites}`
@@ -905,15 +1020,26 @@ async function login() {
 
 async function loadInitialData() {
   await Promise.all([
+    loadDashboard(),
     loadSites(),
     loadDownloaders(),
     loadMediaServers(),
     loadNotifiers(),
-    loadPlaylists(),
     loadSystemSettings()
   ])
   syncPagePolling()
   subscribeMetadataSiteSearch()
+}
+
+async function loadDashboard() {
+  dashboardLoading.value = true
+  try {
+    dashboard.value = await api<DashboardSummary>('/api/dashboard')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '仪表盘加载失败', 'error')
+  } finally {
+    dashboardLoading.value = false
+  }
 }
 
 async function runSearch() {
@@ -1120,6 +1246,9 @@ function openDownloadConfirm(result: SearchResult) {
 
 function switchPage(page: string) {
   activePage.value = page
+  if (page === 'dashboard') {
+    void loadDashboard()
+  }
   if (page === 'musicLibrary' && !musicLibraryTracks.value.length) {
     void loadMusicLibrary()
   }
@@ -2814,6 +2943,14 @@ onUnmounted(() => {
           <div class="brand-subtitle">音乐库自动化</div>
         </div>
         <v-list nav density="compact" class="nav-list">
+          <v-list-item
+            :active="activePage === 'dashboard'"
+            prepend-icon="mdi-view-dashboard-outline"
+            title="仪表盘"
+            rounded="lg"
+            @click="switchPage('dashboard')"
+          />
+          <v-divider class="nav-group-divider" />
           <template v-for="(group, index) in navGroups" :key="group.title">
             <v-divider v-if="index > 0" class="nav-group-divider" />
             <v-list-subheader class="nav-group-title">{{ group.title }}</v-list-subheader>
@@ -2838,6 +2975,150 @@ onUnmounted(() => {
 
       <v-main>
         <div class="content">
+          <section v-if="activePage === 'dashboard'" class="page-stack">
+            <div class="toolbar-row">
+              <v-btn
+                prepend-icon="mdi-refresh"
+                variant="tonal"
+                :loading="dashboardLoading"
+                @click="loadDashboard"
+              >
+                刷新
+              </v-btn>
+              <v-chip v-if="dashboard?.library.last_synced_at" color="primary" variant="tonal">
+                曲库同步 {{ formatOptionalTime(dashboard.library.last_synced_at) }}
+              </v-chip>
+            </div>
+
+            <div v-if="dashboardLoading && !dashboard" class="loading-panel">
+              <v-progress-circular indeterminate color="primary" size="34" width="3" />
+              <span>正在加载仪表盘</span>
+            </div>
+
+            <template v-else-if="dashboard">
+              <div class="dashboard-metric-grid">
+                <v-card
+                  v-for="metric in dashboardMetricCards"
+                  :key="metric.title"
+                  class="dashboard-metric-card"
+                >
+                  <div class="dashboard-metric-icon" :class="`text-${metric.color}`">
+                    <v-icon :icon="metric.icon" size="30" />
+                  </div>
+                  <div>
+                    <div class="dashboard-metric-title">{{ metric.title }}</div>
+                    <div class="dashboard-metric-value">{{ metric.value }}</div>
+                    <div class="dashboard-metric-subtitle">{{ metric.subtitle }}</div>
+                  </div>
+                </v-card>
+              </div>
+
+              <div class="dashboard-panel-grid">
+                <v-card class="dashboard-panel">
+                  <v-card-title class="dashboard-panel-title">
+                    <span>最近下载</span>
+                    <v-chip size="small" color="warning" variant="tonal">
+                      活跃 {{ dashboard.downloads.active }}
+                    </v-chip>
+                  </v-card-title>
+                  <v-list density="compact" lines="two">
+                    <v-list-item
+                      v-for="item in dashboard.downloads.recent"
+                      :key="item.id || item.name"
+                      :title="item.name"
+                      :subtitle="formatOptionalTime(item.updated_at)"
+                    >
+                      <template #prepend>
+                        <v-progress-circular
+                          :model-value="progressPercent(item.progress)"
+                          color="primary"
+                          size="36"
+                          width="4"
+                        >
+                          <span class="dashboard-progress-text">{{ progressPercent(item.progress) }}</span>
+                        </v-progress-circular>
+                      </template>
+                      <template #append>
+                        <v-chip :color="downloadStatusColor(item.state)" size="small" variant="tonal">
+                          {{ downloadStatusText(item.state) }}
+                        </v-chip>
+                      </template>
+                    </v-list-item>
+                    <div v-if="!dashboard.downloads.recent.length" class="empty-cell">暂无下载任务</div>
+                  </v-list>
+                </v-card>
+
+                <v-card class="dashboard-panel">
+                  <v-card-title class="dashboard-panel-title">
+                    <span>最近整理</span>
+                    <v-chip size="small" color="error" variant="tonal">
+                      失败 {{ dashboard.media.failed }}
+                    </v-chip>
+                  </v-card-title>
+                  <v-list density="compact" lines="two">
+                    <v-list-item
+                      v-for="item in dashboard.media.recent"
+                      :key="item.id"
+                      :title="item.title || displayRelativePath(item.source_path, systemForm.scraping.source_directory)"
+                      :subtitle="`${item.artist || '-'} / ${formatOptionalTime(item.updated_at)}`"
+                    >
+                      <template #prepend>
+                        <v-icon icon="mdi-file-music-outline" size="28" />
+                      </template>
+                      <template #append>
+                        <div class="dashboard-chip-stack">
+                          <v-chip size="small" variant="tonal">
+                            {{ mediaOperationTypeText(item.operation_type) }}
+                          </v-chip>
+                          <v-chip :color="mediaStatusColor(item.status)" size="small" variant="tonal">
+                            {{ mediaStatusText(item.status) }}
+                          </v-chip>
+                        </div>
+                      </template>
+                    </v-list-item>
+                    <div v-if="!dashboard.media.recent.length" class="empty-cell">暂无整理记录</div>
+                  </v-list>
+                </v-card>
+
+                <v-card class="dashboard-panel">
+                  <v-card-title class="dashboard-panel-title">队列健康</v-card-title>
+                  <div class="dashboard-health-grid">
+                    <div>
+                      <div class="dashboard-health-value">{{ dashboard.tasks.running }}</div>
+                      <div class="dashboard-health-label">运行中</div>
+                    </div>
+                    <div>
+                      <div class="dashboard-health-value">{{ dashboard.tasks.waiting }}</div>
+                      <div class="dashboard-health-label">等待中</div>
+                    </div>
+                    <div>
+                      <div class="dashboard-health-value">{{ dashboard.tasks.failed }}</div>
+                      <div class="dashboard-health-label">失败</div>
+                    </div>
+                    <div>
+                      <div class="dashboard-health-value">{{ dashboard.playlists.pending_tracks }}</div>
+                      <div class="dashboard-health-label">歌单待处理</div>
+                    </div>
+                  </div>
+                  <div class="dashboard-status-row">
+                    <v-chip color="success" variant="tonal">
+                      已在库 {{ dashboard.playlists.existing_tracks }}
+                    </v-chip>
+                    <v-chip color="error" variant="tonal">
+                      歌单失败 {{ dashboard.playlists.failed_tracks }}
+                    </v-chip>
+                    <v-chip color="warning" variant="tonal">
+                      下载失败 {{ dashboard.downloads.failed }}
+                    </v-chip>
+                    <v-chip color="info" variant="tonal">
+                      近 7 天整理 {{ dashboard.media.recent_7d }}
+                    </v-chip>
+                  </div>
+                </v-card>
+              </div>
+            </template>
+          </section>
+
           <section v-if="activePage === 'search'" class="page-stack">
             <div class="toolbar-row">
               <v-btn color="primary" prepend-icon="mdi-magnify" @click="searchDialog = true">
@@ -4874,6 +5155,114 @@ onUnmounted(() => {
 .download-active-switch {
   flex: 0 0 auto;
   margin-left: auto;
+}
+
+.dashboard-metric-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.dashboard-metric-card {
+  align-items: center;
+  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  display: flex;
+  gap: 14px;
+  min-height: 118px;
+  padding: 18px;
+}
+
+.dashboard-metric-icon {
+  align-items: center;
+  background: rgba(var(--v-theme-on-surface), 0.06);
+  border-radius: 8px;
+  display: flex;
+  flex: 0 0 48px;
+  height: 48px;
+  justify-content: center;
+  width: 48px;
+}
+
+.dashboard-metric-title {
+  color: rgba(var(--v-theme-on-surface), 0.68);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.dashboard-metric-value {
+  font-size: 30px;
+  font-weight: 750;
+  line-height: 38px;
+}
+
+.dashboard-metric-subtitle {
+  color: rgba(var(--v-theme-on-surface), 0.62);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.dashboard-panel-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+
+.dashboard-panel {
+  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  min-width: 0;
+}
+
+.dashboard-panel-title {
+  align-items: center;
+  display: flex;
+  font-size: 16px;
+  font-weight: 700;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.dashboard-progress-text {
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.dashboard-chip-stack {
+  align-items: flex-end;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dashboard-health-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 0 16px 12px;
+}
+
+.dashboard-health-grid > div {
+  background: rgba(var(--v-theme-on-surface), 0.04);
+  border-radius: 8px;
+  padding: 14px;
+}
+
+.dashboard-health-value {
+  font-size: 26px;
+  font-weight: 750;
+  line-height: 32px;
+}
+
+.dashboard-health-label {
+  color: rgba(var(--v-theme-on-surface), 0.62);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.dashboard-status-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 16px 16px;
 }
 
 .delete-action-buttons {
