@@ -4842,7 +4842,7 @@ async def _sync_playlist_to_media_server(
     if not song_ids:
         raise ValueError("该歌单没有已匹配到音乐库的歌曲。")
     client = build_media_server_client(server)
-    result = await client.sync_playlist(name=playlist.name, song_ids=song_ids)
+    result = await client.sync_playlist(name=playlist.name, song_ids=song_ids, public=True)
     state.add_log(
         "playlist",
         "Playlist synced to music library: "

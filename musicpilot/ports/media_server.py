@@ -41,4 +41,5 @@ class MediaServerClient(Protocol):
         *,
         name: str,
         song_ids: list[str],
+        public: bool = False,
     ) -> MediaServerPlaylistSyncResult: ...
