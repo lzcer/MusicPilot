@@ -4517,7 +4517,7 @@ onUnmounted(() => {
               <v-tab value="system">系统设置</v-tab>
             </v-tabs>
 
-            <v-window v-model="settingsTab">
+            <v-window v-model="settingsTab" class="settings-window">
               <v-window-item value="downloaders">
                 <div class="toolbar-row">
                   <v-btn color="primary" prepend-icon="mdi-plus" @click="openNewDownloaderDialog">新增下载器</v-btn>
@@ -6501,6 +6501,10 @@ onUnmounted(() => {
 
 .settings-checks {
   margin: 8px 0 16px;
+}
+
+.settings-window .card-grid {
+  margin-top: 20px;
 }
 
 .settings-checks-label {
