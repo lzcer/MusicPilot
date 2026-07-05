@@ -1,56 +1,82 @@
 # MusicPilot
 
-MusicPilot (MP) is a self-hosted automation hub for music discovery, download, metadata enrichment, library linking, and media-server refresh.
+<p align="center">
+  <img src="docs/assets/musicpilot-logo.png" alt="MusicPilot" width="420">
+</p>
 
-The project is designed around three constraints:
+语言：[简体中文](README.md) | [English](README_EN.md)
 
-- **Async I/O first**: one Python process, pure async orchestration, low memory overhead, and high network/file-I/O concurrency.
-- **Hexagonal architecture**: the core workflow depends on stable ports, while Telegram, Web UI, NexusPHP, qBittorrent, MusicBrainz, Navidrome, and future services live behind adapters.
-- **Single artifact delivery**: the final deployment target is one Docker image containing the backend API and compiled Web UI.
+## 1. 项目简介
 
-`SPEC.md` is the source-of-truth architecture document for contributors and AI-assisted development. New modules should preserve its boundaries unless the spec is explicitly updated.
+MusicPilot 是一个面向自托管用户的音乐库自动化工具，用来把“发现音乐、搜索资源、提交下载、整理文件、补全元数据、刷新音乐库、同步歌单”串成一个可管理的工作流。
 
-## 1. Current Structure
+它适合已经在使用 PT 站点、qBittorrent、Navidrome 等服务的用户：MusicPilot 不替代这些系统，而是负责把它们连接起来，减少重复搜索、手动下载、手动整理和手动刷新音乐库的操作。
 
-```text
-musicpilot/
-  core/        domain events, event bus, pipeline orchestration
-  ports/       adapter protocols
-  adapters/    external service implementations
-  infra/       config, database, API, app bootstrap
-frontend/      Vue/Vite management UI
-alembic/       database migration scaffold
-tests/         focused core tests
-```
+项目的核心目标：
 
-## 2. Implemented Modules
+1. 用一个 Web 界面管理音乐搜索、下载、整理、歌单和音乐库状态。
+2. 通过任务队列处理耗时操作，尽量让下载、刮削、整理和同步可以自动推进。
+3. 保持部署简单，默认使用 SQLite，并提供 Docker Compose 方式在 NAS 或服务器上运行。
+4. 保留清晰的适配层，方便后续接入更多站点、下载器、音乐平台、元数据源和媒体服务器。
 
-- Async event bus and core pipeline
-- NexusPHP indexer loading from database sites and `config/sites.parser.yaml`
-- qBittorrent download injection and completion webhook
-- Download task polling and management
-- Local file management and manual scrape/transfer
-- Metadata cascade with multi-source provider
-- Mutagen-based tag writer
-- Navidrome/Subsonic library refresh and library sync
-- Optional Telegram notification adapter
-- Subscription persistence and APScheduler lifecycle
-- Management UI with login, streaming search, downloads, media records, file management, logs, and settings
-- FastAPI endpoints for health, search, downloads, media, files, indexers, subscriptions, and qBittorrent webhooks
+## 2. 项目功能
 
-## 3. NAS Docker Deployment
+MusicPilot 当前提供以下能力：
 
-This mode builds the image directly on your NAS from the cloned repository. Docker Hub publishing is not required.
+1. 音乐搜索与站点搜索
+   - 支持先搜索音乐元数据，再基于元数据到站点搜索候选资源。
+   - 支持站点并发控制、排除关键词和搜索结果去重。
+   - 支持按艺术家、标题、专辑等信息辅助过滤候选结果。
+
+2. 下载任务管理
+   - 支持把选中的资源提交到 qBittorrent。
+   - 支持下载任务状态跟踪、下载明细查看和任务删除。
+   - 支持下载完成后触发后续整理和音乐库刷新流程。
+
+3. 文件整理与元数据处理
+   - 支持源目录、映射目录、复制整理等模式。
+   - 支持自动刮削、手动整理、歌词和标签写入。
+   - 支持记录每个文件的整理状态、失败原因和实际整理类型。
+
+4. 歌单管理
+   - 支持导入外部歌单并在本地管理歌单条目。
+   - 支持根据歌单条目搜索、下载和匹配本地音乐库。
+   - 支持把本地歌单同步到 Navidrome 音乐库，并可选择同步账号和公开状态。
+
+5. 音乐库与歌手库
+   - 支持扫描和展示音乐库歌曲。
+   - 支持维护歌手库、别名和合并关系，用于提升中文名、英文名、别名之间的匹配准确性。
+   - 支持刷新歌单与音乐库之间的匹配状态。
+
+6. 系统管理
+   - 支持站点、下载器、音乐库、通知和系统参数配置。
+   - 支持日志查看、仪表盘统计和文件管理。
+   - 支持 Docker 环境变量控制基础部署参数。
+
+## 3. 项目工作流程图
+
+![MusicPilot 工作流程](docs/assets/musicpilot-workflow.png)
+
+## 4. 快速开始
+
+以下方式适合在 NAS 或服务器上直接从源码构建并运行 MusicPilot。
+
+1. 克隆项目并进入目录：
 
 ```bash
 git clone <your-repo-url> MusicPilot
 cd MusicPilot
+```
+
+2. 复制环境变量模板：
+
+```bash
 cp .env.example .env
 ```
 
-Edit `.env` before the first start:
+3. 修改 `.env` 中的关键配置：
 
-```bash
+```text
 MP_HTTP_PORT=8000
 MP_ADMIN_USERNAME=admin
 MP_ADMIN_PASSWORD=change-this-password
@@ -59,143 +85,63 @@ MP_HOST_DATA_PATH=/volume1/docker/musicpilot/data
 MP_HOST_CONFIG_PATH=/volume1/docker/musicpilot/config
 MP_HOST_MUSIC_PATH=/volume1/music
 MP_HOST_DOWNLOADS_PATH=/volume1/downloads
-# Use host networking during image build when Docker bridge networking cannot reach package indexes.
+```
+
+如果 Docker 构建时容器网络无法访问 PyPI，而宿主机网络正常，可以保留：
+
+```text
 MP_DOCKER_BUILD_NETWORK=host
-# Optional: use a nearby PyPI mirror if NAS builds cannot reach pypi.org reliably.
+```
+
+如果需要使用更稳定的 Python 包镜像源，可以调整：
+
+```text
 UV_DEFAULT_INDEX=https://pypi.org/simple
 ```
 
-Start the service:
+4. 构建并启动服务：
 
 ```bash
 docker compose up -d --build
 ```
 
-Open the Web UI:
+5. 打开 Web UI：
 
 ```text
 http://<NAS_IP>:8000
 ```
 
-View logs:
+6. 查看日志：
 
 ```bash
 docker compose logs -f musicpilot
 ```
 
-Stop the service:
-
-```bash
-docker compose down
-```
-
-Update from source:
+7. 更新项目：
 
 ```bash
 git pull
 docker compose up -d --build
 ```
 
-The Dockerfile installs third-party Python dependencies before copying the application source, so ordinary backend code changes should reuse the dependency layer. If Docker bridge networking cannot reach package indexes but the NAS host can, keep `MP_DOCKER_BUILD_NETWORK=host`. If your NAS has unstable access to PyPI, set `UV_DEFAULT_INDEX` in `.env` to a stable mirror URL and rebuild.
+### 4.1. 配置教程
 
-## 4. Docker Volumes And Paths
+首次启动后，还需要在 Web UI 中配置站点、下载器、音乐库、整理规则和通知渠道。
 
-The default `docker-compose.yml` mounts:
+配置教程入口：[MusicPilot 配置教程](docs/configuration.md)
 
-```text
-MP_HOST_DATA_PATH      -> /data
-MP_HOST_CONFIG_PATH    -> /config
-MP_HOST_MUSIC_PATH     -> /music
-MP_HOST_DOWNLOADS_PATH -> /downloads
-```
+该文档用于集中说明各项配置步骤，当前只提供入口，具体内容后续补充。
 
-Important container paths:
+## 5. 鸣谢
 
-```text
-/data/musicpilot.db        SQLite database
-/config/sites.parser.yaml  NexusPHP parser rules
-/config/runtime.json       legacy runtime config migration source
-/music                     music library path visible inside the container
-/downloads                 download/source file path visible inside the container
-```
+MusicPilot 的设计和实现过程中参考了许多优秀开源项目。特别感谢：
 
-For qBittorrent and MusicPilot to operate on the same files, configure paths consistently. For example, if qBittorrent saves music to `/volume1/downloads` on the NAS, mount that host path to `/downloads` and configure MusicPilot scraper source paths against `/downloads` inside the Web UI.
+1. [MoviePilot](https://github.com/jxxghp/MoviePilot)
+   - MusicPilot 在自托管自动化、任务编排、站点与下载器联动、管理后台体验等方向上，受到了 MoviePilot 项目的启发。
 
-## 5. Development
+2. [musicdl](https://github.com/CharlesPikachu/musicdl)
+   - MusicPilot 的多源音乐元数据检索和音乐信息补全能力，参考了 musicdl 项目中对音乐平台数据获取的实践。
 
-Python 3.11+ is the target runtime.
+同时感谢 FastAPI、SQLAlchemy、Vue、Vite、Vuetify、qBittorrent、Navidrome、MusicBrainz、NexusPHP 及相关开源生态提供的基础能力。
 
-```bash
-uv venv .venv
-source .venv/bin/activate
-uv pip install -e ".[dev]"
-uvicorn musicpilot.infra.api.app:create_app --factory --reload
-```
-
-Run tests:
-
-```bash
-pytest
-```
-
-With the included `Makefile`:
-
-```bash
-make install
-make smoke
-make dev
-```
-
-Verify the running backend:
-
-```bash
-curl --noproxy '*' http://127.0.0.1:8000/api/health
-```
-
-Run the frontend during development:
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-The default management login is controlled by:
-
-```text
-MP_ADMIN_USERNAME
-MP_ADMIN_PASSWORD
-```
-
-## 6. API Surface
-
-- `GET /api/health`
-- `POST /api/search`
-- `POST /api/downloads`
-- `GET /api/downloads`
-- `GET /api/files`
-- `DELETE /api/files`
-- `POST /api/files/organize`
-- `POST /api/webhooks/qbittorrent/{torrent_hash}`
-- `GET /api/indexers`
-- `GET /api/media`
-- `GET /api/subscriptions`
-- `POST /api/subscriptions`
-
-## 7. Configuration
-
-MusicPilot reads environment variables with the `MP_` prefix.
-
-```bash
-MP_DATABASE_URL=sqlite+aiosqlite:///./data/musicpilot.db
-MP_LOG_LEVEL=INFO
-MP_MUSIC_LIBRARY_PATH=/music
-MP_DOWNLOAD_STAGING_PATH=/downloads
-MP_INDEXER_PARSER_CONFIG=/config/sites.parser.yaml
-```
-
-SQLite is the default database. The database layer enables WAL mode for SQLite and keeps model types portable for future PostgreSQL support.
-
-## 8. License
-
-GPL-3.0. See `LICENSE`.
+本项目仍在持续演进中，欢迎通过 issue、讨论和代码贡献帮助它变得更稳定、更易用。
