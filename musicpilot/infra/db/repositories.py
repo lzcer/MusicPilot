@@ -1633,6 +1633,13 @@ class SqlAlchemyMediaRepository:
         async with self.database.session() as session:
             return await session.get(MediaFile, media_id)
 
+    async def get_media_file_by_source_path(self, source_path: Path) -> MediaFile | None:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(MediaFile).where(MediaFile.source_path == str(source_path))
+            )
+            return result.scalars().first()
+
     async def delete_media_file(self, media_id: int) -> bool:
         async with self.database.session() as session:
             row = await session.get(MediaFile, media_id)

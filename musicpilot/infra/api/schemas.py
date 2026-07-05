@@ -223,6 +223,24 @@ class FileOrganizeRequest(BaseModel):
     paths: list[str] = Field(default_factory=list)
 
 
+class FileManualOrganizeRequest(BaseModel):
+    path: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    artist: str | None = None
+    album: str | None = None
+    year: int | None = None
+    track_number: int | None = None
+    lyrics: str | None = None
+    cover_url: str | None = None
+    extra: dict[str, str] = Field(default_factory=dict)
+
+
+class FileDirectoryManualOrganizeRequest(BaseModel):
+    path: str = Field(min_length=1)
+    artist: str = Field(min_length=1)
+    album: str = Field(min_length=1)
+
+
 class FileOrganizeResponse(BaseModel):
     source_files: int
     mapped_files: int

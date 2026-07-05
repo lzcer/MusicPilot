@@ -115,6 +115,18 @@ type MediaFile = {
   track_number?: number | null
 }
 
+type ManualOrganizeTarget = {
+  kind: 'media' | 'file' | 'directory'
+  mediaId?: number
+  filePath?: string
+  source_path: string
+  title?: string | null
+  artist?: string | null
+  album?: string | null
+  year?: number | null
+  track_number?: number | null
+}
+
 type TrackMetadata = {
   title: string
   artist?: string | null
@@ -531,10 +543,13 @@ const mediaManualDialog = ref(false)
 const mediaMetadataSearchDialog = ref(false)
 const mediaManualSubmitting = ref(false)
 const mediaMetadataSearching = ref(false)
-const manualMedia = ref<MediaFile | null>(null)
+const manualOrganizeTarget = ref<ManualOrganizeTarget | null>(null)
 const manualMetadataSearchQuery = ref('')
 const manualMetadataSource = ref('qmusic')
 const manualMetadataResults = ref<TrackMetadata[]>([])
+const manualOrganizeIsDirectory = computed(
+  () => manualOrganizeTarget.value?.kind === 'directory'
+)
 const manualMetadataForm = ref({
   title: '',
   artist: '',
@@ -1557,7 +1572,16 @@ function retrySingleMedia(row: MediaFile) {
 }
 
 function openManualOrganize(row: MediaFile) {
-  manualMedia.value = row
+  manualOrganizeTarget.value = {
+    kind: 'media',
+    mediaId: row.id,
+    source_path: row.source_path,
+    title: row.title,
+    artist: row.artist,
+    album: row.album,
+    year: row.year,
+    track_number: row.track_number
+  }
   manualMetadataForm.value = {
     title: row.title || '',
     artist: row.artist || '',
@@ -1569,6 +1593,32 @@ function openManualOrganize(row: MediaFile) {
     extra: {}
   }
   manualMetadataSearchQuery.value = [row.title, row.artist].filter(Boolean).join(' ') || row.source_path
+  manualMetadataSource.value = 'qmusic'
+  manualMetadataResults.value = []
+  mediaManualDialog.value = true
+}
+
+function openFileManualOrganize(entry: FileEntry) {
+  if (fileRootType.value !== 'source') return
+  const isDirectory = entry.type === 'directory'
+  const title = isDirectory ? '' : entry.name.replace(/\.[^/.]+$/, '')
+  manualOrganizeTarget.value = {
+    kind: isDirectory ? 'directory' : 'file',
+    filePath: entry.path,
+    source_path: entry.path || entry.name,
+    title
+  }
+  manualMetadataForm.value = {
+    title,
+    artist: '',
+    album: '',
+    year: null,
+    track_number: null,
+    lyrics: '',
+    cover_url: '',
+    extra: {}
+  }
+  manualMetadataSearchQuery.value = isDirectory ? entry.name : title
   manualMetadataSource.value = 'qmusic'
   manualMetadataResults.value = []
   mediaManualDialog.value = true
@@ -1599,6 +1649,15 @@ async function searchManualMetadata() {
 }
 
 function selectManualMetadata(metadata: TrackMetadata) {
+  if (manualOrganizeIsDirectory.value) {
+    manualMetadataForm.value = {
+      ...manualMetadataForm.value,
+      artist: metadata.artist || '',
+      album: metadata.album || ''
+    }
+    mediaMetadataSearchDialog.value = false
+    return
+  }
   manualMetadataForm.value = {
     title: metadata.title || manualMetadataForm.value.title,
     artist: metadata.artist || '',
@@ -1613,32 +1672,64 @@ function selectManualMetadata(metadata: TrackMetadata) {
 }
 
 async function confirmManualOrganize() {
-  const row = manualMedia.value
-  if (!row || mediaManualSubmitting.value) return
+  const target = manualOrganizeTarget.value
+  if (!target || mediaManualSubmitting.value) return
   const title = trimmedInput(manualMetadataForm.value.title)
-  if (!title) {
+  const artist = trimmedInput(manualMetadataForm.value.artist)
+  const album = trimmedInput(manualMetadataForm.value.album)
+  if (!manualOrganizeIsDirectory.value && !title) {
     notify('标题不能为空', 'warning')
+    return
+  }
+  if (manualOrganizeIsDirectory.value && (!artist || !album)) {
+    notify('歌手和专辑不能为空', 'warning')
     return
   }
   mediaManualSubmitting.value = true
   try {
     const form = manualMetadataForm.value
-    const result = await api<FileOrganizeResponse>(`/api/media/${row.id}/manual-organize`, {
-      method: 'POST',
-      body: JSON.stringify({
-        title,
-        artist: trimmedInput(form.artist) || null,
-        album: trimmedInput(form.album) || null,
-        year: form.year,
-        track_number: form.track_number,
-        lyrics: trimmedInput(form.lyrics) || null,
-        cover_url: trimmedInput(form.cover_url) || null,
-        extra: form.extra || {}
+    const payload = {
+      title,
+      artist: artist || null,
+      album: album || null,
+      year: form.year,
+      track_number: form.track_number,
+      lyrics: trimmedInput(form.lyrics) || null,
+      cover_url: trimmedInput(form.cover_url) || null,
+      extra: form.extra || {}
+    }
+    let result: FileOrganizeResponse
+    if (target.kind === 'media') {
+      result = await api<FileOrganizeResponse>(`/api/media/${target.mediaId}/manual-organize`, {
+        method: 'POST',
+        body: JSON.stringify(payload)
       })
-    })
+    } else if (target.kind === 'directory') {
+      result = await api<FileOrganizeResponse>('/api/files/manual-organize-directory', {
+        method: 'POST',
+        body: JSON.stringify({
+          path: target.filePath,
+          artist,
+          album
+        })
+      })
+    } else {
+      result = await api<FileOrganizeResponse>('/api/files/manual-organize', {
+        method: 'POST',
+        body: JSON.stringify({
+          path: target.filePath,
+          ...payload
+        })
+      })
+    }
     mediaManualDialog.value = false
-    manualMedia.value = null
-    await loadMedia()
+    manualOrganizeTarget.value = null
+    await Promise.all([
+      loadMedia(),
+      target.kind === 'file' || target.kind === 'directory'
+        ? loadFiles(filePath.value)
+        : Promise.resolve()
+    ])
     notify(`手动整理完成：文件 ${result.source_files}，失败 ${result.failed_files}`)
   } catch (error) {
     notify(error instanceof Error ? error.message : '手动整理失败', 'error')
@@ -4086,6 +4177,15 @@ onUnmounted(() => {
                         @click.stop="openFileOrganize(entry)"
                       />
                       <v-btn
+                        icon="mdi-pencil-box-outline"
+                        color="primary"
+                        variant="text"
+                        size="small"
+                        :disabled="fileRootType !== 'source' || mediaManualSubmitting"
+                        :title="fileRootType === 'source' ? '手动整理' : '仅源目录可手动整理'"
+                        @click.stop="openFileManualOrganize(entry)"
+                      />
+                      <v-btn
                         icon="mdi-delete"
                         color="error"
                         variant="text"
@@ -5585,14 +5685,14 @@ onUnmounted(() => {
     <v-dialog v-model="mediaManualDialog" max-width="760">
       <v-card title="手动整理">
         <v-card-text class="dialog-stack">
-          <div class="manual-source-path">{{ manualMedia?.source_path || '-' }}</div>
+          <div class="manual-source-path">{{ manualOrganizeTarget?.source_path || '-' }}</div>
           <div class="manual-search-row">
             <v-text-field
               v-model="manualMetadataSearchQuery"
               class="manual-search-input"
               density="comfortable"
               hide-details
-              label="搜索元数据"
+              :label="manualOrganizeIsDirectory ? '搜索专辑' : '搜索元数据'"
               prepend-inner-icon="mdi-magnify"
               @keyup.enter="searchManualMetadata"
             />
@@ -5606,18 +5706,33 @@ onUnmounted(() => {
             </v-btn>
           </div>
           <div class="manual-metadata-grid">
-            <v-text-field v-model="manualMetadataForm.title" label="标题" />
+            <v-text-field
+              v-if="!manualOrganizeIsDirectory"
+              v-model="manualMetadataForm.title"
+              label="标题"
+            />
             <v-text-field v-model="manualMetadataForm.artist" label="歌手" />
             <v-text-field v-model="manualMetadataForm.album" label="专辑" />
-            <v-text-field v-model.number="manualMetadataForm.year" label="年份" type="number" />
             <v-text-field
+              v-if="!manualOrganizeIsDirectory"
+              v-model.number="manualMetadataForm.year"
+              label="年份"
+              type="number"
+            />
+            <v-text-field
+              v-if="!manualOrganizeIsDirectory"
               v-model.number="manualMetadataForm.track_number"
               label="曲序"
               type="number"
             />
-            <v-text-field v-model="manualMetadataForm.cover_url" label="封面地址" />
+            <v-text-field
+              v-if="!manualOrganizeIsDirectory"
+              v-model="manualMetadataForm.cover_url"
+              label="封面地址"
+            />
           </div>
           <v-textarea
+            v-if="!manualOrganizeIsDirectory"
             v-model="manualMetadataForm.lyrics"
             auto-grow
             label="歌词"
@@ -5637,7 +5752,7 @@ onUnmounted(() => {
     </v-dialog>
 
     <v-dialog v-model="mediaMetadataSearchDialog" max-width="920">
-      <v-card title="选择元数据">
+      <v-card :title="manualOrganizeIsDirectory ? '选择专辑' : '选择元数据'">
         <v-card-text class="dialog-stack">
           <div class="manual-search-row">
             <v-select

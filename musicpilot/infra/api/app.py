@@ -62,11 +62,13 @@ from musicpilot.core.metadata import MetadataCascade
 from musicpilot.core.pipeline import MusicPipeline
 from musicpilot.core.processor import MediaProcessor
 from musicpilot.core.scraping import (
+    ContextualMetadata,
     LibraryTrackSnapshot,
     LocalMusicScraper,
     ScrapingConfig,
     ScrapingFileResult,
     ScrapingSummary,
+    infer_album_context_metadata,
     infer_metadata_from_paths,
     normalize_metadata_match_text,
     scraping_config_from_payload,
@@ -103,8 +105,10 @@ from musicpilot.infra.api.schemas import (
     FileBulkDeleteFailure,
     FileBulkDeleteRequest,
     FileBulkDeleteResponse,
+    FileDirectoryManualOrganizeRequest,
     FileEntryResponse,
     FileListResponse,
+    FileManualOrganizeRequest,
     FileOrganizeRequest,
     FileOrganizeResponse,
     HealthResponse,
@@ -499,6 +503,10 @@ class ManualScrapeExecutor:
             if isinstance(item, str) and item
         )
         manual_metadata = _manual_metadata_by_source_file(payload.get("manual_metadata"))
+        contextual_metadata = _contextual_metadata_by_source_file(
+            payload.get("contextual_metadata")
+        )
+        exclude_library_paths = _paths_from_payload(payload.get("exclude_library_paths"))
         if not source_files:
             raise ValueError("Manual scrape task payload is incomplete.")
         settings_payload = await self.state.repository.get_system_settings()
@@ -511,6 +519,8 @@ class ManualScrapeExecutor:
             task_name,
             source_files,
             manual_metadata=manual_metadata,
+            contextual_metadata=contextual_metadata,
+            exclude_library_paths=exclude_library_paths,
             use_task_manager=False,
         )
         return TaskExecutionResult(result=_scraping_summary_result(summary))
@@ -2056,6 +2066,119 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=502, detail=f"整理失败：{exc}") from exc
         return _file_organize_response_from_task_result(task.result or {})
 
+    @app.post("/api/files/manual-organize", response_model=FileOrganizeResponse)
+    async def manual_organize_source_file(
+        payload: FileManualOrganizeRequest,
+    ) -> FileOrganizeResponse:
+        settings_payload = await state.repository.get_system_settings()
+        config = scraping_config_from_payload(settings_payload)
+        if not config.enabled:
+            raise HTTPException(status_code=409, detail="请先在刮削设置中开启刮削。")
+        root = _scraping_source_root_or_409(config)
+        source_path = _resolve_source_relative_path(root, payload.path)
+        source_is_audio = await asyncio.to_thread(
+            lambda: source_path.exists() and source_path.is_file() and _is_audio_file(source_path)
+        )
+        if not source_is_audio:
+            raise HTTPException(status_code=404, detail="源音频文件不存在，无法手动整理。")
+        metadata = _track_metadata_from_manual_payload(payload)
+        exclude_library_paths: tuple[Path, ...] = ()
+        existing_media = await state.repository.get_media_file_by_source_path(source_path)
+        if existing_media is not None:
+            exclude_library_paths = await _prepare_media_record_reorganize(state, existing_media)
+        try:
+            task_id = await state.task_manager.enqueue(
+                TaskCreate(
+                    task_type="MANUAL_SCRAPE",
+                    payload={
+                        "task_name": f"manual metadata {source_path.name}",
+                        "source_files": [str(source_path)],
+                        "manual_metadata": {
+                            str(source_path): [_track_metadata_payload(metadata)],
+                        },
+                        "exclude_library_paths": [
+                            str(path) for path in exclude_library_paths
+                        ],
+                    },
+                    resource_keys=["scraper"],
+                )
+            )
+            task = await state.task_manager.wait_for_task(task_id)
+            if task.status != "SUCCEEDED":
+                raise RuntimeError(
+                    task.error_message or f"Manual scrape failed: {source_path.name}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            state.add_log(
+                "metadata",
+                f"Manual metadata scraping failed for {source_path}: {exc}",
+                "ERROR",
+            )
+            raise HTTPException(status_code=502, detail=f"手动整理失败：{exc}") from exc
+        return _file_organize_response_from_task_result(task.result or {})
+
+    @app.post("/api/files/manual-organize-directory", response_model=FileOrganizeResponse)
+    async def manual_organize_source_directory(
+        payload: FileDirectoryManualOrganizeRequest,
+    ) -> FileOrganizeResponse:
+        settings_payload = await state.repository.get_system_settings()
+        config = scraping_config_from_payload(settings_payload)
+        if not config.enabled:
+            raise HTTPException(status_code=409, detail="请先在刮削设置中开启刮削。")
+        root = _scraping_source_root_or_409(config)
+        source_dir = _resolve_source_relative_path(root, payload.path)
+        source_is_dir = await asyncio.to_thread(
+            lambda: source_dir.exists() and source_dir.is_dir()
+        )
+        if not source_is_dir:
+            raise HTTPException(status_code=404, detail="源目录不存在，无法手动整理。")
+        source_files = await asyncio.to_thread(_source_audio_files, root, source_dir)
+        if not source_files:
+            raise HTTPException(status_code=422, detail="目录中没有可整理的音频文件。")
+        artist = payload.artist.strip()
+        album = payload.album.strip()
+        contextual_metadata = infer_album_context_metadata(
+            list(source_files),
+            artist=artist,
+            album=album,
+        )
+        exclude_paths: list[Path] = []
+        for source_file in source_files:
+            existing_media = await state.repository.get_media_file_by_source_path(source_file)
+            if existing_media is not None:
+                exclude_paths.extend(
+                    await _prepare_media_record_reorganize(state, existing_media)
+                )
+        try:
+            task_id = await state.task_manager.enqueue(
+                TaskCreate(
+                    task_type="MANUAL_SCRAPE",
+                    payload={
+                        "task_name": f"manual album {source_dir.name}",
+                        "source_files": [str(path) for path in source_files],
+                        "contextual_metadata": {
+                            str(path): _track_metadata_payload(item.metadata)
+                            for path, item in contextual_metadata.items()
+                        },
+                        "exclude_library_paths": [str(path) for path in exclude_paths],
+                    },
+                    resource_keys=["scraper"],
+                )
+            )
+            task = await state.task_manager.wait_for_task(task_id)
+            if task.status != "SUCCEEDED":
+                raise RuntimeError(
+                    task.error_message or f"Manual scrape failed: {source_dir.name}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            state.add_log(
+                "metadata",
+                f"Manual album scraping failed for {source_dir}: {exc}",
+                "ERROR",
+            )
+            raise HTTPException(status_code=502, detail=f"目录手动整理失败：{exc}") from exc
+        return _file_organize_response_from_task_result(task.result or {})
+
     @app.get("/api/media", response_model=MediaFilePageResponse)
     async def media_files(
         page: int = Query(default=1, ge=1),
@@ -2175,6 +2298,7 @@ def create_app() -> FastAPI:
         if not config.enabled:
             raise HTTPException(status_code=409, detail="请先在刮削设置中开启刮削")
         metadata = _track_metadata_from_manual_payload(payload)
+        exclude_library_paths = await _prepare_media_record_reorganize(state, media)
         try:
             task_id = await state.task_manager.enqueue(
                 TaskCreate(
@@ -2185,6 +2309,9 @@ def create_app() -> FastAPI:
                         "manual_metadata": {
                             str(source_path): [_track_metadata_payload(metadata)],
                         },
+                        "exclude_library_paths": [
+                            str(path) for path in exclude_library_paths
+                        ],
                     },
                     resource_keys=["scraper"],
                 )
@@ -4229,6 +4356,30 @@ def _manual_metadata_by_source_file(value: object) -> dict[Path, tuple[TrackMeta
     return result
 
 
+def _contextual_metadata_by_source_file(value: object) -> dict[Path, ContextualMetadata]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[Path, ContextualMetadata] = {}
+    for raw_path, raw_item in value.items():
+        if not isinstance(raw_path, str) or not isinstance(raw_item, dict):
+            continue
+        metadata = _track_metadata_from_payload(raw_item)
+        if metadata is None:
+            continue
+        result[Path(raw_path)] = ContextualMetadata(
+            metadata=metadata,
+            verify_identity=True,
+            preserve_artist_album=True,
+        )
+    return result
+
+
+def _paths_from_payload(value: object) -> tuple[Path, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(Path(item) for item in value if isinstance(item, str) and item)
+
+
 async def _auto_build_artist_library(state: AppState) -> None:
     """Build artist library in background with a timeout."""
     if state.artist_build_lock.locked():
@@ -5117,6 +5268,30 @@ async def _delete_media_record(
     return await state.repository.delete_media_file(media.id)
 
 
+async def _prepare_media_record_reorganize(state: AppState, media: MediaFile) -> tuple[Path, ...]:
+    exclude_paths: list[Path] = []
+    if media.library_path:
+        library_path = Path(media.library_path)
+        exclude_paths.append(library_path)
+        if media.status == "success" and not await asyncio.to_thread(
+            _paths_are_same_file,
+            library_path,
+            Path(media.source_path),
+        ):
+            await _delete_file_path(library_path)
+    await state.repository.delete_media_file(media.id)
+    return tuple(exclude_paths)
+
+
+def _paths_are_same_file(left: Path, right: Path) -> bool:
+    try:
+        if left.exists() and right.exists():
+            return left.samefile(right)
+    except OSError:
+        return False
+    return _path_match_key(left) == _path_match_key(right)
+
+
 async def _delete_file_path(path: Path) -> None:
     await asyncio.to_thread(_delete_file_path_sync, path)
 
@@ -5312,6 +5487,53 @@ def _source_audio_files_for_targets(root: Path, targets: list[Path]) -> tuple[Pa
     return tuple(sorted(files, key=lambda path: path.as_posix().casefold()))
 
 
+def _path_match_key(path: str | Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        return str(Path(path).expanduser().resolve(strict=False))
+    except OSError:
+        return str(Path(path).expanduser())
+
+
+def _path_match_keys(path: str | Path | None, roots: tuple[Path, ...] = ()) -> set[str]:
+    if path is None:
+        return set()
+    raw_path = Path(path).expanduser()
+    keys = {_normalized_path_key(raw_path)}
+    resolved = raw_path.resolve(strict=False)
+    keys.add(_normalized_path_key(resolved))
+    for root in roots:
+        root_resolved = root.expanduser().resolve(strict=False)
+        with contextlib.suppress(ValueError):
+            keys.add(_normalized_path_key(resolved.relative_to(root_resolved)))
+    return {key for key in keys if key}
+
+
+def _normalized_path_key(path: Path) -> str:
+    return path.as_posix().lstrip("./")
+
+
+def _path_matches_any_key(
+    path: str | Path | None,
+    excluded_keys: set[str],
+    roots: tuple[Path, ...],
+) -> bool:
+    for key in _path_match_keys(path, roots):
+        if key in excluded_keys:
+            return True
+        if any(_path_key_suffix_matches(key, excluded) for excluded in excluded_keys):
+            return True
+    return False
+
+
+def _path_key_suffix_matches(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    return "/" in shorter and longer.endswith(f"/{shorter}")
+
+
 async def _scrape_manual_source_files(
     state: AppState,
     config: ScrapingConfig,
@@ -5319,6 +5541,8 @@ async def _scrape_manual_source_files(
     source_files: tuple[Path, ...],
     *,
     manual_metadata: dict[Path, tuple[TrackMetadata, ...]] | None = None,
+    contextual_metadata: dict[Path, ContextualMetadata] | None = None,
+    exclude_library_paths: tuple[Path, ...] = (),
     use_task_manager: bool = True,
 ) -> ScrapingSummary:
     try:
@@ -5329,6 +5553,16 @@ async def _scrape_manual_source_files(
             f"Music library sync before manual scraping failed: {exc}",
             "WARNING",
         )
+    library_roots = tuple(
+        path
+        for path in (config.mapped_directory, config.source_directory)
+        if path is not None
+    )
+    excluded_library_keys = {
+        key
+        for path in exclude_library_paths
+        for key in _path_match_keys(path, library_roots)
+    }
     library_tracks = tuple(
         LibraryTrackSnapshot(
             title=item.title,
@@ -5338,6 +5572,7 @@ async def _scrape_manual_source_files(
             path=item.path,
         )
         for item in await state.repository.list_music_library_tracks()
+        if not _path_matches_any_key(item.path, excluded_library_keys, library_roots)
     )
     media_history = tuple(
         LibraryTrackSnapshot(
@@ -5351,6 +5586,11 @@ async def _scrape_manual_source_files(
         if item.title
         and item.status == "success"
         and item.library_path
+        and not _path_matches_any_key(
+            item.library_path,
+            excluded_library_keys,
+            library_roots,
+        )
         and (media_file_size := _file_size_or_none(item.library_path)) is not None
     )
     async def record_file_result(item: ScrapingFileResult) -> None:
@@ -5389,6 +5629,7 @@ async def _scrape_manual_source_files(
             library_tracks=library_tracks,
             media_history=media_history,
             forced_metadata=forced_metadata,
+            contextual_metadata=contextual_metadata,
             on_file_result=record_file_result,
         )
 
