@@ -4,7 +4,7 @@ import pytest
 from musicpilot.adapters.downloaders.qbittorrent import QBittorrentAuthError, QBittorrentClient
 from musicpilot.adapters.indexers.config import parser_config_from_mapping
 from musicpilot.adapters.indexers.nexusphp import NexusPHPCrawler, NexusPHPSiteConfig
-from musicpilot.infra.api.app import _validate_navidrome_scan_response
+from musicpilot.adapters.media_servers.navidrome import _validate_navidrome_scan_response
 
 PARSER = parser_config_from_mapping(
     {
