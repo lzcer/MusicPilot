@@ -5683,8 +5683,8 @@ onUnmounted(() => {
     </v-dialog>
 
     <v-dialog v-model="mediaManualDialog" max-width="760">
-      <v-card title="手动整理">
-        <v-card-text class="dialog-stack">
+      <v-card class="manual-organize-card" title="手动整理">
+        <v-card-text class="dialog-stack manual-organize-body">
           <div class="manual-source-path">{{ manualOrganizeTarget?.source_path || '-' }}</div>
           <div class="manual-search-row">
             <v-text-field
@@ -5734,12 +5734,13 @@ onUnmounted(() => {
           <v-textarea
             v-if="!manualOrganizeIsDirectory"
             v-model="manualMetadataForm.lyrics"
-            auto-grow
+            class="manual-lyrics-field"
             label="歌词"
-            rows="5"
+            no-resize
+            rows="8"
           />
         </v-card-text>
-        <v-card-actions>
+        <v-card-actions class="manual-organize-actions">
           <v-spacer />
           <v-btn variant="text" :disabled="mediaManualSubmitting" @click="mediaManualDialog = false">
             取消
@@ -6398,6 +6399,28 @@ onUnmounted(() => {
   line-height: 20px;
   overflow-wrap: anywhere;
   padding: 10px 12px;
+}
+
+.manual-organize-card {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 48px);
+}
+
+.manual-organize-body {
+  overflow-y: auto;
+}
+
+.manual-organize-actions {
+  background: rgb(var(--v-theme-surface));
+  border-top: 1px solid rgba(var(--v-theme-on-surface), 0.12);
+  flex: 0 0 auto;
+  padding: 12px 16px;
+}
+
+.manual-lyrics-field :deep(textarea) {
+  max-height: 240px;
+  overflow-y: auto;
 }
 
 .manual-search-row {
