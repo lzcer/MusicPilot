@@ -38,9 +38,11 @@ git tag -a v0.1.1 -m "v0.1.1"
 git push origin v0.1.1
 ```
 
-当存在上一个 `v*` 标签时，workflow 会自动汇总上一个标签到当前标签之间的提交信息，并写入 Release 内容。
+当存在上一个 `v*` 标签时，workflow 会自动汇总上一个标签到当前标签之间的提交信息，并按 `feat`、`fix`、`perf`、`refactor` 前缀分类写入 Release 内容。其他前缀不会进入自动发布说明。
 
 ## 1.4. 镜像标签
+
+发布镜像支持 `linux/amd64` 和 `linux/arm64`。同一个镜像标签会发布为多架构 manifest，Docker 会根据运行机器的架构自动拉取对应镜像。
 
 稳定版本会推送以下镜像标签：
 
@@ -48,7 +50,6 @@ git push origin v0.1.1
 ghcr.io/lzcer/musicpilot:v0.1.0
 ghcr.io/lzcer/musicpilot:0.1.0
 ghcr.io/lzcer/musicpilot:latest
-ghcr.io/lzcer/musicpilot:sha-<commit>
 ```
 
 预发布版本包含 `-`，例如 `v1.0.0-beta.1`，不会更新 `latest`。

@@ -112,6 +112,114 @@ MusicPilot 当前提供以下能力：
 
 ## 6. 快速开始
 
+推荐在 NAS 或服务器上直接使用已发布的 Docker 镜像部署 MusicPilot。需要本地修改源码或调试构建时，再使用源码构建方式。
+
+### 6.1. 使用 Docker 镜像部署
+
+1. 创建部署目录并进入目录：
+
+```bash
+mkdir -p musicpilot
+cd musicpilot
+```
+
+2. 创建 `.env` 文件：
+
+```bash
+cat > .env <<'EOF'
+MP_HTTP_PORT=8000
+MP_ADMIN_USERNAME=admin
+MP_ADMIN_PASSWORD=change-this-password
+MP_SESSION_SECRET=change-this-random-secret
+MP_HOST_DATA_PATH=./data
+MP_HOST_CONFIG_PATH=./config
+MP_HOST_MUSIC_PATH=/volume1/music
+MP_HOST_DOWNLOADS_PATH=/volume1/downloads
+EOF
+```
+
+3. 创建 `docker-compose.yml` 文件：
+
+```bash
+cat > docker-compose.yml <<'EOF'
+services:
+  musicpilot:
+    image: ghcr.io/lzcer/musicpilot:latest
+    environment:
+      MP_APP_NAME: MusicPilot
+      MP_LOG_LEVEL: INFO
+      MP_ADMIN_USERNAME: ${MP_ADMIN_USERNAME:-admin}
+      MP_ADMIN_PASSWORD: ${MP_ADMIN_PASSWORD:-musicpilot}
+      MP_SESSION_SECRET: ${MP_SESSION_SECRET:-musicpilot-change-me}
+      MP_DATABASE_URL: ${MP_DATABASE_URL:-sqlite+aiosqlite:////data/musicpilot.db}
+      MP_MUSIC_LIBRARY_PATH: /music
+      MP_DOWNLOAD_STAGING_PATH: /downloads
+      MP_STATIC_DIR: /app/frontend/dist
+      MP_INDEXER_PARSER_CONFIG: /config/sites.parser.yaml
+      MP_RUNTIME_CONFIG: /config/runtime.json
+      MP_MUSICBRAINZ_USER_AGENT: ${MP_MUSICBRAINZ_USER_AGENT:-MusicPilot/1.0.0 (self-hosted)}
+      MP_WRITE_AUDIO_TAGS: ${MP_WRITE_AUDIO_TAGS:-true}
+      MP_SUBSCRIPTIONS_ENABLED: ${MP_SUBSCRIPTIONS_ENABLED:-true}
+      MP_SUBSCRIPTION_CHECK_INTERVAL_MINUTES: ${MP_SUBSCRIPTION_CHECK_INTERVAL_MINUTES:-1440}
+    restart: unless-stopped
+    ports:
+      - "${MP_HTTP_PORT:-8000}:8000"
+    volumes:
+      - ${MP_HOST_DATA_PATH:-./data}:/data
+      - ${MP_HOST_CONFIG_PATH:-./config}:/config
+      - ${MP_HOST_MUSIC_PATH:-./data/library}:/music
+      - ${MP_HOST_DOWNLOADS_PATH:-./data/downloads}:/downloads
+EOF
+```
+
+如果希望固定版本，建议把镜像改为明确的版本号，例如：
+
+```yaml
+image: ghcr.io/lzcer/musicpilot:1.0.0
+```
+
+镜像支持 `linux/amd64` 和 `linux/arm64`，Docker 会根据运行机器的架构自动拉取对应镜像。
+
+首次启动时，如果宿主机挂载目录中没有站点解析器配置，容器会自动把内置配置初始化到：
+
+```text
+./config/sites.parser.yaml
+```
+
+后续可以直接修改该文件来自定义站点解析器，修改后重启容器生效：
+
+```bash
+docker compose up -d
+```
+
+4. 拉取镜像并启动服务：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+5. 打开 Web UI：
+
+```text
+http://<NAS_IP>:8000
+```
+
+6. 查看日志：
+
+```bash
+docker compose logs -f musicpilot
+```
+
+7. 更新到最新镜像：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+### 6.2. 从源码构建部署
+
 以下方式适合在 NAS 或服务器上直接从源码构建并运行 MusicPilot。
 
 1. 克隆项目并进入目录：
@@ -177,7 +285,7 @@ git pull
 docker compose up -d --build
 ```
 
-### 6.1. 可选 PostgreSQL 数据库
+### 6.3. 可选 PostgreSQL 数据库
 
 MusicPilot 默认使用 SQLite，适合单机和 NAS 部署。需要更高并发或希望使用独立数据库时，可以把 `.env` 中的 `MP_DATABASE_URL` 改为 PostgreSQL 连接串：
 
@@ -187,7 +295,7 @@ MP_DATABASE_URL=postgresql+asyncpg://musicpilot:change-this-password@postgres:54
 
 PostgreSQL 数据库和用户需要提前创建。MusicPilot 启动时会通过 Alembic 自动初始化或升级表结构。
 
-### 6.2. 配置教程
+### 6.4. 配置教程
 
 首次启动后，还需要在 Web UI 中配置站点、下载器、音乐库、整理规则和通知渠道。
 
