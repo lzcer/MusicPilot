@@ -492,12 +492,14 @@ const searchDialog = ref(false)
 const metadataSearchLoading = ref(false)
 const torrentSearchLoading = ref(false)
 const searchText = ref('')
+const searchArtist = ref('')
 const searchResults = ref<SearchResult[]>([])
 const metadataCandidates = ref<MediaCandidate[]>([])
 const selectedMedia = ref<MediaCandidate | null>(null)
 const siteConfirmDialog = ref(false)
 const noMetadataDialog = ref(false)
 const selectedSiteIds = ref<string[]>([])
+const selectedAlbumNames = ref<string[]>([])
 const searchStats = ref({ raw_count: 0, filtered_count: 0 })
 const searchProgress = ref({ completed_sites: 0, total_sites: 0, active_keywords: [] as string[] })
 const hasSearchedTorrents = ref(false)
@@ -868,6 +870,12 @@ const pageTitle = computed(() => navItems.find((item) => item.value === activePa
 
 const searchLoading = computed(() => metadataSearchLoading.value || torrentSearchLoading.value)
 
+const selectedMediaAlbums = computed(() => albumList(selectedMedia.value))
+
+const canRunMetadataSiteSearch = computed(
+  () => selectedSiteIds.value.length > 0 && (!selectedMediaAlbums.value.length || selectedAlbumNames.value.length > 0)
+)
+
 const enabledMediaServerOptions = computed(() =>
   mediaServers.value
     .filter((item) => item.enabled && item.id)
@@ -1163,6 +1171,7 @@ async function runSearch() {
   searchDialog.value = false
   metadataSearchLoading.value = true
   selectedMedia.value = null
+  selectedAlbumNames.value = []
   searchResults.value = []
   metadataCandidates.value = []
   hasSearchedTorrents.value = false
@@ -1170,6 +1179,9 @@ async function runSearch() {
   searchPage.value = 1
   try {
     const params = new URLSearchParams({ query: searchText.value.trim(), limit: '12' })
+    if (searchArtist.value.trim()) {
+      params.set('artist', searchArtist.value.trim())
+    }
     const response = await api<{ candidates: MediaCandidate[] }>(`/api/metadata/search?${params.toString()}`)
     metadataCandidates.value = response.candidates
     if (!metadataCandidates.value.length) {
@@ -1187,6 +1199,7 @@ function runDirectSearch() {
   noMetadataDialog.value = false
   metadataCandidates.value = []
   selectedMedia.value = null
+  selectedAlbumNames.value = []
   searchResults.value = []
   hasSearchedTorrents.value = true
   searchPage.value = 1
@@ -1213,13 +1226,15 @@ function runDirectSearch() {
 }
 
 function openSiteConfirm(candidate: MediaCandidate) {
-  selectedMedia.value = rawMediaCandidate(candidate)
+  const media = rawMediaCandidate(candidate)
+  selectedMedia.value = media
+  selectedAlbumNames.value = albumList(media)
   selectedSiteIds.value = sites.value.map((site) => site.id).filter(Boolean) as string[]
   siteConfirmDialog.value = true
 }
 
 async function runMetadataSiteSearch() {
-  if (!selectedMedia.value) return
+  if (!selectedMedia.value || !canRunMetadataSiteSearch.value) return
   siteConfirmDialog.value = false
   torrentSearchLoading.value = true
   metadataCandidates.value = []
@@ -1232,7 +1247,7 @@ async function runMetadataSiteSearch() {
     const snapshot = await api<MetadataSiteSearchStreamPayload>('/api/search/by-metadata/stream/start', {
       method: 'POST',
       body: JSON.stringify({
-        media: rawMediaCandidate(selectedMedia.value),
+        media: selectedSiteSearchMedia(),
         site_ids: selectedSiteIds.value,
         limit: 100
       })
@@ -1305,6 +1320,7 @@ function applyMetadataSearchSnapshot(payload: MetadataSiteSearchStreamPayload) {
   }
   if (payload.media) {
     selectedMedia.value = payload.media
+    selectedAlbumNames.value = albumList(payload.media)
   }
   if (payload.results) {
     searchResults.value = payload.results
@@ -1335,6 +1351,33 @@ function rawMediaCandidate(candidate: MediaCandidate) {
     source: candidate.source,
     external_id: candidate.external_id
   }
+}
+
+function selectedSiteSearchMedia() {
+  if (!selectedMedia.value) return null
+  const media = rawMediaCandidate(selectedMedia.value)
+  const albums = albumList(selectedMedia.value)
+  if (!albums.length) return media
+  const selectedAlbums = selectedAlbumNames.value.filter((album) => albums.includes(album))
+  return {
+    ...media,
+    album: selectedAlbums[0] ?? null,
+    albums: selectedAlbums
+  }
+}
+
+function selectAllAlbums() {
+  selectedAlbumNames.value = [...selectedMediaAlbums.value]
+}
+
+function clearSelectedAlbums() {
+  selectedAlbumNames.value = []
+}
+
+function toggleSelectedAlbum(album: string) {
+  selectedAlbumNames.value = selectedAlbumNames.value.includes(album)
+    ? selectedAlbumNames.value.filter((item) => item !== album)
+    : [...selectedAlbumNames.value, album]
 }
 
 function mediaSummary(candidate: MediaCandidate) {
@@ -4962,8 +5005,9 @@ onUnmounted(() => {
 
     <v-dialog v-model="searchDialog" max-width="460">
       <v-card title="搜索">
-        <v-card-text>
-          <v-text-field v-model="searchText" label="搜索文本" autofocus @keyup.enter="runSearch" />
+        <v-card-text class="dialog-stack">
+          <v-text-field v-model="searchText" label="歌曲名" autofocus @keyup.enter="runSearch" />
+          <v-text-field v-model="searchArtist" label="歌手（可选）" @keyup.enter="runSearch" />
         </v-card-text>
         <v-card-actions>
           <v-spacer />
@@ -4991,28 +5035,54 @@ onUnmounted(() => {
             <div class="site-confirm-label">媒体信息</div>
             <div class="site-confirm-title">{{ selectedMedia.title }}</div>
             <div class="site-confirm-line">{{ selectedMedia.artist || '未知艺人' }}</div>
-            <div class="site-confirm-label site-confirm-album-label">专辑列表</div>
-            <div v-if="albumList(selectedMedia).length" class="site-confirm-albums">
-              <div v-for="album in albumList(selectedMedia)" :key="album" class="site-confirm-line">
-                {{ album }}
+            <div class="site-confirm-section-head site-confirm-album-label">
+              <div class="site-confirm-label">专辑范围</div>
+              <div v-if="selectedMediaAlbums.length" class="site-confirm-actions">
+                <v-btn size="x-small" variant="text" @click="selectAllAlbums">全选</v-btn>
+                <v-btn size="x-small" variant="text" @click="clearSelectedAlbums">清空</v-btn>
               </div>
             </div>
-            <div v-else class="site-confirm-line">未知专辑</div>
+            <div v-if="selectedMediaAlbums.length" class="album-select-grid">
+              <button
+                v-for="album in selectedMediaAlbums"
+                :key="album"
+                type="button"
+                class="album-select-chip"
+                :class="{ 'is-selected': selectedAlbumNames.includes(album) }"
+                :title="album"
+                @click="toggleSelectedAlbum(album)"
+              >
+                <v-icon
+                  :icon="selectedAlbumNames.includes(album) ? 'mdi-checkbox-marked' : 'mdi-checkbox-blank-outline'"
+                  size="18"
+                />
+                <span>{{ album }}</span>
+              </button>
+            </div>
+            <div v-if="selectedMediaAlbums.length && !selectedAlbumNames.length" class="site-confirm-hint">
+              至少选择一个专辑后才能执行搜索
+            </div>
+            <div v-else-if="!selectedMediaAlbums.length" class="site-confirm-line">未知专辑</div>
           </div>
-          <v-checkbox
-            v-for="site in sites"
-            :key="site.id || site.name"
-            v-model="selectedSiteIds"
-            :label="site.name"
-            :value="site.id"
-            density="compact"
-            hide-details
-          />
+          <div>
+            <div class="site-confirm-label site-confirm-site-label">站点范围</div>
+            <div class="site-confirm-site-list">
+              <v-checkbox
+                v-for="site in sites"
+                :key="site.id || site.name"
+                v-model="selectedSiteIds"
+                :label="site.name"
+                :value="site.id"
+                density="compact"
+                hide-details
+              />
+            </div>
+          </div>
         </v-card-text>
         <v-card-actions>
           <v-spacer />
           <v-btn variant="text" @click="siteConfirmDialog = false">取消</v-btn>
-          <v-btn color="primary" :disabled="!selectedSiteIds.length" @click="runMetadataSiteSearch">
+          <v-btn color="primary" :disabled="!canRunMetadataSiteSearch" @click="runMetadataSiteSearch">
             执行搜索
           </v-btn>
         </v-card-actions>
@@ -6244,6 +6314,74 @@ onUnmounted(() => {
 .fixed-table :deep(th),
 .fixed-table :deep(td) {
   white-space: nowrap;
+}
+
+.site-confirm-section-head {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.site-confirm-actions {
+  align-items: center;
+  display: flex;
+  gap: 4px;
+}
+
+.site-confirm-site-label {
+  margin-bottom: 6px;
+}
+
+.site-confirm-site-list {
+  display: grid;
+  gap: 2px 12px;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+}
+
+.album-select-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.album-select-chip {
+  align-items: center;
+  background: rgba(var(--v-theme-on-surface), 0.04);
+  border: 1px solid rgba(var(--v-theme-on-surface), 0.16);
+  border-radius: 8px;
+  color: rgba(var(--v-theme-on-surface), 0.76);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  gap: 6px;
+  max-width: min(100%, 260px);
+  min-height: 34px;
+  min-width: 0;
+  padding: 6px 10px;
+}
+
+.album-select-chip:hover {
+  border-color: rgba(var(--v-theme-primary), 0.45);
+}
+
+.album-select-chip.is-selected {
+  background: rgba(var(--v-theme-primary), 0.08);
+  border-color: rgba(var(--v-theme-primary), 0.55);
+  color: rgb(var(--v-theme-primary));
+}
+
+.album-select-chip span {
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.site-confirm-hint {
+  color: rgb(var(--v-theme-error));
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .table-actions {

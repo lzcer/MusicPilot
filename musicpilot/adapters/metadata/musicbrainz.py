@@ -34,22 +34,10 @@ class MusicBrainzProvider:
         artist: str | None = None,
         limit: int = 5,
     ) -> tuple[TrackMetadata, ...]:
-        query = f'recording:"{title}"'
-        if artist:
-            query += f' AND artist:"{artist}"'
-        response = await self._client.get(
-            "/recording",
-            params={
-                "query": query,
-                "fmt": "json",
-                "limit": max(1, min(limit, 25)),
-                "inc": "artist-credits+releases",
-            },
-        )
-        response.raise_for_status()
+        body = await self._recording_search(_recording_query(title, artist), limit=min(limit, 25))
         candidates: list[TrackMetadata] = []
         seen: set[tuple[str, str, str]] = set()
-        for item in response.json().get("recordings", []):
+        for item in body.get("recordings", []):
             item_title = str(item.get("title") or title)
             artist_credit = item.get("artist-credit") or []
             artist_name = str(artist_credit[0].get("name")) if artist_credit else artist
@@ -78,7 +66,23 @@ class MusicBrainzProvider:
                     return tuple(candidates)
         return tuple(candidates)
 
-    async def search(self, query: str, *, limit: int = 10) -> tuple[MediaCandidate, ...]:
+    async def search(
+        self,
+        query: str,
+        *,
+        artist: str | None = None,
+        limit: int = 10,
+    ) -> tuple[MediaCandidate, ...]:
+        search_query = _recording_query(query, artist)
+        body = await self._recording_search(search_query, limit=min(limit, 50))
+        candidates = self._media_candidates(body, query=query, limit=limit)
+        if candidates or not artist:
+            return candidates
+
+        fallback_body = await self._recording_search(_fallback_recording_query(query, artist), limit=min(limit, 50))
+        return self._media_candidates(fallback_body, query=query, limit=limit)
+
+    async def _recording_search(self, query: str, *, limit: int) -> dict[str, object]:
         response = await self._client.get(
             "/recording",
             params={
@@ -89,9 +93,24 @@ class MusicBrainzProvider:
             },
         )
         response.raise_for_status()
+        body = response.json()
+        return body if isinstance(body, dict) else {}
+
+    def _media_candidates(
+        self,
+        body: dict[str, object],
+        *,
+        query: str,
+        limit: int,
+    ) -> tuple[MediaCandidate, ...]:
         candidates: list[MediaCandidate] = []
         seen: set[tuple[str, str, str]] = set()
-        for item in response.json().get("recordings", []):
+        recordings = body.get("recordings", [])
+        if not isinstance(recordings, list):
+            return ()
+        for item in recordings:
+            if not isinstance(item, dict):
+                continue
             title = str(item.get("title") or query)
             artist_credit = item.get("artist-credit") or []
             artist_name = str(artist_credit[0].get("name")) if artist_credit else None
@@ -129,3 +148,35 @@ def _parse_year(date_value: str | None) -> int | None:
 
 def _cover_url(release_id: str) -> str:
     return f"https://coverartarchive.org/release/{release_id}/front-250"
+
+
+def _recording_query(title: str, artist: str | None = None) -> str:
+    query = f'recording:"{_lucene_phrase(title)}"'
+    artist_values = _artist_query_values(artist)
+    if not artist_values:
+        return query
+    artist_query = " OR ".join(
+        f'{field}:"{_lucene_phrase(value)}"'
+        for value in artist_values
+        for field in ("artistname", "creditname", "artist")
+    )
+    return f"{query} AND ({artist_query})"
+
+
+def _fallback_recording_query(title: str, artist: str) -> str:
+    return f'"{_lucene_phrase(title)}" "{_lucene_phrase(artist)}"'
+
+
+def _artist_query_values(artist: str | None) -> tuple[str, ...]:
+    value = str(artist or "").strip()
+    if not value:
+        return ()
+    values = [value]
+    parts = [part.strip() for part in value.split(",", 1)]
+    if len(parts) == 2 and all(parts):
+        values.append(f"{parts[1]} {parts[0]}")
+    return tuple(dict.fromkeys(values))
+
+
+def _lucene_phrase(value: str) -> str:
+    return str(value).strip().replace("\\", "\\\\").replace('"', '\\"')

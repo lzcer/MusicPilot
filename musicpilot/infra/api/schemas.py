@@ -64,6 +64,7 @@ class MediaCandidateResponse(BaseModel):
 
 class MetadataSearchResponse(BaseModel):
     query: str
+    artist: str | None = None
     candidates: list[MediaCandidateResponse]
 
 

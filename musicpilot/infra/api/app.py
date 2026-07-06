@@ -404,8 +404,9 @@ class SearchMediaExecutor:
     async def execute(self, task: object) -> TaskExecutionResult:
         payload = getattr(task, "payload", {}) or {}
         query = str(payload.get("query") or "")
+        artist = _optional_string(payload.get("artist"))
         limit = _optional_int(payload.get("limit")) or 10
-        aggregated = await _search_media_candidates_direct(self.state, query, limit)
+        aggregated = await _search_media_candidates_direct(self.state, query, limit, artist=artist)
         return TaskExecutionResult(
             result={"candidates": [item.model_dump() for item in aggregated]}
         )
@@ -962,18 +963,25 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/api/metadata/search", response_model=MetadataSearchResponse)
-    async def metadata_search(query: str, limit: int = 10) -> MetadataSearchResponse:
+    async def metadata_search(
+        query: str,
+        limit: int = 10,
+        artist: str | None = None,
+    ) -> MetadataSearchResponse:
+        artist_text = artist.strip() if artist else None
         aggregated = await _search_media_candidates(
             state,
             query,
             limit,
+            artist=artist_text,
             log_category="metadata",
         )
+        query_text = f"{query} / {artist_text}" if artist_text else query
         state.add_log(
             "metadata",
-            f"Metadata search completed: {query}, {len(aggregated)} candidate group(s)",
+            f"Metadata search completed: {query_text}, {len(aggregated)} candidate group(s)",
         )
-        return MetadataSearchResponse(query=query, candidates=aggregated)
+        return MetadataSearchResponse(query=query, artist=artist_text, candidates=aggregated)
 
     @app.post("/api/search/by-metadata", response_model=MetadataSiteSearchResponse)
     async def search_by_metadata(
@@ -3444,11 +3452,13 @@ async def _playlist_media_candidates(
     state: AppState,
     track: PlaylistTrack,
 ) -> list[MediaCandidateResponse]:
-    query = " ".join(part for part in (track.title, track.artist) if part).strip()
+    query = str(track.title or "").strip()
+    artist = _optional_string(track.artist)
     aggregated = await _search_media_candidates(
         state,
         query,
         10,
+        artist=artist,
         log_category="playlist",
         use_task_manager=False,
     )
@@ -3948,6 +3958,7 @@ async def _search_media_candidates(
     query: str,
     limit: int,
     *,
+    artist: str | None = None,
     log_category: str,
     use_task_manager: bool = True,
 ) -> list[MediaCandidateResponse]:
@@ -3957,10 +3968,11 @@ async def _search_media_candidates(
             resource_keys=[await _media_search_resource_key(state)],
             payload={
                 "query": query,
+                "artist": artist,
                 "limit": limit,
                 "log_category": log_category,
             },
-            runner=lambda: _search_media_candidates_direct(state, query, limit),
+            runner=lambda: _search_media_candidates_direct(state, query, limit, artist=artist),
             wait_log_message="Playlist metadata search waiting for media-search resource.",
         )
     task_id = await state.task_manager.enqueue(
@@ -3969,6 +3981,7 @@ async def _search_media_candidates(
             resource_keys=[await _media_search_resource_key(state)],
             payload={
                 "query": query,
+                "artist": artist,
                 "limit": limit,
                 "log_category": log_category,
             },
@@ -3989,6 +4002,8 @@ async def _search_media_candidates_direct(
     state: AppState,
     query: str,
     limit: int,
+    *,
+    artist: str | None = None,
 ) -> list[MediaCandidateResponse]:
     candidates: list[MediaCandidate] = []
     for provider in state.metadata.providers:
@@ -3996,10 +4011,11 @@ async def _search_media_candidates_direct(
         if search is None:
             continue
         try:
-            provider_candidates = await search(
-                query,
-                limit=min(max(limit * 5, limit), 50),
-            )
+            search_limit = min(max(limit * 5, limit), 50)
+            if artist:
+                provider_candidates = await search(query, artist=artist, limit=search_limit)
+            else:
+                provider_candidates = await search(query, limit=search_limit)
         except Exception as exc:  # noqa: BLE001
             state.add_log("metadata", f"Metadata provider failed: {exc}", "WARNING")
             continue
