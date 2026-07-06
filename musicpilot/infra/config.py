@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     music_library_path: Path = Field(default=Path("./data/library"))
     download_staging_path: Path = Field(default=Path("./data/downloads"))
     static_dir: Path = Field(default=Path("frontend/dist"))
+    system_indexer_parser_config: Path = Field(default=Path("config/sites.parser.yaml"))
     indexer_parser_config: Path = Field(default=Path("config/sites.parser.yaml"))
     runtime_config: Path = Field(default=Path("config/runtime.json"))
     qbittorrent_base_url: str | None = None

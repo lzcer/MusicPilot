@@ -29,7 +29,7 @@ from sqlalchemy.exc import IntegrityError
 
 from musicpilot.adapters.bots import TelegramBotAdapter, TelegramHttpNotifier
 from musicpilot.adapters.downloaders import QBittorrentClient
-from musicpilot.adapters.indexers import build_nexusphp_indexers, load_parser_catalog
+from musicpilot.adapters.indexers import build_nexusphp_indexers, load_merged_parser_catalog
 from musicpilot.adapters.indexers.nexusphp import (
     NexusPHPCrawler,
     NexusPHPParserConfig,
@@ -533,7 +533,10 @@ class AppState:
         self.log_handler = AppLogHandler(self.logs)
         self.event_bus = EventBus()
         self.database = Database(settings.database_url)
-        self.parser_catalog = load_parser_catalog(settings.indexer_parser_config)
+        self.parser_catalog = load_merged_parser_catalog(
+            settings.system_indexer_parser_config,
+            settings.indexer_parser_config,
+        )
         self.indexers = ()
         self.repository = SqlAlchemyMediaRepository(self.database)
         self.artist_service = ArtistService(repository=self.repository)
@@ -654,7 +657,10 @@ class AppState:
                     await self.repository.upsert_notifier(payload=_legacy_notifier_payload(item))
 
     def reload_parser_catalog(self) -> None:
-        self.parser_catalog = load_parser_catalog(self.settings.indexer_parser_config)
+        self.parser_catalog = load_merged_parser_catalog(
+            self.settings.system_indexer_parser_config,
+            self.settings.indexer_parser_config,
+        )
 
     async def search_indexer(
         self,

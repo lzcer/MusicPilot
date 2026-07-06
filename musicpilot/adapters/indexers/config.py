@@ -32,8 +32,23 @@ class ParserCatalog:
 
 
 def load_parser_catalog(path: Path) -> ParserCatalog:
+    return ParserCatalog(_load_parser_catalog_entries(path))
+
+
+def load_merged_parser_catalog(system_path: Path, user_path: Path) -> ParserCatalog:
+    merged: dict[str, ParserCatalogEntry] = {}
+    paths = (system_path,) if system_path == user_path else (system_path, user_path)
+
+    for path in paths:
+        for entry in _load_parser_catalog_entries(path):
+            merged[_normalized_host(entry.base_url)] = entry
+
+    return ParserCatalog(tuple(merged.values()))
+
+
+def _load_parser_catalog_entries(path: Path) -> tuple[ParserCatalogEntry, ...]:
     if not path.exists():
-        return ParserCatalog(())
+        return ()
 
     payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     sites = payload.get("sites", [])
@@ -44,19 +59,37 @@ def load_parser_catalog(path: Path) -> ParserCatalog:
     for site in sites:
         if not isinstance(site, dict):
             raise ValueError(f"Invalid parser site entry in {path}: expected mapping")
+        parser = parser_config_from_mapping(site.get("parser"))
         try:
-            entries.append(
-                ParserCatalogEntry(
-                    name=str(site["name"]),
-                    base_url=str(site["base_url"]),
-                    parser=parser_config_from_mapping(site.get("parser")),
+            for target in _parser_site_targets(site, path):
+                entries.append(
+                    ParserCatalogEntry(
+                        name=str(target["name"]),
+                        base_url=str(target["base_url"]),
+                        parser=parser,
+                    )
                 )
-            )
         except KeyError as exc:
             raise ValueError(
                 f"Missing required parser site config key {exc.args[0]!r} in {path}"
             ) from exc
-    return ParserCatalog(tuple(entries))
+    return tuple(entries)
+
+
+def _parser_site_targets(site: dict[str, Any], path: Path) -> tuple[dict[str, Any], ...]:
+    if "targets" not in site:
+        return ({"name": site["name"], "base_url": site["base_url"]},)
+
+    targets = site["targets"]
+    if not isinstance(targets, list):
+        raise ValueError(f"Invalid parser site targets in {path}: expected list")
+
+    parsed_targets: list[dict[str, Any]] = []
+    for target in targets:
+        if not isinstance(target, dict):
+            raise ValueError(f"Invalid parser site target in {path}: expected mapping")
+        parsed_targets.append({"name": target["name"], "base_url": target["base_url"]})
+    return tuple(parsed_targets)
 
 
 def build_nexusphp_indexers(

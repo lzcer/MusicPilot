@@ -1,40 +1,9 @@
 sites:
-  - name: OpenCD
-    base_url: https://open.cd
-    parser:
-      list_selector: "table.torrents tr:has(a[href*='details.php']):has(a[href*='download.php'])"
-      fields:
-        title:
-          selector: "a[href*='details.php']"
-          filters: ["collapse_space"]
-        subtitle:
-          selector: "td:nth-of-type(2) .subtitle, td:nth-of-type(2) .embedded, td:nth-of-type(2) > span, td:nth-of-type(2)"
-          attribute: "text"
-          filters: ["collapse_space"]
-        details:
-          selector: "a[href*='details.php']"
-          attribute: "href"
-        download:
-          selector: "a[href*='download.php']"
-          attribute: "href"
-        size:
-          selector: "td"
-          attribute: "text+attrs"
-          regex: "(\\d+(?:\\.\\d+)?\\s*(?:[KMGT]i?B|[KMGT]B))"
-        published_at:
-          selector: "time, td, span, font"
-          attribute: "text+attrs"
-          filters: ["date"]
-        promotion:
-          selector: "img, font, span, td"
-          attribute: "text+attrs"
-          filters: ["promotion"]
-        seeders:
-          selector: ":scope > td:nth-last-of-type(4)"
-        leechers:
-          selector: ":scope > td:nth-last-of-type(3)"
-  - name: HDFans
-    base_url: https://hdfans.org/
+  - targets:
+      - name: OpenCD
+        base_url: https://open.cd
+      - name: HDFans
+        base_url: https://hdfans.org/
     parser:
       list_selector: "table.torrents tr:has(a[href*='details.php']):has(a[href*='download.php'])"
       fields:

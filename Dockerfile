@@ -51,12 +51,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --no-build-isolation \
       .
 COPY config ./config
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN mkdir -p /data /music /downloads /config \
-    && chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN mkdir -p /data /music /downloads /config
 COPY --from=frontend /app/frontend/dist /app/frontend/dist
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/api/health', timeout=5).read()" || exit 1
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["uvicorn", "musicpilot.infra.api.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]

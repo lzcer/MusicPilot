@@ -180,13 +180,34 @@ image: ghcr.io/lzcer/musicpilot:1.0.0
 
 镜像支持 `linux/amd64` 和 `linux/arm64`，Docker 会根据运行机器的架构自动拉取对应镜像。
 
-首次启动时，如果宿主机挂载目录中没有站点解析器配置，容器会自动把内置配置初始化到：
+MusicPilot 会同时读取镜像内置的站点解析器配置和用户自定义配置。内置配置随镜像更新，用户自定义配置用于新增或覆盖规则。
+
+如果需要自定义站点解析器，把配置文件放到：
 
 ```text
 ./config/sites.parser.yaml
 ```
 
-后续可以直接修改该文件来自定义站点解析器，修改后重启容器生效：
+多个站点共用同一套解析规则时，可以把站点写在同一个 `targets` 列表中：
+
+```yaml
+sites:
+  - targets:
+      - name: OpenCD
+        base_url: https://open.cd
+      - name: HDFans
+        base_url: https://hdfans.org/
+    parser:
+      list_selector: "table.torrents tr:has(a[href*='details.php']):has(a[href*='download.php'])"
+      fields:
+        title:
+          selector: "a[href*='details.php']"
+        download:
+          selector: "a[href*='download.php']"
+          attribute: href
+```
+
+只有解析规则不同时，才需要新增一个 `sites` 条目。当用户配置中的 `base_url` 与内置配置重复时，以用户配置为准。修改后重启容器生效：
 
 ```bash
 docker compose up -d
