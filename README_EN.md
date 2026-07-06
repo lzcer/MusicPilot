@@ -121,56 +121,56 @@ git clone <your-repo-url> MusicPilot
 cd MusicPilot
 ```
 
-2. Copy the environment template:
+2. Update the key values in `docker-compose.yml`:
 
-```bash
-cp .env.example .env
-```
-
-3. Update the key values in `.env`:
-
-```text
-MP_HTTP_PORT=8000
-MP_ADMIN_USERNAME=admin
-MP_ADMIN_PASSWORD=change-this-password
-MP_SESSION_SECRET=change-this-random-secret
-MP_HOST_DATA_PATH=/volume1/docker/musicpilot/data
-MP_HOST_CONFIG_PATH=/volume1/docker/musicpilot/config
-MP_HOST_MUSIC_PATH=/volume1/music
-MP_HOST_DOWNLOADS_PATH=/volume1/downloads
+```yaml
+ports:
+  - "8000:8000"
+volumes:
+  - /volume1/docker/musicpilot/data:/data
+  - /volume1/docker/musicpilot/config:/config
+  - /volume1/music:/music
+  - /volume1/downloads:/downloads
+environment:
+  MP_ADMIN_USERNAME: admin
+  MP_ADMIN_PASSWORD: change-this-password
+  MP_SESSION_SECRET: change-this-random-secret
 ```
 
 If the Docker build container cannot reach PyPI while the host network works normally, keep:
 
-```text
-MP_DOCKER_BUILD_NETWORK=host
+```yaml
+build:
+  network: host
 ```
 
 If you need a more stable Python package mirror, adjust:
 
-```text
-UV_DEFAULT_INDEX=https://pypi.org/simple
+```yaml
+build:
+  args:
+    UV_DEFAULT_INDEX: https://pypi.org/simple
 ```
 
-4. Build and start the service:
+3. Build and start the service:
 
 ```bash
 docker compose up -d --build
 ```
 
-5. Open the Web UI:
+4. Open the Web UI:
 
 ```text
 http://<NAS_IP>:8000
 ```
 
-6. View logs:
+5. View logs:
 
 ```bash
 docker compose logs -f musicpilot
 ```
 
-7. Update the project:
+6. Update the project:
 
 ```bash
 git pull
@@ -179,10 +179,10 @@ docker compose up -d --build
 
 ### 6.1. Optional PostgreSQL Database
 
-MusicPilot uses SQLite by default, which fits single-host and NAS deployments. For higher concurrency or an external database, change `MP_DATABASE_URL` in `.env` to a PostgreSQL connection string:
+MusicPilot uses SQLite by default, which fits single-host and NAS deployments. For higher concurrency or an external database, change `MP_DATABASE_URL` in `docker-compose.yml` to a PostgreSQL connection string:
 
-```text
-MP_DATABASE_URL=postgresql+asyncpg://musicpilot:change-this-password@postgres:5432/musicpilot
+```yaml
+MP_DATABASE_URL: postgresql+asyncpg://musicpilot:change-this-password@postgres:5432/musicpilot
 ```
 
 Create the PostgreSQL database and user before starting MusicPilot. On startup, MusicPilot runs Alembic to initialize or upgrade the schema.

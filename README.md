@@ -123,22 +123,7 @@ mkdir -p musicpilot
 cd musicpilot
 ```
 
-2. 创建 `.env` 文件：
-
-```bash
-cat > .env <<'EOF'
-MP_HTTP_PORT=8000
-MP_ADMIN_USERNAME=admin
-MP_ADMIN_PASSWORD=change-this-password
-MP_SESSION_SECRET=change-this-random-secret
-MP_HOST_DATA_PATH=./data
-MP_HOST_CONFIG_PATH=./config
-MP_HOST_MUSIC_PATH=/volume1/music
-MP_HOST_DOWNLOADS_PATH=/volume1/downloads
-EOF
-```
-
-3. 创建 `docker-compose.yml` 文件：
+2. 创建 `docker-compose.yml` 文件：
 
 ```bash
 cat > docker-compose.yml <<'EOF'
@@ -148,29 +133,31 @@ services:
     environment:
       MP_APP_NAME: MusicPilot
       MP_LOG_LEVEL: INFO
-      MP_ADMIN_USERNAME: ${MP_ADMIN_USERNAME:-admin}
-      MP_ADMIN_PASSWORD: ${MP_ADMIN_PASSWORD:-musicpilot}
-      MP_SESSION_SECRET: ${MP_SESSION_SECRET:-musicpilot-change-me}
-      MP_DATABASE_URL: ${MP_DATABASE_URL:-sqlite+aiosqlite:////data/musicpilot.db}
+      MP_ADMIN_USERNAME: admin
+      MP_ADMIN_PASSWORD: change-this-password
+      MP_SESSION_SECRET: change-this-random-secret
+      MP_DATABASE_URL: sqlite+aiosqlite:////data/musicpilot.db
       MP_MUSIC_LIBRARY_PATH: /music
       MP_DOWNLOAD_STAGING_PATH: /downloads
       MP_STATIC_DIR: /app/frontend/dist
       MP_INDEXER_PARSER_CONFIG: /config/sites.parser.yaml
       MP_RUNTIME_CONFIG: /config/runtime.json
-      MP_MUSICBRAINZ_USER_AGENT: ${MP_MUSICBRAINZ_USER_AGENT:-MusicPilot/1.0.0 (self-hosted)}
-      MP_WRITE_AUDIO_TAGS: ${MP_WRITE_AUDIO_TAGS:-true}
-      MP_SUBSCRIPTIONS_ENABLED: ${MP_SUBSCRIPTIONS_ENABLED:-true}
-      MP_SUBSCRIPTION_CHECK_INTERVAL_MINUTES: ${MP_SUBSCRIPTION_CHECK_INTERVAL_MINUTES:-1440}
+      MP_MUSICBRAINZ_USER_AGENT: MusicPilot/1.0.0 (self-hosted)
+      MP_WRITE_AUDIO_TAGS: "true"
+      MP_SUBSCRIPTIONS_ENABLED: "true"
+      MP_SUBSCRIPTION_CHECK_INTERVAL_MINUTES: "1440"
     restart: unless-stopped
     ports:
-      - "${MP_HTTP_PORT:-8000}:8000"
+      - "8000:8000"
     volumes:
-      - ${MP_HOST_DATA_PATH:-./data}:/data
-      - ${MP_HOST_CONFIG_PATH:-./config}:/config
-      - ${MP_HOST_MUSIC_PATH:-./data/library}:/music
-      - ${MP_HOST_DOWNLOADS_PATH:-./data/downloads}:/downloads
+      - ./data:/data
+      - ./config:/config
+      - /volume1/music:/music
+      - /volume1/downloads:/downloads
 EOF
 ```
+
+需要调整端口、账号密码、密钥或目录时，直接修改 `docker-compose.yml` 里的对应值。
 
 如果希望固定版本，建议把镜像改为明确的版本号，例如：
 
@@ -207,32 +194,28 @@ sites:
           attribute: href
 ```
 
-只有解析规则不同时，才需要新增一个 `sites` 条目。当用户配置中的 `base_url` 与内置配置重复时，以用户配置为准。修改后重启容器生效：
+只有解析规则不同时，才需要新增一个 `sites` 条目。当用户配置中的 `base_url` 与内置配置重复时，以用户配置为准。后续修改该文件后，重新启动容器生效。
 
-```bash
-docker compose up -d
-```
-
-4. 拉取镜像并启动服务：
+3. 拉取镜像并启动服务：
 
 ```bash
 docker compose pull
 docker compose up -d
 ```
 
-5. 打开 Web UI：
+4. 打开 Web UI：
 
 ```text
 http://<NAS_IP>:8000
 ```
 
-6. 查看日志：
+5. 查看日志：
 
 ```bash
 docker compose logs -f musicpilot
 ```
 
-7. 更新到最新镜像：
+6. 更新到最新镜像：
 
 ```bash
 docker compose pull
@@ -250,56 +233,56 @@ git clone <your-repo-url> MusicPilot
 cd MusicPilot
 ```
 
-2. 复制环境变量模板：
+2. 修改 `docker-compose.yml` 中的关键配置：
 
-```bash
-cp .env.example .env
-```
-
-3. 修改 `.env` 中的关键配置：
-
-```text
-MP_HTTP_PORT=8000
-MP_ADMIN_USERNAME=admin
-MP_ADMIN_PASSWORD=change-this-password
-MP_SESSION_SECRET=change-this-random-secret
-MP_HOST_DATA_PATH=/volume1/docker/musicpilot/data
-MP_HOST_CONFIG_PATH=/volume1/docker/musicpilot/config
-MP_HOST_MUSIC_PATH=/volume1/music
-MP_HOST_DOWNLOADS_PATH=/volume1/downloads
+```yaml
+ports:
+  - "8000:8000"
+volumes:
+  - /volume1/docker/musicpilot/data:/data
+  - /volume1/docker/musicpilot/config:/config
+  - /volume1/music:/music
+  - /volume1/downloads:/downloads
+environment:
+  MP_ADMIN_USERNAME: admin
+  MP_ADMIN_PASSWORD: change-this-password
+  MP_SESSION_SECRET: change-this-random-secret
 ```
 
 如果 Docker 构建时容器网络无法访问 PyPI，而宿主机网络正常，可以保留：
 
-```text
-MP_DOCKER_BUILD_NETWORK=host
+```yaml
+build:
+  network: host
 ```
 
 如果需要使用更稳定的 Python 包镜像源，可以调整：
 
-```text
-UV_DEFAULT_INDEX=https://pypi.org/simple
+```yaml
+build:
+  args:
+    UV_DEFAULT_INDEX: https://pypi.org/simple
 ```
 
-4. 构建并启动服务：
+3. 构建并启动服务：
 
 ```bash
 docker compose up -d --build
 ```
 
-5. 打开 Web UI：
+4. 打开 Web UI：
 
 ```text
 http://<NAS_IP>:8000
 ```
 
-6. 查看日志：
+5. 查看日志：
 
 ```bash
 docker compose logs -f musicpilot
 ```
 
-7. 更新项目：
+6. 更新项目：
 
 ```bash
 git pull
@@ -395,10 +378,10 @@ http://127.0.0.1:8000
 
 ### 6.4. 可选 PostgreSQL 数据库
 
-MusicPilot 默认使用 SQLite，适合单机和 NAS 部署。需要更高并发或希望使用独立数据库时，可以把 `.env` 中的 `MP_DATABASE_URL` 改为 PostgreSQL 连接串：
+MusicPilot 默认使用 SQLite，适合单机和 NAS 部署。需要更高并发或希望使用独立数据库时，可以把 `docker-compose.yml` 中的 `MP_DATABASE_URL` 改为 PostgreSQL 连接串：
 
-```text
-MP_DATABASE_URL=postgresql+asyncpg://musicpilot:change-this-password@postgres:5432/musicpilot
+```yaml
+MP_DATABASE_URL: postgresql+asyncpg://musicpilot:change-this-password@postgres:5432/musicpilot
 ```
 
 PostgreSQL 数据库和用户需要提前创建。MusicPilot 启动时会通过 Alembic 自动初始化或升级表结构。
