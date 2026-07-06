@@ -7,6 +7,10 @@ sites:
     parser:
       list_selector: "table.torrents tr:has(a[href*='details.php']):has(a[href*='download.php'])"
       fields:
+        type:
+          selector: "td:nth-of-type(1)"
+          attribute: "titles"
+          filters: ["category"]
         title:
           selector: "a[href*='details.php']"
           filters: ["collapse_space"]
@@ -36,3 +40,59 @@ sites:
           selector: ":scope > td:nth-last-of-type(4)"
         leechers:
           selector: ":scope > td:nth-last-of-type(3)"
+      filter:
+        type:
+          include:
+            - music
+  - targets:
+      - name: HHClub
+        base_url: https://hhanclub.net/
+      - name: HHClub
+        base_url: https://hhan.club/
+      - name: HHClub
+        base_url: https://hhanclub.top/
+    parser:
+      search_params:
+        search-mode: "0"
+        incldead: "1"
+        spstate: "0"
+        inclbookmarked: "0"
+        search_area: "0"
+        search_all: "1"
+      list_selector: "div.torrent-table-sub-info:has(a[href^='details.php?id=']), div.w-full:has(a[href^='details.php?id='])"
+      fields:
+        type:
+          selector: "a[href*='cat[]=']"
+          attribute: "text+attrs"
+          filters: ["category"]
+        title:
+          selector: ".torrent-title a[href^='details.php?id='], a[href^='details.php?id=']"
+          filters: ["collapse_space"]
+        subtitle:
+          selector: ".torrent-title .torrent-info-text-small-name, .torrent-title > div > div"
+          filters: ["collapse_space"]
+        details:
+          selector: "a[href^='details.php?id=']"
+          attribute: "href"
+        download:
+          selector: "a[href^='download.php?id=']"
+          attribute: "href"
+        size:
+          selector: ".torrent-info-text-size, div.torrent-info-text:nth-child(1)"
+          filters: ["collapse_space"]
+        published_at:
+          selector: ".torrent-info-text-added, div.torrent-info-text:nth-child(2)"
+          attribute: "text+attrs"
+          filters: ["date"]
+        promotion:
+          selector: "span[class*='promotion-tag']"
+          attribute: "class"
+          filters: ["promotion"]
+        seeders:
+          selector: ".torrent-info-text-seeders, div.torrent-info-text:nth-child(3)"
+        leechers:
+          selector: ".torrent-info-text-leechers, div.torrent-info-text:nth-child(4)"
+      filter:
+        type:
+          include:
+            - music

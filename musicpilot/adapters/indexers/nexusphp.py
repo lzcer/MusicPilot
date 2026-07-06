@@ -23,11 +23,20 @@ class FieldRule:
 
 
 @dataclass(frozen=True, slots=True)
+class ResultFilterRule:
+    include: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class NexusPHPParserConfig:
     list_selector: str = (
         "table.torrents tr:has(a[href*='details.php']):has(a[href*='download.php'])"
     )
     fields: dict[str, FieldRule] = field(default_factory=dict)
+    result_filter: dict[str, ResultFilterRule] = field(default_factory=dict)
+    search_query_param: str = "search"
+    search_params: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +82,11 @@ class NexusPHPCrawler:
 
         async with self._semaphore:
             if self._client is None:
-                async with httpx.AsyncClient(http2=True, timeout=20, proxy=self._proxy_url) as client:
+                async with httpx.AsyncClient(
+                    http2=True,
+                    timeout=20,
+                    proxy=self._proxy_url,
+                ) as client:
                     html = await self._fetch(client, query, headers)
             else:
                 html = await self._fetch(self._client, query, headers)
@@ -128,7 +141,9 @@ class NexusPHPCrawler:
         headers: dict[str, str],
     ) -> str:
         url = urljoin(self.config.base_url, "torrents.php")
-        response = await client.get(url, params={"search": query}, headers=headers)
+        params = dict(self.config.parser.search_params)
+        params[self.config.parser.search_query_param] = query
+        response = await client.get(url, params=params, headers=headers)
         response.raise_for_status()
         return response.text
 
@@ -180,6 +195,10 @@ class NexusPHPCrawler:
             if not title or not download_href:
                 continue
 
+            filter_values = _extract_filter_values(row, fields, parser.result_filter)
+            if not _matches_result_filter(filter_values, parser.result_filter):
+                continue
+
             details_href = _extract_field(row, fields.get("details"))
             subtitle = _extract_field(row, fields.get("subtitle"))
             if subtitle:
@@ -198,6 +217,7 @@ class NexusPHPCrawler:
                 subtitle=subtitle,
                 published_at=_extract_field(row, fields.get("published_at")),
                 promotion=_normalize_promotion(_extract_field(row, fields.get("promotion"))),
+                metadata=filter_values,
             )
             key = result.details_url or result.download_url
             if key in seen:
@@ -208,6 +228,40 @@ class NexusPHPCrawler:
                 break
 
         return tuple(results)
+
+
+def _extract_filter_values(
+    row: Tag,
+    fields: dict[str, FieldRule],
+    result_filter: dict[str, ResultFilterRule],
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    field_names = set(result_filter)
+    if "type" in fields:
+        field_names.add("type")
+    for name in field_names:
+        value = _extract_field(row, fields.get(name))
+        if value:
+            values[name] = value
+    return values
+
+
+def _matches_result_filter(
+    values: dict[str, str],
+    result_filter: dict[str, ResultFilterRule],
+) -> bool:
+    for name, rule in result_filter.items():
+        value = values.get(name, "")
+        if rule.exclude and _contains_any(value, rule.exclude):
+            return False
+        if rule.include and not _contains_any(value, rule.include):
+            return False
+    return True
+
+
+def _contains_any(value: str, needles: tuple[str, ...]) -> bool:
+    lowered = value.lower()
+    return any(needle.lower() in lowered for needle in needles)
 
 
 def _extract_field(row: Tag | BeautifulSoup, rule: FieldRule | None) -> str | None:
@@ -255,6 +309,8 @@ def _select_index(nodes: list[Tag], index: int | None) -> Tag | None:
 def _read_node_value(node: Tag, attribute: str) -> str:
     if attribute == "text":
         return node.get_text(" ", strip=True)
+    if attribute == "titles":
+        return _read_node_attribute_values(node, "title")
     if attribute == "text+attrs":
         parts = [node.get_text(" ", strip=True)]
         for candidate in [node, *node.select("[title], [alt], [datetime], [class], img[src]")]:
@@ -271,6 +327,17 @@ def _read_node_value(node: Tag, attribute: str) -> str:
     return str(value or "")
 
 
+def _read_node_attribute_values(node: Tag, attribute: str) -> str:
+    parts: list[str] = []
+    for candidate in [node, *node.select(f"[{attribute}]")]:
+        value = candidate.get(attribute)
+        if isinstance(value, list):
+            parts.extend(str(item) for item in value)
+        elif isinstance(value, str):
+            parts.append(value)
+    return " ".join(part for part in parts if part)
+
+
 def _apply_filters(value: str, filters: tuple[str, ...]) -> str:
     result = value
     for name in filters:
@@ -282,7 +349,49 @@ def _apply_filters(value: str, filters: tuple[str, ...]) -> str:
             result = _first_match(result, _DATE_PATTERN, _SHORT_DATE_PATTERN)
         elif name == "promotion":
             result = _first_promotion_marker(result)
+        elif name == "category":
+            result = _normalize_category(result)
     return result.strip()
+
+
+def _normalize_category(value: str) -> str:
+    seen: set[str] = set()
+    parts: list[str] = []
+    for raw_part in re.split(r"\s+", value):
+        part = _category_part(raw_part)
+        if not part or _is_category_noise(part):
+            continue
+        key = part.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append(part)
+    return " / ".join(parts)
+
+
+def _category_part(value: str) -> str:
+    part = value.strip()
+    lowered = part.lower()
+    icon_match = re.search(
+        r"(?:^|/)icon[-_]([a-z0-9][a-z0-9_-]*)\.(?:gif|png|jpg|jpeg|webp|svg)$",
+        lowered,
+    )
+    if icon_match:
+        return icon_match.group(1).replace("_", "-")
+    return part
+
+
+def _is_category_noise(value: str) -> bool:
+    lowered = value.lower()
+    if lowered in _CATEGORY_NOISE_MARKERS:
+        return True
+    if lowered.startswith("!"):
+        return True
+    if lowered.startswith("pic/") or lowered.startswith("/pic/"):
+        return True
+    if lowered.endswith((".gif", ".png", ".jpg", ".jpeg", ".webp", ".svg")):
+        return True
+    return bool(re.fullmatch(r"c_[a-z0-9_:-]+", lowered))
 
 
 def _first_match(value: str, *patterns: re.Pattern[str]) -> str:
@@ -380,3 +489,10 @@ _PROMOTION_MARKERS = (
     ("50%", "50%"),
     ("促销", "促销"),
 )
+_CATEGORY_NOISE_MARKERS = {
+    "cat",
+    "category",
+    "rowfollow",
+    "nowrap",
+    "类型",
+}

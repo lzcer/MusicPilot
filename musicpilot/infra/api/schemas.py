@@ -44,6 +44,7 @@ class SearchResultResponse(BaseModel):
     subtitle: str | None = None
     published_at: str | None = None
     promotion: str | None = None
+    metadata: dict[str, object] = Field(default_factory=dict)
 
 
 class SearchResponse(BaseModel):
@@ -342,6 +343,9 @@ class NexusPHPParserRequest(BaseModel):
         min_length=1,
     )
     fields: dict[str, ParserFieldRequest] = Field(default_factory=dict)
+    filter: dict[str, object] = Field(default_factory=dict)
+    search_query_param: str = "search"
+    search_params: dict[str, str] = Field(default_factory=dict)
 
 
 class SiteCreateRequest(BaseModel):
@@ -351,6 +355,7 @@ class SiteCreateRequest(BaseModel):
     user_agent: str | None = None
     max_concurrency: int = Field(default=2, ge=1, le=10)
     use_proxy: bool = False
+    enabled: bool = True
 
 
 class SiteResponse(SiteCreateRequest):

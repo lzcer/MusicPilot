@@ -306,7 +306,94 @@ git pull
 docker compose up -d --build
 ```
 
-### 6.3. 可选 PostgreSQL 数据库
+### 6.3. 本地开发启动
+
+以下方式适合在本机修改源码、调试接口和开发前端页面。需要提前安装 Python、`uv`、Node.js 和 npm。
+
+1. 第一次拉代码时，安装后端依赖并启动 API：
+
+```bash
+uv venv .venv
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+uvicorn musicpilot.infra.api.app:create_app --factory --reload
+```
+
+后端默认监听：
+
+```text
+http://127.0.0.1:8000
+```
+
+以后后端依赖没有变化时，只需要：
+
+```bash
+source .venv/bin/activate
+uvicorn musicpilot.infra.api.app:create_app --factory --reload
+```
+
+2. 第一次启动前端时，另开一个终端安装依赖并启动：
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+前端开发服务器默认监听：
+
+```text
+http://127.0.0.1:5173
+```
+
+Vite 已配置把 `/api` 代理到 `http://127.0.0.1:8000`，所以本地开发时通常打开：
+
+```text
+http://127.0.0.1:5173
+```
+
+默认登录账号：
+
+```text
+admin / musicpilot
+```
+
+本地开发不强制需要 `.env`。如果要改账号、数据库或目录，可以在项目根目录创建 `.env` 覆盖默认值。
+
+3. 可以用健康检查确认后端已启动：
+
+```bash
+curl --noproxy '*' http://127.0.0.1:8000/api/health
+```
+
+4. 常用检查命令：
+
+```bash
+make test
+make lint
+make smoke
+cd frontend
+npm run build
+```
+
+5. 如果只想用后端直接托管前端静态文件，先执行：
+
+```bash
+cd frontend
+npm ci
+npm run build
+cd ..
+source .venv/bin/activate
+uvicorn musicpilot.infra.api.app:create_app --factory --reload
+```
+
+然后打开：
+
+```text
+http://127.0.0.1:8000
+```
+
+### 6.4. 可选 PostgreSQL 数据库
 
 MusicPilot 默认使用 SQLite，适合单机和 NAS 部署。需要更高并发或希望使用独立数据库时，可以把 `.env` 中的 `MP_DATABASE_URL` 改为 PostgreSQL 连接串：
 
@@ -316,7 +403,7 @@ MP_DATABASE_URL=postgresql+asyncpg://musicpilot:change-this-password@postgres:54
 
 PostgreSQL 数据库和用户需要提前创建。MusicPilot 启动时会通过 Alembic 自动初始化或升级表结构。
 
-### 6.4. 配置教程
+### 6.5. 配置教程
 
 首次启动后，还需要在 Web UI 中配置站点、下载器、音乐库、整理规则和通知渠道。
 

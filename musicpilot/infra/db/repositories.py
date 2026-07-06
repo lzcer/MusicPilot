@@ -1799,6 +1799,7 @@ class SqlAlchemyMediaRepository:
         user_agent: str | None = None,
         max_concurrency: int = 2,
         use_proxy: bool = False,
+        enabled: bool = True,
     ) -> IndexerSite:
         async with self.database.session() as session:
             site = IndexerSite(
@@ -1808,6 +1809,7 @@ class SqlAlchemyMediaRepository:
                 user_agent=user_agent,
                 max_concurrency=max_concurrency,
                 use_proxy=use_proxy,
+                enabled=enabled,
             )
             session.add(site)
             await session.commit()
@@ -1824,6 +1826,7 @@ class SqlAlchemyMediaRepository:
         user_agent: str | None = None,
         max_concurrency: int = 2,
         use_proxy: bool = False,
+        enabled: bool = True,
     ) -> IndexerSite | None:
         async with self.database.session() as session:
             result = await session.execute(select(IndexerSite).where(IndexerSite.id == site_id))
@@ -1836,6 +1839,7 @@ class SqlAlchemyMediaRepository:
             site.user_agent = user_agent
             site.max_concurrency = max_concurrency
             site.use_proxy = use_proxy
+            site.enabled = enabled
             await session.commit()
             await session.refresh(site)
             return site

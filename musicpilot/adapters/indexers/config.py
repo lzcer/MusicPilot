@@ -12,6 +12,7 @@ from musicpilot.adapters.indexers.nexusphp import (
     NexusPHPCrawler,
     NexusPHPParserConfig,
     NexusPHPSiteConfig,
+    ResultFilterRule,
 )
 
 
@@ -99,6 +100,8 @@ def build_nexusphp_indexers(
 ) -> tuple[NexusPHPCrawler, ...]:
     crawlers: list[NexusPHPCrawler] = []
     for site in sites:
+        if not bool(site.get("enabled", True)):
+            continue
         entry = catalog.match(str(site.get("base_url", "")))
         if entry is None:
             continue
@@ -141,6 +144,15 @@ def parser_config_from_mapping(raw: Any) -> NexusPHPParserConfig:
     raw_fields = raw.get("fields", {})
     if not isinstance(raw_fields, dict):
         raise ValueError("Invalid parser.fields config: expected mapping")
+    raw_filter = raw.get("filter", {})
+    if not isinstance(raw_filter, dict):
+        raise ValueError("Invalid parser.filter config: expected mapping")
+    search_query_param = str(raw.get("search_query_param", "search")).strip()
+    if not search_query_param:
+        raise ValueError("Invalid parser.search_query_param config: value is required")
+    raw_search_params = raw.get("search_params", {})
+    if not isinstance(raw_search_params, dict):
+        raise ValueError("Invalid parser.search_params config: expected mapping")
 
     fields: dict[str, FieldRule] = {}
     for name, value in raw_fields.items():
@@ -157,7 +169,56 @@ def parser_config_from_mapping(raw: Any) -> NexusPHPParserConfig:
         if not fields[str(name)].selector:
             raise ValueError(f"Invalid parser field {name!r}: selector is required")
 
-    return NexusPHPParserConfig(list_selector=list_selector, fields=fields)
+    result_filter = {
+        str(name): _result_filter_rule_from_mapping(name, value)
+        for name, value in raw_filter.items()
+    }
+    missing_filter_fields = [name for name in result_filter if name not in fields]
+    if missing_filter_fields:
+        raise ValueError(
+            "Invalid parser.filter config: missing field(s) "
+            + ", ".join(missing_filter_fields)
+        )
+
+    return NexusPHPParserConfig(
+        list_selector=list_selector,
+        fields=fields,
+        result_filter=result_filter,
+        search_query_param=search_query_param,
+        search_params={
+            str(name): str(value)
+            for name, value in raw_search_params.items()
+            if value is not None
+        },
+    )
+
+
+def _result_filter_rule_from_mapping(name: object, raw: Any) -> ResultFilterRule:
+    if isinstance(raw, list):
+        include = _string_tuple(raw)
+        if not include:
+            raise ValueError(f"Invalid parser.filter field {name!r}: include is required")
+        return ResultFilterRule(include=include)
+    if not isinstance(raw, dict):
+        raise ValueError(f"Invalid parser.filter field {name!r}: expected list or mapping")
+
+    include = _string_tuple(raw.get("include", ()))
+    exclude = _string_tuple(raw.get("exclude", ()))
+    if not include and not exclude:
+        raise ValueError(f"Invalid parser.filter field {name!r}: include or exclude is required")
+    return ResultFilterRule(include=include, exclude=exclude)
+
+
+def _string_tuple(raw: Any) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        values = (raw,)
+    elif isinstance(raw, list | tuple):
+        values = tuple(str(item) for item in raw)
+    else:
+        raise ValueError("Invalid parser.filter value: expected string or list")
+    return tuple(value.strip() for value in values if value.strip())
 
 
 def _normalized_host(base_url: str) -> str:

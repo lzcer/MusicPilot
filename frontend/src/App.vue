@@ -13,6 +13,9 @@ type ParserField = {
 type ParserConfig = {
   list_selector: string
   fields: Record<string, ParserField>
+  filter?: Record<string, unknown>
+  search_query_param?: string
+  search_params?: Record<string, string>
 }
 
 type SearchResult = {
@@ -26,7 +29,12 @@ type SearchResult = {
   subtitle?: string | null
   published_at?: string | null
   promotion?: string | null
+  metadata?: Record<string, unknown>
 }
+
+type SearchSortField = 'size' | 'seeders' | 'publishedAt'
+
+type SearchSortDirection = 'asc' | 'desc'
 
 type MediaCandidate = {
   title: string
@@ -286,6 +294,7 @@ type Site = {
   parser?: ParserConfig
   max_concurrency: number
   use_proxy: boolean
+  enabled: boolean
 }
 
 type DownloaderConfig = {
@@ -503,6 +512,9 @@ const selectedAlbumNames = ref<string[]>([])
 const searchStats = ref({ raw_count: 0, filtered_count: 0 })
 const searchProgress = ref({ completed_sites: 0, total_sites: 0, active_keywords: [] as string[] })
 const hasSearchedTorrents = ref(false)
+const searchSiteFilter = ref('')
+const searchSortField = ref<SearchSortField | ''>('')
+const searchSortDirection = ref<SearchSortDirection>('desc')
 const searchPage = ref(1)
 const searchPageSize = ref(20)
 const pendingDownload = ref<SearchResult | null>(null)
@@ -694,7 +706,8 @@ const siteForm = ref({
   cookie: '',
   user_agent: '',
   max_concurrency: 2,
-  use_proxy: false
+  use_proxy: false,
+  enabled: true
 })
 
 const downloaderForm = ref({
@@ -872,8 +885,16 @@ const searchLoading = computed(() => metadataSearchLoading.value || torrentSearc
 
 const selectedMediaAlbums = computed(() => albumList(selectedMedia.value))
 
+const enabledSites = computed(() => sites.value.filter((site) => site.enabled && site.id))
+
+const enabledSiteIds = computed(() => enabledSites.value.map((site) => site.id).filter(Boolean) as string[])
+
+const selectedEnabledSiteIds = computed(() =>
+  selectedSiteIds.value.filter((id) => enabledSiteIds.value.includes(id))
+)
+
 const canRunMetadataSiteSearch = computed(
-  () => selectedSiteIds.value.length > 0 && (!selectedMediaAlbums.value.length || selectedAlbumNames.value.length > 0)
+  () => selectedEnabledSiteIds.value.length > 0 && (!selectedMediaAlbums.value.length || selectedAlbumNames.value.length > 0)
 )
 
 const enabledMediaServerOptions = computed(() =>
@@ -946,17 +967,79 @@ const dashboardMetricCards = computed<DashboardMetric[]>(() => {
   ]
 })
 
-const torrentSearchProgressText = computed(() => {
-  const siteText = `站点 ${searchProgress.value.completed_sites}/${searchProgress.value.total_sites}`
+const torrentSearchConditionText = computed(() => {
   const active = searchProgress.value.active_keywords.length
     ? searchProgress.value.active_keywords.join(' / ')
     : '等待结果'
-  return `${siteText} 搜索中：${active} 结果：${searchStats.value.raw_count} 过滤：${searchStats.value.filtered_count}`
+  if (!searchProgress.value.total_sites) return `搜索中：${active}`
+  const siteText = `站点 ${searchProgress.value.completed_sites}/${searchProgress.value.total_sites}`
+  return `${siteText} · 搜索中：${active}`
+})
+
+const resultSiteOptions = computed(() => {
+  const names = Array.from(new Set(searchResults.value.map((item) => item.source).filter(Boolean))).sort()
+  return [
+    { title: '全部站点', value: '' },
+    ...names.map((name) => ({ title: name, value: name }))
+  ]
+})
+
+const filteredSearchResults = computed(() => {
+  if (!searchSiteFilter.value) return searchResults.value
+  return searchResults.value.filter((item) => item.source === searchSiteFilter.value)
+})
+
+const resultSortOptions = [
+  { title: '大小', value: 'size' },
+  { title: '做种人数', value: 'seeders' },
+  { title: '发布时间', value: 'publishedAt' }
+] satisfies Array<{ title: string; value: SearchSortField }>
+
+function toggleSearchSort(field: SearchSortField) {
+  if (searchSortField.value === field) {
+    searchSortDirection.value = searchSortDirection.value === 'asc' ? 'desc' : 'asc'
+  } else {
+    searchSortField.value = field
+    searchSortDirection.value = 'desc'
+  }
+  searchPage.value = 1
+}
+
+function searchSortIcon(field: SearchSortField) {
+  if (searchSortField.value !== field) return ''
+  return searchSortDirection.value === 'asc' ? 'mdi-arrow-up' : 'mdi-arrow-down'
+}
+
+function searchSortTitle(field: SearchSortField) {
+  if (searchSortField.value !== field) return '点击排序'
+  return searchSortDirection.value === 'asc' ? '正序' : '倒序'
+}
+
+function isActiveSearchSort(field: SearchSortField) {
+  return searchSortField.value === field
+}
+
+const sortedSearchResults = computed(() => {
+  const field = searchSortField.value
+  if (!field) return filteredSearchResults.value
+  const multiplier = searchSortDirection.value === 'asc' ? 1 : -1
+  return [...filteredSearchResults.value].sort((left, right) => {
+    if (field === 'size') {
+      return (searchResultSize(left) - searchResultSize(right)) * multiplier
+    }
+    if (field === 'seeders') {
+      return (left.seeders - right.seeders) * multiplier
+    }
+    if (field === 'publishedAt') {
+      return (searchResultTime(left) - searchResultTime(right)) * multiplier
+    }
+    return 0
+  })
 })
 
 const pagedSearchResults = computed(() => {
   const start = (searchPage.value - 1) * searchPageSize.value
-  return searchResults.value.slice(start, start + searchPageSize.value)
+  return sortedSearchResults.value.slice(start, start + searchPageSize.value)
 })
 
 const filteredLogs = computed(() => {
@@ -1176,6 +1259,7 @@ async function runSearch() {
   metadataCandidates.value = []
   hasSearchedTorrents.value = false
   searchStats.value = { raw_count: 0, filtered_count: 0 }
+  searchSiteFilter.value = ''
   searchPage.value = 1
   try {
     const params = new URLSearchParams({ query: searchText.value.trim(), limit: '12' })
@@ -1202,7 +1286,10 @@ function runDirectSearch() {
   selectedAlbumNames.value = []
   searchResults.value = []
   hasSearchedTorrents.value = true
+  searchSiteFilter.value = ''
   searchPage.value = 1
+  searchStats.value = { raw_count: 0, filtered_count: 0 }
+  searchProgress.value = { completed_sites: 0, total_sites: 0, active_keywords: [] }
   torrentSearchLoading.value = true
   const params = new URLSearchParams({ query: searchText.value.trim(), limit: '100' })
   const stream = new EventSource(`/api/search/stream?${params.toString()}`, {
@@ -1212,6 +1299,10 @@ function runDirectSearch() {
   stream.addEventListener('result', (event) => {
     const result = JSON.parse((event as MessageEvent).data) as SearchResult
     searchResults.value.push(result)
+    searchStats.value = {
+      raw_count: searchResults.value.length,
+      filtered_count: searchResults.value.length
+    }
   })
 
   stream.addEventListener('error', () => {
@@ -1229,26 +1320,28 @@ function openSiteConfirm(candidate: MediaCandidate) {
   const media = rawMediaCandidate(candidate)
   selectedMedia.value = media
   selectedAlbumNames.value = albumList(media)
-  selectedSiteIds.value = sites.value.map((site) => site.id).filter(Boolean) as string[]
+  selectedSiteIds.value = [...enabledSiteIds.value]
   siteConfirmDialog.value = true
 }
 
 async function runMetadataSiteSearch() {
   if (!selectedMedia.value || !canRunMetadataSiteSearch.value) return
+  const siteIds = selectedEnabledSiteIds.value
   siteConfirmDialog.value = false
   torrentSearchLoading.value = true
   metadataCandidates.value = []
   searchResults.value = []
   hasSearchedTorrents.value = true
+  searchSiteFilter.value = ''
   searchPage.value = 1
   searchStats.value = { raw_count: 0, filtered_count: 0 }
-  searchProgress.value = { completed_sites: 0, total_sites: selectedSiteIds.value.length, active_keywords: [] }
+  searchProgress.value = { completed_sites: 0, total_sites: siteIds.length, active_keywords: [] }
   try {
     const snapshot = await api<MetadataSiteSearchStreamPayload>('/api/search/by-metadata/stream/start', {
       method: 'POST',
       body: JSON.stringify({
         media: selectedSiteSearchMedia(),
-        site_ids: selectedSiteIds.value,
+        site_ids: siteIds,
         limit: 100
       })
     })
@@ -1278,10 +1371,8 @@ function subscribeMetadataSiteSearch() {
 
   metadataSearchStream.addEventListener('site_done', (event) => {
     const payload = JSON.parse((event as MessageEvent).data) as MetadataSiteDonePayload
-    mergeSearchResults(payload.results)
-    searchStats.value = {
-      raw_count: searchStats.value.raw_count + payload.raw_count,
-      filtered_count: searchStats.value.filtered_count + payload.filtered_count
+    for (const message of payload.errors ?? []) {
+      notify(`${payload.site} 搜索提示：${message}`, 'warning')
     }
   })
 
@@ -1330,14 +1421,6 @@ function applyMetadataSearchSnapshot(payload: MetadataSiteSearchStreamPayload) {
     Boolean(payload.results?.length) ||
     Boolean(payload.total_sites)
   torrentSearchLoading.value = !(payload.done ?? false)
-}
-
-function mergeSearchResults(results: SearchResult[]) {
-  const byUrl = new Map(searchResults.value.map((item) => [item.download_url, item]))
-  for (const result of results) {
-    byUrl.set(result.download_url, result)
-  }
-  searchResults.value = Array.from(byUrl.values()).sort((a, b) => b.seeders - a.seeders)
 }
 
 function rawMediaCandidate(candidate: MediaCandidate) {
@@ -1397,6 +1480,26 @@ function viewResult(row: SearchResult) {
     return
   }
   window.open(row.details_url, '_blank', 'noopener,noreferrer')
+}
+
+function searchResultType(row: SearchResult | null | undefined) {
+  const value = row?.metadata?.type
+  if (typeof value === 'string') return value.trim()
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item).trim()).filter(Boolean).join(' / ')
+  }
+  return ''
+}
+
+function searchResultTime(row: SearchResult) {
+  if (!row.published_at) return 0
+  const normalized = row.published_at.replace(/^(\d{4}-\d{2}-\d{2})\s+/, '$1T')
+  const timestamp = Date.parse(normalized)
+  return Number.isNaN(timestamp) ? 0 : timestamp
+}
+
+function searchResultSize(row: SearchResult) {
+  return row.size_bytes ?? 0
 }
 
 function openDownloadConfirm(result: SearchResult) {
@@ -2652,6 +2755,10 @@ watch(downloadableTaskIds, () => {
   syncSelectedDownloadIds()
 })
 
+watch(searchSiteFilter, () => {
+  searchPage.value = 1
+})
+
 function openNewSiteDialog() {
   editingSiteId.value = null
   siteForm.value = {
@@ -2660,7 +2767,8 @@ function openNewSiteDialog() {
     cookie: '',
     user_agent: '',
     max_concurrency: 2,
-    use_proxy: false
+    use_proxy: false,
+    enabled: true
   }
   siteDialog.value = true
 }
@@ -2673,7 +2781,8 @@ function editSite(site: Site) {
     cookie: site.cookie ?? '',
     user_agent: site.user_agent ?? '',
     max_concurrency: site.max_concurrency,
-    use_proxy: site.use_proxy
+    use_proxy: site.use_proxy,
+    enabled: site.enabled
   }
   siteDialog.value = true
 }
@@ -3678,16 +3787,24 @@ onUnmounted(() => {
                 <v-progress-circular indeterminate size="16" width="2" />
                 搜索媒体信息
               </v-chip>
-              <v-chip v-if="torrentSearchLoading" class="loading-chip" color="info" variant="tonal">
-                <v-progress-circular indeterminate size="16" width="2" />
-                {{ torrentSearchProgressText }}
-              </v-chip>
+              <div v-if="torrentSearchLoading || searchStats.raw_count" class="torrent-status-panel">
+                <div class="torrent-status-counts">
+                  <v-progress-circular
+                    v-if="torrentSearchLoading"
+                    indeterminate
+                    size="16"
+                    width="2"
+                  />
+                  <span>结果 {{ searchStats.raw_count }}</span>
+                  <span>过滤 {{ searchStats.filtered_count }}</span>
+                </div>
+                <div v-if="torrentSearchLoading" class="torrent-status-condition">
+                  {{ torrentSearchConditionText }}
+                </div>
+              </div>
               <div v-if="selectedMedia" class="selected-media-summary">
                 {{ mediaSummary(selectedMedia) }}
               </div>
-              <v-chip v-if="searchStats.raw_count" color="secondary" variant="tonal">
-                原始 {{ searchStats.raw_count }} / 过滤 {{ searchStats.filtered_count }}
-              </v-chip>
             </div>
 
             <div v-if="metadataSearchLoading" class="loading-panel">
@@ -3731,11 +3848,43 @@ onUnmounted(() => {
             </div>
 
             <v-card class="search-panel">
-              <div v-if="torrentSearchLoading && !pagedSearchResults.length" class="loading-panel">
+              <div v-if="searchResults.length" class="search-result-controls">
+                <v-select
+                  v-model="searchSiteFilter"
+                  :items="resultSiteOptions"
+                  label="站点"
+                  hide-details
+                  density="compact"
+                  variant="outlined"
+                  class="site-result-filter"
+                />
+                <div class="result-sort-field" aria-label="排序">
+                  <span class="result-sort-label">排序</span>
+                  <v-btn
+                    v-for="option in resultSortOptions"
+                    :key="option.value"
+                    :class="{ 'result-sort-button--active': isActiveSearchSort(option.value) }"
+                    :title="searchSortTitle(option.value)"
+                    class="result-sort-button"
+                    size="small"
+                    variant="text"
+                    @click="toggleSearchSort(option.value)"
+                  >
+                    <span>{{ option.title }}</span>
+                    <v-icon
+                      v-if="searchSortIcon(option.value)"
+                      :icon="searchSortIcon(option.value)"
+                      class="result-sort-icon"
+                      size="16"
+                    />
+                  </v-btn>
+                </div>
+              </div>
+              <div v-if="torrentSearchLoading && !sortedSearchResults.length" class="loading-panel">
                 <v-progress-circular indeterminate color="primary" size="34" width="3" />
                 <span>正在搜索种子资源</span>
               </div>
-              <div v-else-if="pagedSearchResults.length" class="result-card-grid">
+              <div v-else-if="sortedSearchResults.length" class="result-card-grid">
                 <article
                   v-for="row in pagedSearchResults"
                   :key="row.download_url"
@@ -3761,6 +3910,15 @@ onUnmounted(() => {
                         {{ row.promotion }}
                       </v-chip>
                       <v-chip color="secondary" size="small" variant="tonal">{{ row.source }}</v-chip>
+                      <v-chip
+                        v-if="searchResultType(row)"
+                        class="result-type-chip"
+                        color="info"
+                        size="small"
+                        variant="tonal"
+                      >
+                        类型 {{ searchResultType(row) }}
+                      </v-chip>
                     </div>
                   </div>
                   <div class="result-card-footer">
@@ -3779,7 +3937,7 @@ onUnmounted(() => {
                 </article>
               </div>
               <div v-else-if="hasSearchedTorrents" class="empty-cell">暂无搜索结果</div>
-              <div v-if="searchResults.length" class="pagination-row">
+              <div v-if="sortedSearchResults.length" class="pagination-row">
                 <v-select
                   v-model="searchPageSize"
                   :items="[10, 20, 50, 100]"
@@ -3789,7 +3947,7 @@ onUnmounted(() => {
                 />
                 <v-pagination
                   v-model="searchPage"
-                  :length="Math.max(1, Math.ceil(searchResults.length / searchPageSize))"
+                  :length="Math.max(1, Math.ceil(sortedSearchResults.length / searchPageSize))"
                   density="comfortable"
                 />
               </div>
@@ -4599,7 +4757,14 @@ onUnmounted(() => {
                 <v-card-text>
                   <div class="muted">{{ site.base_url }}</div>
                   <div class="mt-1">
-                    <v-chip size="small" variant="tonal">{{ site.max_concurrency }} 并发</v-chip>
+                    <v-chip
+                      size="small"
+                      :color="site.enabled ? 'success' : 'warning'"
+                      variant="tonal"
+                    >
+                      {{ site.enabled ? '启用' : '停用' }}
+                    </v-chip>
+                    <v-chip size="small" variant="tonal" class="ml-1">{{ site.max_concurrency }} 并发</v-chip>
                     <v-chip
                       v-if="site.use_proxy"
                       size="small"
@@ -5068,7 +5233,7 @@ onUnmounted(() => {
             <div class="site-confirm-label site-confirm-site-label">站点范围</div>
             <div class="site-confirm-site-list">
               <v-checkbox
-                v-for="site in sites"
+                v-for="site in enabledSites"
                 :key="site.id || site.name"
                 v-model="selectedSiteIds"
                 :label="site.name"
@@ -5076,6 +5241,7 @@ onUnmounted(() => {
                 density="compact"
                 hide-details
               />
+              <div v-if="!enabledSites.length" class="empty-cell">暂无启用站点</div>
             </div>
           </div>
         </v-card-text>
@@ -5128,6 +5294,10 @@ onUnmounted(() => {
             <v-chip color="success" size="large" variant="flat" class="confirm-promotion-chip">
               {{ pendingDownload.promotion }}
             </v-chip>
+          </div>
+          <div v-if="searchResultType(pendingDownload)" class="confirm-row muted">
+            <v-icon icon="mdi-shape-outline" size="28" />
+            <span>类型 {{ searchResultType(pendingDownload) }}</span>
           </div>
         </v-card-text>
         <v-card-actions class="download-confirm-actions">
@@ -5481,6 +5651,14 @@ onUnmounted(() => {
           <v-textarea v-model="siteForm.cookie" label="Cookie" rows="3" />
           <v-text-field v-model="siteForm.user_agent" label="User-Agent" />
           <v-text-field v-model.number="siteForm.max_concurrency" label="最大并发" type="number" />
+          <v-switch
+            v-model="siteForm.enabled"
+            color="primary"
+            density="compact"
+            hide-details
+            inset
+            label="启用站点"
+          />
           <v-switch
             v-model="siteForm.use_proxy"
             color="primary"
@@ -6072,6 +6250,97 @@ onUnmounted(() => {
   margin-left: auto;
 }
 
+.torrent-status-panel {
+  background: rgba(var(--v-theme-info), 0.08);
+  border: 1px solid rgba(var(--v-theme-info), 0.18);
+  border-radius: 8px;
+  color: rgb(var(--v-theme-info));
+  display: flex;
+  flex: 0 1 360px;
+  flex-direction: column;
+  gap: 4px;
+  justify-content: center;
+  min-height: 44px;
+  min-width: 260px;
+  padding: 6px 12px;
+}
+
+.torrent-status-counts {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 13px;
+  font-weight: 700;
+  gap: 12px;
+  line-height: 18px;
+}
+
+.torrent-status-condition {
+  color: rgba(var(--v-theme-on-surface), 0.66);
+  font-size: 12px;
+  line-height: 18px;
+  min-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-result-controls {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: flex-end;
+  padding: 12px 16px 0;
+}
+
+.site-result-filter {
+  max-width: 220px;
+  min-width: 160px;
+}
+
+.result-sort-field {
+  align-items: center;
+  background: rgb(var(--v-theme-surface));
+  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  border-radius: 4px;
+  flex: 0 1 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-height: 40px;
+  padding: 5px 6px 3px;
+  position: relative;
+}
+
+.result-sort-label {
+  background: rgb(var(--v-theme-surface));
+  color: rgba(var(--v-theme-on-surface), 0.66);
+  font-size: 12px;
+  left: 10px;
+  line-height: 16px;
+  padding: 0 4px;
+  position: absolute;
+  top: -9px;
+}
+
+.result-sort-button {
+  color: rgba(var(--v-theme-on-surface), 0.78);
+  font-weight: 600;
+  height: 30px !important;
+  min-width: 0;
+  padding: 0 7px;
+}
+
+.result-sort-button--active {
+  color: rgb(var(--v-theme-primary));
+  font-weight: 700;
+}
+
+.result-sort-icon {
+  margin-left: 4px;
+}
+
 .dashboard-metric-grid {
   display: grid;
   gap: 14px;
@@ -6178,6 +6447,33 @@ onUnmounted(() => {
   flex-wrap: wrap;
   gap: 8px;
   padding: 0 16px 16px;
+}
+
+.result-card-tags {
+  align-items: flex-start;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.result-type-chip {
+  flex: 1 1 100%;
+  height: auto !important;
+  justify-content: flex-start;
+  max-width: 100%;
+  min-height: 26px;
+  padding-bottom: 4px;
+  padding-top: 4px;
+}
+
+.result-type-chip :deep(.v-chip__content) {
+  display: block;
+  line-height: 18px;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  word-break: break-word;
 }
 
 .delete-action-buttons {

@@ -259,6 +259,7 @@ class MetadataSiteSearchTask:
         self.done = False
         self.errors: list[dict[str, str]] = []
         self.results: list[dict[str, Any]] = []
+        self._site_states: dict[str, dict[str, Any]] = {}
         self._active_keywords: dict[str, int] = {}
         self._subscribers: set[asyncio.Queue[tuple[str, dict[str, Any]]]] = set()
         self._lock = asyncio.Lock()
@@ -301,6 +302,26 @@ class MetadataSiteSearchTask:
                 self._active_keywords[keyword] = count - 1
         await self.publish("progress", self.snapshot())
 
+    async def site_progress(
+        self,
+        *,
+        site: str,
+        raw_count: int,
+        filtered_count: int,
+        results: list[SearchResultResponse],
+        errors: list[str],
+    ) -> None:
+        async with self._lock:
+            self._site_states[site] = {
+                "site": site,
+                "raw_count": raw_count,
+                "filtered_count": filtered_count,
+                "results": [item.model_dump() for item in results],
+                "errors": errors,
+            }
+            self._rebuild_search_totals()
+        await self.publish("progress", self.snapshot())
+
     async def site_done(
         self,
         *,
@@ -312,16 +333,16 @@ class MetadataSiteSearchTask:
     ) -> None:
         async with self._lock:
             self.completed_sites += 1
-            self.raw_count += raw_count
-            self.filtered_count += filtered_count
-            site_payload = {
+            site_payload = self._site_states.get(site) or {
                 "site": site,
                 "raw_count": raw_count,
                 "filtered_count": filtered_count,
                 "results": [item.model_dump() for item in results],
                 "errors": errors,
             }
-            self.results.extend(site_payload["results"])
+            site_payload["errors"] = errors
+            self._site_states[site] = site_payload
+            self._rebuild_search_totals()
         await self.publish("site_done", site_payload)
         await self.publish("progress", self.snapshot())
 
@@ -342,6 +363,23 @@ class MetadataSiteSearchTask:
             subscribers = tuple(self._subscribers)
         for queue in subscribers:
             queue.put_nowait((event, payload))
+
+    def _rebuild_search_totals(self) -> None:
+        self.raw_count = sum(int(state["raw_count"]) for state in self._site_states.values())
+        self.filtered_count = sum(
+            int(state["filtered_count"]) for state in self._site_states.values()
+        )
+        results = [
+            result
+            for state in self._site_states.values()
+            for result in state["results"]
+            if isinstance(result, dict)
+        ]
+        self.results = sorted(
+            results,
+            key=lambda item: int(item.get("seeders") or 0),
+            reverse=True,
+        )
 
 
 class PlaylistTrackDownloadExecutor:
@@ -957,6 +995,7 @@ def create_app() -> FastAPI:
                     subtitle=result.subtitle,
                     published_at=result.published_at,
                     promotion=result.promotion,
+                    metadata=result.metadata,
                 )
                 for result in results
             ],
@@ -1122,6 +1161,7 @@ def create_app() -> FastAPI:
                             "subtitle": result.subtitle,
                             "published_at": result.published_at,
                             "promotion": result.promotion,
+                            "metadata": result.metadata,
                         },
                     )
             state.add_log("search", f"Search completed: {query}, {count} result(s)")
@@ -4668,6 +4708,18 @@ async def _run_metadata_site_search_for_indexer(
         raw_results: list[SearchResult] = []
         errors: list[str] = []
 
+        async def publish_site_progress() -> None:
+            merged = _dedupe_results(raw_results)
+            filtered = await _filter_by_artist_with_aliases(state, merged, task.media.artist)
+            ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[:limit]
+            await task.site_progress(
+                site=site_name,
+                raw_count=len(merged),
+                filtered_count=len(filtered),
+                results=[_search_result_response(item) for item in ranked],
+                errors=errors,
+            )
+
         async def search_keyword(keyword: str) -> None:
             async with semaphore:
                 await task.keyword_started(keyword)
@@ -4678,7 +4730,10 @@ async def _run_metadata_site_search_for_indexer(
                 else:
                     raw_results.extend(results)
                 finally:
-                    await task.keyword_finished(keyword)
+                    try:
+                        await publish_site_progress()
+                    finally:
+                        await task.keyword_finished(keyword)
 
         await asyncio.gather(*(search_keyword(keyword) for keyword in keywords))
         merged = _dedupe_results(raw_results)
@@ -4707,6 +4762,7 @@ def _search_result_response(result: SearchResult) -> SearchResultResponse:
         subtitle=result.subtitle,
         published_at=result.published_at,
         promotion=result.promotion,
+        metadata=result.metadata,
     )
 
 
@@ -4962,6 +5018,7 @@ def _site_payload(site: IndexerSite) -> dict[str, object]:
         "user_agent": site.user_agent,
         "max_concurrency": site.max_concurrency,
         "use_proxy": site.use_proxy,
+        "enabled": site.enabled,
     }
 
 
@@ -6558,6 +6615,15 @@ def _parser_response(parser: NexusPHPParserConfig) -> NexusPHPParserRequest:
             )
             for name, field in parser.fields.items()
         },
+        filter={
+            name: {
+                "include": list(rule.include),
+                "exclude": list(rule.exclude),
+            }
+            for name, rule in parser.result_filter.items()
+        },
+        search_query_param=parser.search_query_param,
+        search_params=parser.search_params,
     )
 
 
