@@ -38,7 +38,7 @@ git tag -a v0.1.1 -m "v0.1.1"
 git push origin v0.1.1
 ```
 
-当存在上一个 `v*` 标签时，workflow 会自动汇总上一个标签到当前标签之间的提交信息，并按 `feat`、`fix`、`perf`、`refactor` 前缀分类写入 Release 内容。其他前缀不会进入自动发布说明。
+当存在上一个 `v*` 标签时，workflow 会自动汇总上一个标签到当前标签之间的提交标题和正文，并按 `feat`、`fix`、`perf`、`refactor` 前缀分类写入 Release 内容。其他前缀不会进入自动发布说明。
 
 ## 1.4. 镜像标签
 

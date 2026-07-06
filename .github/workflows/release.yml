@@ -120,12 +120,7 @@ jobs:
             {
               echo "## 1. 更新内容"
               echo
-              echo "以下内容根据 ${previous_tag} 到 ${tag} 之间的 feat、fix、perf、refactor 提交信息自动生成。"
-              echo
             } > "${notes_file}"
-
-            commits_file="${RUNNER_TEMP}/release-commits.txt"
-            git log "${previous_tag}..${tag_sha}" --no-merges --pretty=format:"%s (%h)" > "${commits_file}"
 
             has_release_notes=0
 
@@ -134,14 +129,54 @@ jobs:
               section_title="$2"
               commit_type="$3"
               section_file="${RUNNER_TEMP}/release-${commit_type}.txt"
+              commit_pattern="^${commit_type}(\\([^)]+\\))?!?:[[:space:]]"
 
-              grep -E "^${commit_type}(\([^)]+\))?!?: " "${commits_file}" > "${section_file}" || true
+              : > "${section_file}"
+
+              while IFS= read -r -d '' commit_record; do
+                subject="${commit_record%%$'\x1f'*}"
+                rest="${commit_record#*$'\x1f'}"
+                body="${rest%%$'\x1f'*}"
+                short_sha="${rest##*$'\x1f'}"
+
+                if [[ ! "${subject}" =~ ${commit_pattern} ]]; then
+                  continue
+                fi
+
+                title="${subject#*: }"
+                printf -- "- %s (%s)\n" "${title}" "${short_sha}" >> "${section_file}"
+
+                if [[ -n "${body//[[:space:]]/}" ]]; then
+                  echo >> "${section_file}"
+                  awk '
+                    { lines[NR] = $0 }
+                    END {
+                      start = 1
+                      end = NR
+                      while (start <= end && lines[start] ~ /^[[:space:]]*$/) {
+                        start++
+                      }
+                      while (end >= start && lines[end] ~ /^[[:space:]]*$/) {
+                        end--
+                      }
+                      for (i = start; i <= end; i++) {
+                        if (lines[i] ~ /^[[:space:]]*$/) {
+                          print ""
+                        } else {
+                          printf "  %s\n", lines[i]
+                        }
+                      }
+                    }
+                  ' <<< "${body}" >> "${section_file}"
+                  echo >> "${section_file}"
+                fi
+              done < <(git log -z "${previous_tag}..${tag_sha}" --no-merges --format="%s%x1f%b%x1f%h")
 
               if [[ -s "${section_file}" ]]; then
                 {
                   echo "### ${section_number}. ${section_title}"
                   echo
-                  sed -E "s/^${commit_type}(\([^)]+\))?!?: /- /" "${section_file}"
+                  cat "${section_file}"
                   echo
                 } >> "${notes_file}"
                 has_release_notes=1
