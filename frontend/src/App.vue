@@ -655,6 +655,7 @@ const playlistTrackEditForm = ref({
   album: ''
 })
 const playlistTrackDownloadingIds = ref<number[]>([])
+const playlistPageDownloading = ref(false)
 const deleting = ref(false)
 const downloadDeleting = ref(false)
 const mediaDeleting = ref(false)
@@ -829,6 +830,7 @@ function metadataSourceLabel(source?: string | null) {
 
 const playlistTrackDownloadStatusOptions = [
   { title: '全部下载状态', value: '' },
+  { title: '待处理', value: 'pending' },
   { title: '等待', value: 'waiting' },
   { title: '队列中', value: 'queue' },
   { title: '搜索中', value: 'searching' },
@@ -1133,6 +1135,10 @@ const artistPageLength = computed(() =>
 
 const playlistTrackPageLength = computed(() =>
   Math.max(1, Math.ceil(playlistTrackTotal.value / playlistTrackPageSize.value))
+)
+
+const downloadablePlaylistTracks = computed(() =>
+  playlistTracks.value.filter((track) => canStartPlaylistTrackDownload(track))
 )
 
 const fileEntryPaths = computed(() => fileEntries.value.map((item) => item.path))
@@ -2670,23 +2676,72 @@ function playlistTrackActionTitle(track: PlaylistTrack) {
   return isPlaylistTrackRetry(track) ? '重试' : '下载'
 }
 
+async function requestPlaylistTrackDownload(playlist: Playlist, track: PlaylistTrack) {
+  await api(`/api/playlists/${playlist.id}/tracks/${track.id}/download`, {
+    method: 'POST'
+  })
+}
+
+function markPlaylistTracksQueued(trackIds: number[]) {
+  const idSet = new Set(trackIds)
+  playlistTracks.value = playlistTracks.value.map((item) =>
+    idSet.has(item.id) ? { ...item, download_status: 'queue', last_error: null } : item
+  )
+}
+
 async function downloadPlaylistTrack(track: PlaylistTrack) {
   const playlist = selectedPlaylist.value
   if (!playlist || !canStartPlaylistTrackDownload(track)) return
   playlistTrackDownloadingIds.value = [...playlistTrackDownloadingIds.value, track.id]
   try {
-    await api(`/api/playlists/${playlist.id}/tracks/${track.id}/download`, {
-      method: 'POST'
-    })
-    playlistTracks.value = playlistTracks.value.map((item) =>
-      item.id === track.id ? { ...item, download_status: 'searching', last_error: null } : item
-    )
+    await requestPlaylistTrackDownload(playlist, track)
+    markPlaylistTracksQueued([track.id])
     await Promise.all([loadPlaylistTracks(playlist), loadDownloads()])
     notify('单曲下载任务已开始')
   } catch (error) {
     notify(error instanceof Error ? error.message : '单曲下载失败', 'error')
   } finally {
     playlistTrackDownloadingIds.value = playlistTrackDownloadingIds.value.filter((id) => id !== track.id)
+  }
+}
+
+async function downloadPlaylistTrackPage() {
+  const playlist = selectedPlaylist.value
+  if (!playlist || playlistPageDownloading.value) return
+  const tracks = [...downloadablePlaylistTracks.value]
+  if (!tracks.length) {
+    notify('当前页没有可下载的单曲', 'warning')
+    return
+  }
+  const trackIds = tracks.map((track) => track.id)
+  playlistPageDownloading.value = true
+  playlistTrackDownloadingIds.value = Array.from(
+    new Set([...playlistTrackDownloadingIds.value, ...trackIds])
+  )
+  try {
+    const results = await Promise.allSettled(
+      tracks.map((track) => requestPlaylistTrackDownload(playlist, track))
+    )
+    const succeededIds = tracks
+      .filter((_, index) => results[index].status === 'fulfilled')
+      .map((track) => track.id)
+    const failedCount = results.length - succeededIds.length
+    if (succeededIds.length) {
+      markPlaylistTracksQueued(succeededIds)
+    }
+    await Promise.all([loadPlaylistTracks(playlist), loadDownloads()])
+    if (failedCount) {
+      notify(`本页下载已触发：成功 ${succeededIds.length} 首，失败 ${failedCount} 首`, 'warning')
+    } else {
+      notify(`本页下载任务已开始：${succeededIds.length} 首`)
+    }
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '本页下载失败', 'error')
+  } finally {
+    playlistPageDownloading.value = false
+    playlistTrackDownloadingIds.value = playlistTrackDownloadingIds.value.filter(
+      (id) => !trackIds.includes(id)
+    )
   }
 }
 
@@ -5431,6 +5486,22 @@ onUnmounted(() => {
         <v-card-title class="d-flex align-center ga-2">
           <span class="text-truncate">{{ selectedPlaylist ? selectedPlaylist.name : '歌单明细' }}</span>
           <v-spacer />
+          <v-btn
+            prepend-icon="mdi-download-multiple"
+            variant="tonal"
+            size="small"
+            title="下载本页"
+            :loading="playlistPageDownloading"
+            :disabled="
+              !selectedPlaylist ||
+              playlistTrackLoading ||
+              playlistPageDownloading ||
+              !downloadablePlaylistTracks.length
+            "
+            @click="downloadPlaylistTrackPage"
+          >
+            下载本页
+          </v-btn>
           <v-btn
             icon="mdi-refresh"
             variant="text"
