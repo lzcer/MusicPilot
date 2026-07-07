@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -225,6 +226,7 @@ PLAYLIST_TRACK_ACTIVE_STATUSES = {
     "refreshing_library",
 }
 PLAYLIST_TRACK_SUCCESS_STATUSES = {"existing", "library_refreshed"}
+DOWNLOAD_ITEM_SCRAPE_INCOMPLETE_STATUSES = {"pending", "metadata_searching"}
 logger = logging.getLogger(__name__)
 
 
@@ -913,6 +915,7 @@ def create_app() -> FastAPI:
         await state.reload_downloader()
         await state.reload_notifiers()
         await _restore_playlist_download_tasks(state)
+        await _restore_pending_download_item_scrapes(state)
         state.pipeline.start()
         state.task_manager.start()
         state.start_download_polling()
@@ -4244,15 +4247,95 @@ async def _schedule_download_task_item_scraping(
 ) -> None:
     if task_id is None or not item_ids:
         return
+    pending_ids = set(item_ids)
+    items = await state.repository.list_download_task_items(task_id)
+    eligible_ids = {
+        item.id
+        for item in items
+        if item.id in pending_ids and item.status in DOWNLOAD_ITEM_SCRAPE_INCOMPLETE_STATUSES
+    }
     for item_id in item_ids:
+        if item_id not in eligible_ids:
+            continue
         await _enqueue_download_item_scrape(state, task_id, item_id)
+
+
+async def _restore_pending_download_item_scrapes(state: AppState) -> None:
+    restored = 0
+    for task in await state.repository.list_unfinished_download_tasks():
+        scheduled, _incomplete = await _schedule_pending_download_task_item_scrapes(
+            state,
+            task.id,
+        )
+        restored += scheduled
+    if restored:
+        state.add_log(
+            "metadata",
+            f"Restored pending download item metadata scrape tasks: count={restored}",
+        )
+
+
+async def _schedule_pending_download_task_item_scrapes(
+    state: AppState,
+    task_id: int,
+) -> tuple[int, int]:
+    scheduled = 0
+    incomplete = 0
+    for item in await state.repository.list_download_task_items(task_id):
+        if item.status in DOWNLOAD_ITEM_SCRAPE_INCOMPLETE_STATUSES:
+            incomplete += 1
+        if item.status not in DOWNLOAD_ITEM_SCRAPE_INCOMPLETE_STATUSES:
+            continue
+        scrape_task_id = await _enqueue_download_item_scrape(state, task_id, item.id)
+        if scrape_task_id is not None:
+            scheduled += 1
+    return scheduled, incomplete
+
+
+async def _wait_for_download_item_scrapes(
+    state: AppState,
+    task_id: int,
+    task_name: str,
+) -> None:
+    logged = False
+    while True:
+        scheduled, incomplete = await _schedule_pending_download_task_item_scrapes(
+            state,
+            task_id,
+        )
+        if incomplete <= 0:
+            return
+        if scheduled or not logged:
+            state.add_log(
+                "metadata",
+                "Download refresh waiting for item metadata scraping: "
+                f"task={task_id}, name={task_name}, incomplete={incomplete}, "
+                f"scheduled={scheduled}",
+            )
+            logged = True
+        await asyncio.sleep(2)
 
 
 async def _enqueue_download_item_scrape(
     state: AppState,
     task_id: int,
     item_id: int,
-) -> int:
+) -> int | None:
+    item = await state.repository.get_download_task_item(item_id)
+    if item is None or item.torrent_record_id != task_id:
+        return None
+    idempotency_key = _download_item_scrape_idempotency_key(item)
+    existing = await state.repository.get_system_task_by_idempotency_key(idempotency_key)
+    if existing is not None:
+        if existing.status in {"WAIT", "RUNNING"}:
+            return None
+        if item.status in DOWNLOAD_ITEM_SCRAPE_INCOMPLETE_STATUSES:
+            idempotency_key = f"{idempotency_key}:recover:{_download_item_generation(item)}"
+            recovery = await state.repository.get_system_task_by_idempotency_key(idempotency_key)
+            if recovery is not None and recovery.status in {"WAIT", "RUNNING"}:
+                return None
+        else:
+            return None
     return await state.task_manager.enqueue(
         TaskCreate(
             task_type="DOWNLOAD_ITEM_SCRAPE",
@@ -4262,9 +4345,33 @@ async def _enqueue_download_item_scrape(
             },
             resource_keys=[f"download-item:{item_id}"],
             max_attempts=3,
-            idempotency_key=f"download-item-scrape:{item_id}",
+            idempotency_key=idempotency_key,
         )
     )
+
+
+def _download_item_scrape_idempotency_key(item: TorrentRecordItem) -> str:
+    raw_payload = item.raw_payload if isinstance(item.raw_payload, dict) else {}
+    identity = "|".join(
+        (
+            str(item.torrent_record_id),
+            item.file_path,
+            item.file_name,
+            str(raw_payload.get("size") or ""),
+        )
+    )
+    digest = hashlib.sha1(identity.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return (
+        "download-item-scrape:"
+        f"{item.torrent_record_id}:{item.id}:{_download_item_generation(item)}:{digest}"
+    )
+
+
+def _download_item_generation(item: TorrentRecordItem) -> str:
+    created_at = item.created_at
+    if isinstance(created_at, datetime):
+        return created_at.astimezone(UTC).strftime("%Y%m%d%H%M%S%f")
+    return "unknown"
 
 
 async def _scrape_download_task_item(state: AppState, item_id: int) -> TorrentRecordItem | None:
@@ -5865,6 +5972,16 @@ async def _schedule_download_refresh_library(
     state: AppState,
     task: TorrentRecord,
 ) -> None:
+    scheduled, incomplete = await _schedule_pending_download_task_item_scrapes(state, task.id)
+    if incomplete:
+        if scheduled:
+            state.add_log(
+                "metadata",
+                "Download refresh delayed for item metadata scraping: "
+                f"task={task.id}, name={task.name}, incomplete={incomplete}, "
+                f"scheduled={scheduled}",
+            )
+        return
     refresh_task = task
     if task.status != "refreshing_library":
         updated = await state.repository.update_download_task(
@@ -5950,6 +6067,7 @@ async def _refresh_library_for_task(
     *,
     use_scrape_task_manager: bool = True,
 ) -> None:
+    await _wait_for_download_item_scrapes(state, task.id, task.name)
     if task.status != "refreshing_library":
         refreshing = await state.repository.update_download_task(
             task.id,

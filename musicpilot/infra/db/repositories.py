@@ -897,23 +897,43 @@ class SqlAlchemyMediaRepository:
         items: list[dict[str, Any]],
     ) -> list[TorrentRecordItem]:
         async with self.database.session() as session:
-            await session.execute(
-                delete(TorrentRecordItem).where(TorrentRecordItem.torrent_record_id == task_id)
+            existing_result = await session.execute(
+                select(TorrentRecordItem)
+                .where(TorrentRecordItem.torrent_record_id == task_id)
+                .order_by(TorrentRecordItem.id)
             )
+            existing_rows = list(existing_result.scalars().all())
+            existing_by_path = {row.file_path: row for row in existing_rows}
+            seen_paths: set[str] = set()
             rows: list[TorrentRecordItem] = []
             for item in items:
-                row = TorrentRecordItem(
-                    torrent_record_id=task_id,
-                    file_name=str(item["file_name"]),
-                    file_path=str(item["file_path"]),
-                    artist=_optional_string(item.get("artist")),
-                    parsed_title=_optional_string(item.get("parsed_title")),
-                    playlist_track_id=_optional_int(item.get("playlist_track_id")),
-                    status=str(item.get("status") or "pending"),
-                    raw_payload=dict(item.get("raw_payload") or {}),
-                )
-                session.add(row)
+                file_path = str(item["file_path"])
+                seen_paths.add(file_path)
+                row = existing_by_path.get(file_path)
+                if row is None:
+                    row = TorrentRecordItem(
+                        torrent_record_id=task_id,
+                        file_name=str(item["file_name"]),
+                        file_path=file_path,
+                        artist=_optional_string(item.get("artist")),
+                        parsed_title=_optional_string(item.get("parsed_title")),
+                        playlist_track_id=_optional_int(item.get("playlist_track_id")),
+                        status=str(item.get("status") or "pending"),
+                        raw_payload=dict(item.get("raw_payload") or {}),
+                    )
+                    session.add(row)
+                else:
+                    row.file_name = str(item["file_name"])
+                    row.artist = _optional_string(item.get("artist"))
+                    row.parsed_title = _optional_string(item.get("parsed_title"))
+                    row.raw_payload = dict(item.get("raw_payload") or {})
+                    playlist_track_id = _optional_int(item.get("playlist_track_id"))
+                    if playlist_track_id is not None:
+                        row.playlist_track_id = playlist_track_id
                 rows.append(row)
+            for row in existing_rows:
+                if row.file_path not in seen_paths:
+                    await session.delete(row)
             await session.commit()
             for row in rows:
                 await session.refresh(row)
