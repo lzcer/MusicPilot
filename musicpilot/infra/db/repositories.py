@@ -459,6 +459,28 @@ class SqlAlchemyMediaRepository:
             )
             return result.scalars().first()
 
+    async def update_waiting_system_task(
+        self,
+        task_id: int,
+        *,
+        payload: dict[str, Any] | None = None,
+        priority: int | None = None,
+        available_at: datetime | None = None,
+    ) -> SystemTask | None:
+        async with self.database.session() as session:
+            task = await session.get(SystemTask, task_id)
+            if task is None or task.status != "WAIT":
+                return None
+            if payload is not None:
+                task.payload = payload
+            if priority is not None:
+                task.priority = max(int(task.priority or 0), priority)
+            if available_at is not None:
+                task.available_at = available_at
+            await session.commit()
+            await session.refresh(task)
+            return task
+
     async def try_claim_system_task(
         self,
         task_id: int,

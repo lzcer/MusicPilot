@@ -239,6 +239,8 @@ DOWNLOAD_ITEM_ORGANIZE_TERMINAL_STATUSES = {
     "organize_failed",
     "organize_skipped",
 }
+DOWNLOAD_ITEM_TASK_PRIORITY = 50
+DOWNLOAD_REFRESH_TASK_PRIORITY = 40
 logger = logging.getLogger(__name__)
 
 
@@ -4417,6 +4419,14 @@ async def _schedule_download_item_processing_for_files(
             terminal += 1
             continue
         if item.status in DOWNLOAD_ITEM_ORGANIZE_ACTIVE_STATUSES:
+            organize_task_id = await _enqueue_download_item_organize(
+                state,
+                task,
+                item,
+                source_file,
+            )
+            if organize_task_id is not None:
+                scheduled += 1
             pending += 1
             continue
         if item.status in DOWNLOAD_ITEM_SCRAPE_DONE_STATUSES:
@@ -4481,28 +4491,42 @@ async def _enqueue_download_item_scrape(
     if item is None or item.torrent_record_id != task_id:
         return None
     idempotency_key = _download_item_scrape_idempotency_key(item)
+    payload = {
+        "torrent_record_id": task_id,
+        "item_id": item_id,
+        "organize_after_scrape": organize_after_scrape,
+        "source_file": str(source_file) if source_file is not None else None,
+        "task_name": task_name,
+    }
     existing = await state.repository.get_system_task_by_idempotency_key(idempotency_key)
     if existing is not None:
         if existing.status in {"WAIT", "RUNNING"}:
+            await _upgrade_waiting_system_task(
+                state,
+                existing,
+                payload=payload,
+                priority=DOWNLOAD_ITEM_TASK_PRIORITY,
+            )
             return None
         if item.status in DOWNLOAD_ITEM_SCRAPE_INCOMPLETE_STATUSES:
             idempotency_key = f"{idempotency_key}:recover:{_download_item_generation(item)}"
             recovery = await state.repository.get_system_task_by_idempotency_key(idempotency_key)
             if recovery is not None and recovery.status in {"WAIT", "RUNNING"}:
+                await _upgrade_waiting_system_task(
+                    state,
+                    recovery,
+                    payload=payload,
+                    priority=DOWNLOAD_ITEM_TASK_PRIORITY,
+                )
                 return None
         else:
             return None
     return await state.task_manager.enqueue(
         TaskCreate(
             task_type="DOWNLOAD_ITEM_SCRAPE",
-            payload={
-                "torrent_record_id": task_id,
-                "item_id": item_id,
-                "organize_after_scrape": organize_after_scrape,
-                "source_file": str(source_file) if source_file is not None else None,
-                "task_name": task_name,
-            },
+            payload=payload,
             resource_keys=[f"download-item:{item_id}"],
+            priority=DOWNLOAD_ITEM_TASK_PRIORITY,
             max_attempts=3,
             idempotency_key=idempotency_key,
         )
@@ -4516,18 +4540,49 @@ async def _enqueue_download_item_organize(
     source_file: Path,
 ) -> int | None:
     idempotency_key = _download_item_organize_idempotency_key(item, source_file)
+    task_create = _download_item_organize_task_create(
+        torrent_record_id=task.id,
+        item_id=item.id,
+        source_file=source_file,
+        task_name=task.name,
+        idempotency_key=idempotency_key,
+    )
     existing = await state.repository.get_system_task_by_idempotency_key(idempotency_key)
-    if existing is not None and existing.status in {"WAIT", "RUNNING", "SUCCEEDED"}:
-        return None
-    return await state.task_manager.enqueue(
-        _download_item_organize_task_create(
+    if existing is not None:
+        if existing.status in {"WAIT", "RUNNING"}:
+            await _upgrade_waiting_system_task(
+                state,
+                existing,
+                payload=task_create.payload,
+                priority=DOWNLOAD_ITEM_TASK_PRIORITY,
+            )
+            return None
+        if (
+            existing.status == "SUCCEEDED"
+            and item.status in DOWNLOAD_ITEM_ORGANIZE_TERMINAL_STATUSES
+        ):
+            return None
+        idempotency_key = (
+            f"{idempotency_key}:recover:"
+            f"{_download_item_generation(item)}:{_file_identity_digest(source_file)}"
+        )
+        recovery = await state.repository.get_system_task_by_idempotency_key(idempotency_key)
+        if recovery is not None and recovery.status in {"WAIT", "RUNNING"}:
+            await _upgrade_waiting_system_task(
+                state,
+                recovery,
+                payload=task_create.payload,
+                priority=DOWNLOAD_ITEM_TASK_PRIORITY,
+            )
+            return None
+        task_create = _download_item_organize_task_create(
             torrent_record_id=task.id,
             item_id=item.id,
             source_file=source_file,
             task_name=task.name,
             idempotency_key=idempotency_key,
         )
-    )
+    return await state.task_manager.enqueue(task_create)
 
 
 def _download_item_organize_task_create(
@@ -4547,9 +4602,41 @@ def _download_item_organize_task_create(
             "task_name": task_name,
         },
         resource_keys=[_scraping_file_resource_key(source_file)],
+        priority=DOWNLOAD_ITEM_TASK_PRIORITY,
         max_attempts=3,
         idempotency_key=idempotency_key,
     )
+
+
+async def _upgrade_waiting_system_task(
+    state: AppState,
+    task: object,
+    *,
+    payload: dict[str, Any],
+    priority: int,
+) -> None:
+    task_id = _optional_int(getattr(task, "id", None))
+    if task_id is None or getattr(task, "status", None) != "WAIT":
+        return
+    current_payload = getattr(task, "payload", None)
+    merged_payload = dict(current_payload if isinstance(current_payload, dict) else {})
+    merged_payload.update(payload)
+    updated = await state.repository.update_waiting_system_task(
+        task_id,
+        payload=merged_payload,
+        priority=priority,
+        available_at=datetime.now(UTC),
+    )
+    if updated is not None:
+        await state.task_manager.wake()
+
+
+def _file_identity_digest(path: Path) -> str:
+    try:
+        identity = str(path.expanduser().resolve(strict=False))
+    except OSError:
+        identity = str(path.expanduser())
+    return hashlib.sha1(identity.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
 def _download_item_scrape_idempotency_key(item: TorrentRecordItem) -> str:
@@ -6297,6 +6384,7 @@ async def _schedule_download_refresh_library(
                 "task_name": refresh_task.name,
             },
             resource_keys=[f"download-refresh:{task.id}"],
+            priority=DOWNLOAD_REFRESH_TASK_PRIORITY,
             max_attempts=3,
             idempotency_key=idempotency_key,
         )
@@ -6510,6 +6598,7 @@ async def _scrape_download_for_task(
                     "task_name": task.name,
                     "source_file_count": len(source_files),
                 },
+                priority=DOWNLOAD_REFRESH_TASK_PRIORITY,
                 wait_log_message=f"Download scraping is waiting for scraper resource: {task.name}",
                 runner=run_scrape,
             )
