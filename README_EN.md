@@ -16,7 +16,7 @@ Core goals:
 
 1. Provide one Web UI for managing music search, downloads, organization, playlists, and music library status.
 2. Use a task queue to handle long-running operations, so downloads, scraping, organization, and sync can move forward automatically where possible.
-3. Keep deployment simple, use SQLite by default, and support Docker Compose on NAS devices or servers.
+3. Keep deployment simple. SQLite can be used for quick starts, while PostgreSQL is recommended for long-running and production deployments. Docker Compose is supported on NAS devices or servers.
 4. Keep clear adapter boundaries so more sites, downloaders, music platforms, metadata sources, and media servers can be added later.
 
 ## 2. Supported Integrations
@@ -177,9 +177,11 @@ git pull
 docker compose up -d --build
 ```
 
-### 6.1. Optional PostgreSQL Database
+### 6.1. Recommended PostgreSQL Database
 
-MusicPilot uses SQLite by default, which fits single-host and NAS deployments. For higher concurrency or an external database, change `MP_DATABASE_URL` in `docker-compose.yml` to a PostgreSQL connection string:
+MusicPilot can start quickly with SQLite, but PostgreSQL is recommended for long-running and production deployments. Download polling, task queues, playlist sync, library refreshes, and database backups continuously write runtime data, and PostgreSQL is more reliable for concurrency, recovery, and maintenance.
+
+If PostgreSQL already exists, change `MP_DATABASE_URL` in `docker-compose.yml` to a PostgreSQL connection string:
 
 ```yaml
 MP_DATABASE_URL: postgresql+asyncpg://musicpilot:change-this-password@postgres:5432/musicpilot
@@ -187,13 +189,34 @@ MP_DATABASE_URL: postgresql+asyncpg://musicpilot:change-this-password@postgres:5
 
 Create the PostgreSQL database and user before starting MusicPilot. On startup, MusicPilot runs Alembic to initialize or upgrade the schema.
 
+To run PostgreSQL in the same Compose project, add a `postgres` service and make MusicPilot depend on it:
+
+```yaml
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: musicpilot
+      POSTGRES_USER: musicpilot
+      POSTGRES_PASSWORD: change-this-password
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  musicpilot:
+    environment:
+      MP_DATABASE_URL: postgresql+asyncpg://musicpilot:change-this-password@postgres:5432/musicpilot
+    depends_on:
+      - postgres
+```
+
 ### 6.2. Configuration Guide
 
 After the first startup, configure sites, downloaders, music libraries, organization rules, and notification channels in the Web UI.
 
 Configuration guide entry: [MusicPilot Configuration Guide](docs/configuration.en.md)
 
-This document will collect the configuration steps. For now, only the entry is provided, and detailed content will be added later.
+This document covers startup environment variables, site parsers, site accounts, downloaders, music libraries, scraping, search, notifications, and database backup steps.
 
 ## 7. Disclaimer
 

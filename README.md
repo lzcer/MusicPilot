@@ -16,7 +16,7 @@ MusicPilot 是一个面向自托管用户的音乐库自动化工具，用来把
 
 1. 用一个 Web 界面管理音乐搜索、下载、整理、歌单和音乐库状态。
 2. 通过任务队列处理耗时操作，尽量让下载、刮削、整理和同步可以自动推进。
-3. 保持部署简单，默认使用 SQLite，并提供 Docker Compose 方式在 NAS 或服务器上运行。
+3. 保持部署简单，SQLite 可用于快速起步；长期运行和正式部署推荐使用 PostgreSQL，并提供 Docker Compose 方式在 NAS 或服务器上运行。
 4. 保留清晰的适配层，方便后续接入更多站点、下载器、音乐平台、元数据源和媒体服务器。
 
 ## 2. 支持范围
@@ -136,6 +136,7 @@ services:
       MP_ADMIN_USERNAME: admin
       MP_ADMIN_PASSWORD: change-this-password
       MP_SESSION_SECRET: change-this-random-secret
+      # 快速试用可以使用 SQLite；长期运行和正式部署建议改为 PostgreSQL。
       MP_DATABASE_URL: sqlite+aiosqlite:////data/musicpilot.db
       MP_MUSIC_LIBRARY_PATH: /music
       MP_DOWNLOAD_STAGING_PATH: /downloads
@@ -376,9 +377,11 @@ uvicorn musicpilot.infra.api.app:create_app --factory --reload
 http://127.0.0.1:8000
 ```
 
-### 6.4. 可选 PostgreSQL 数据库
+### 6.4. 推荐 PostgreSQL 数据库
 
-MusicPilot 默认使用 SQLite，适合单机和 NAS 部署。需要更高并发或希望使用独立数据库时，可以把 `docker-compose.yml` 中的 `MP_DATABASE_URL` 改为 PostgreSQL 连接串：
+MusicPilot 可以使用 SQLite 快速启动，但长期运行和正式部署推荐使用 PostgreSQL。下载轮询、任务队列、歌单同步、媒体库刷新和数据库备份都会持续写入运行数据，PostgreSQL 在并发、恢复和维护上更稳妥。
+
+如果已有 PostgreSQL，可以把 `docker-compose.yml` 中的 `MP_DATABASE_URL` 改为 PostgreSQL 连接串：
 
 ```yaml
 MP_DATABASE_URL: postgresql+asyncpg://musicpilot:change-this-password@postgres:5432/musicpilot
@@ -386,13 +389,34 @@ MP_DATABASE_URL: postgresql+asyncpg://musicpilot:change-this-password@postgres:5
 
 PostgreSQL 数据库和用户需要提前创建。MusicPilot 启动时会通过 Alembic 自动初始化或升级表结构。
 
+如果希望把 PostgreSQL 一起放进 Compose，可以增加一个 `postgres` 服务，并让 MusicPilot 依赖它：
+
+```yaml
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: musicpilot
+      POSTGRES_USER: musicpilot
+      POSTGRES_PASSWORD: change-this-password
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  musicpilot:
+    environment:
+      MP_DATABASE_URL: postgresql+asyncpg://musicpilot:change-this-password@postgres:5432/musicpilot
+    depends_on:
+      - postgres
+```
+
 ### 6.5. 配置教程
 
 首次启动后，还需要在 Web UI 中配置站点、下载器、音乐库、整理规则和通知渠道。
 
 配置教程入口：[MusicPilot 配置教程](docs/configuration.md)
 
-该文档用于集中说明各项配置步骤，当前只提供入口，具体内容后续补充。
+该文档集中说明启动环境变量、站点解析器、站点账号、下载器、音乐库、刮削、搜索、通知和数据库备份等配置步骤。
 
 ## 7. 免责声明
 
