@@ -3660,6 +3660,10 @@ function downloadTaskItemStatusText(status: string) {
     metadata_searching: '查询中',
     metadata_found: '已匹配',
     metadata_not_found: '未匹配',
+    organizing: '整理中',
+    organized: '已整理',
+    organize_failed: '整理失败',
+    organize_skipped: '已跳过',
     failed: '失败'
   }[status] ?? status
 }
@@ -3670,6 +3674,10 @@ function downloadTaskItemStatusColor(status: string) {
     metadata_searching: 'info',
     metadata_found: 'success',
     metadata_not_found: 'warning',
+    organizing: 'info',
+    organized: 'success',
+    organize_failed: 'error',
+    organize_skipped: 'warning',
     failed: 'error'
   }[status] ?? 'secondary'
 }
