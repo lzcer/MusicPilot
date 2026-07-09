@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import time
 import tomllib
 import unicodedata
@@ -1471,11 +1472,19 @@ def create_app() -> FastAPI:
         return SystemSettingsResponse(**settings_payload)
 
     @app.get("/api/settings/database/export")
-    async def export_database() -> Response:
-        exported = await DatabaseMigrationService(state.database).export_zip()
+    async def export_database() -> StreamingResponse:
         filename = f"musicpilot-database-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.zip"
-        return Response(
-            content=exported,
+        fd, path_name = tempfile.mkstemp(prefix="musicpilot-database-", suffix=".zip")
+        os.close(fd)
+        export_path = Path(path_name)
+        try:
+            await DatabaseMigrationService(state.database).export_zip_to_path(export_path)
+        except Exception:
+            with contextlib.suppress(FileNotFoundError):
+                await asyncio.to_thread(export_path.unlink)
+            raise
+        return StreamingResponse(
+            _stream_temporary_file(export_path),
             media_type="application/zip",
             headers={
                 "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
@@ -7377,6 +7386,17 @@ def _supported_parser_or_422(state: AppState, base_url: str) -> NexusPHPParserCo
             detail="当前站点暂不支持，请先在 sites.parser.yaml 中配置解析器。",
         )
     return entry.parser
+
+
+async def _stream_temporary_file(path: Path) -> AsyncIterator[bytes]:
+    try:
+        with path.open("rb") as file:
+            while chunk := file.read(1024 * 1024):
+                yield chunk
+                await asyncio.sleep(0)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            await asyncio.to_thread(path.unlink)
 
 
 def _proxy_url(settings_payload: dict[str, object]) -> str | None:
