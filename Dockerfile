@@ -38,8 +38,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --verbose \
       --default-index "${UV_DEFAULT_INDEX}" \
       -r pyproject.toml
-COPY README.md LICENSE ./
+COPY README.md LICENSE alembic.ini ./
 COPY musicpilot ./musicpilot
+COPY alembic ./alembic
 RUN --mount=type=cache,target=/root/.cache/uv \
     UV_HTTP_TIMEOUT=120 \
     UV_HTTP_RETRIES=5 \
