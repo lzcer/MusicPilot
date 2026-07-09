@@ -1345,6 +1345,32 @@ function runDirectSearch() {
   })
 }
 
+function openDirectSiteSearchConfirm() {
+  const title = trimmedInput(searchText.value)
+  if (!title) return
+  searchDialog.value = false
+  metadataCandidates.value = []
+  searchResults.value = []
+  hasSearchedTorrents.value = false
+  searchSiteFilter.value = ''
+  searchPage.value = 1
+  searchStats.value = { raw_count: 0, filtered_count: 0 }
+  searchProgress.value = { completed_sites: 0, total_sites: 0, active_keywords: [] }
+  selectedMedia.value = {
+    title,
+    artist: null,
+    album: null,
+    albums: [],
+    release_date: null,
+    cover_url: null,
+    source: 'direct',
+    external_id: `direct:${title}`
+  }
+  selectedAlbumNames.value = []
+  selectedSiteIds.value = [...enabledSiteIds.value]
+  siteConfirmDialog.value = true
+}
+
 function openSiteConfirm(candidate: MediaCandidate) {
   const media = rawMediaCandidate(candidate)
   selectedMedia.value = media
@@ -5454,6 +5480,15 @@ onUnmounted(() => {
         <v-card-actions>
           <v-spacer />
           <v-btn variant="text" @click="searchDialog = false">取消</v-btn>
+          <v-btn
+            color="primary"
+            prepend-icon="mdi-server-network"
+            variant="tonal"
+            :disabled="!trimmedInput(searchText)"
+            @click="openDirectSiteSearchConfirm"
+          >
+            搜索站点
+          </v-btn>
           <v-btn color="primary" :loading="searchLoading" @click="runSearch">搜索</v-btn>
         </v-card-actions>
       </v-card>
