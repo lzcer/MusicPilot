@@ -330,30 +330,53 @@ class MultiSourceMusicProvider:
     ) -> tuple[_SourceSong, ...]:
         query = _search_query(title, artist)
         response = await self._client.get(
-            "https://m.music.migu.cn/migu/remoting/scr_search_tag",
-            params={"rows": 10, "type": 2, "keyword": query, "pgc": 1},
+            "https://c.musicapp.migu.cn/v1.0/content/search_all.do",
+            params={
+                "text": query,
+                "pageNo": 1,
+                "pageSize": 10,
+                "isCopyright": 1,
+                "sort": 1,
+                "searchSwitch": (
+                    '{"song":1,"album":0,"singer":0,"tagSong":1,"mvSong":0,"bestShow":1}'
+                ),
+            },
             headers={
                 "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:80.0) "
-                    "Gecko/20100101 Firefox/80.0"
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
                 ),
-                "Referer": "https://m.music.migu.cn/",
+                "Accept": "application/json, text/plain, */*",
+                "Origin": "https://h5.nf.migu.cn",
+                "Referer": "https://h5.nf.migu.cn/",
+                "ua": "Android_migu",
+                "version": "6.8.8",
+                "channel": "014021I",
+                "subchannel": "014021I",
             },
         )
         response.raise_for_status()
-        songs = response.json().get("musics", [])
+        songs = response.json().get("songResultData", {}).get("result", [])
         return tuple(
             _SourceSong(
                 source="migu",
                 song_id=str(song.get("copyrightId") or ""),
-                name=str(song.get("songName") or ""),
-                artist=str(song.get("singerName") or ""),
-                album=str(song.get("albumName") or ""),
-                album_img=_optional_string(song.get("cover")),
+                name=str(song.get("name") or song.get("songName") or ""),
+                artist=",".join(
+                    str(singer.get("name") or "")
+                    for singer in song.get("singers", song.get("singerList", []))
+                    if isinstance(singer, dict)
+                ) or str(song.get("singerName") or ""),
+                album=",".join(
+                    str(album.get("name") or "")
+                    for album in song.get("albums", [])
+                    if isinstance(album, dict)
+                ) or str(song.get("albumName") or ""),
+                album_img=_migu_cover_url(song),
                 year="",
             )
             for song in songs
-            if song.get("copyrightId") and song.get("songName")
+            if song.get("copyrightId") and (song.get("name") or song.get("songName"))
         )
 
     async def _fetch_migu_lyric(self, song_id: str) -> str | None:
@@ -372,24 +395,44 @@ class MultiSourceMusicProvider:
     ) -> tuple[_SourceSong, ...]:
         query = _search_query(title, artist)
         response = await self._client.get(
-            "http://www.kuwo.cn/api/www/search/searchMusicBykeyWord",
-            params={"key": query, "pn": 1, "rn": 10, "httpsStatus": 1},
-            headers=_kuwo_headers(self._kuwo_token, self._kuwo_cross),
+            "https://www.kuwo.cn/search/searchMusicBykeyWord",
+            params={
+                "vipver": 1,
+                "client": "kt",
+                "ft": "music",
+                "cluster": 0,
+                "strategy": 2012,
+                "encoding": "utf8",
+                "rformat": "json",
+                "mobi": 1,
+                "issubtitle": 1,
+                "show_copyright_off": 1,
+                "pn": 0,
+                "rn": 10,
+                "all": query,
+            },
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+                ),
+            },
         )
         response.raise_for_status()
-        songs = response.json().get("data", {}).get("list", [])
+        songs = response.json().get("abslist", [])
         return tuple(
             _SourceSong(
                 source="kuwo",
-                song_id=str(song.get("rid") or ""),
-                name=str(song.get("name") or ""),
-                artist=str(song.get("artist") or ""),
-                album=str(song.get("album") or ""),
-                album_img=_optional_string(song.get("albumpic")),
+                song_id=str(song.get("MUSICRID") or song.get("rid") or "").removeprefix("MUSIC_"),
+                name=str(song.get("SONGNAME") or song.get("NAME") or song.get("name") or ""),
+                artist=str(song.get("ARTIST") or song.get("artist") or ""),
+                album=str(song.get("ALBUM") or song.get("album") or ""),
+                album_img=_optional_string(song.get("hts_MVPIC") or song.get("albumpic")),
                 year="",
             )
             for song in songs
-            if song.get("rid") and song.get("name")
+            if (song.get("MUSICRID") or song.get("rid"))
+            and (song.get("SONGNAME") or song.get("NAME") or song.get("name"))
         )
 
     async def _fetch_kuwo_lyric(self, song_id: str) -> str | None:
@@ -514,6 +557,15 @@ def _timestamp_year_text(value: object) -> str:
 def _optional_string(value: object) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _migu_cover_url(song: dict[str, object]) -> str | None:
+    images = song.get("imgItems")
+    if isinstance(images, list):
+        for item in reversed(images):
+            if isinstance(item, dict) and (url := _optional_string(item.get("img"))):
+                return url
+    return _optional_string(song.get("cover"))
 
 
 def _generate_kw_token(length: int = 32) -> str:
