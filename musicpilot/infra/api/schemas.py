@@ -204,6 +204,7 @@ class DashboardTaskSummaryResponse(BaseModel):
     waiting: int
     running: int
     failed: int
+    slow: int
 
 
 class DashboardResponse(BaseModel):

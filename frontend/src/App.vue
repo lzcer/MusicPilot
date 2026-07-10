@@ -274,10 +274,11 @@ type DashboardSummary = {
     waiting: number
     running: number
     failed: number
+    slow: number
   }
 }
 
-type SystemTaskStatus = 'RUNNING' | 'WAIT' | 'FAILED'
+type SystemTaskStatus = 'RUNNING' | 'WAIT' | 'FAILED' | 'SLOW'
 
 type SystemTask = {
   id: number
@@ -570,6 +571,8 @@ let logTimer: number | undefined
 let downloadTimer: number | undefined
 let artistBuildTimer: number | undefined
 let mediaRefreshTimer: number | undefined
+let systemTaskTimer: number | undefined
+let systemTaskRefreshPending = false
 let metadataSearchStream: EventSource | undefined
 
 const downloads = ref<DownloadTask[]>([])
@@ -1178,6 +1181,10 @@ const systemTasksDialogTitle = computed(
   () => `队列任务 - ${systemTaskStatusText(systemTaskStatus.value)}`
 )
 
+const systemTaskInterruptButtonText = computed(() =>
+  systemTaskStatus.value === 'SLOW' ? '强制中止选中' : '中断选中'
+)
+
 const mediaFileIds = computed(() => mediaFiles.value.map((item) => item.id))
 const mediaPageLength = computed(() =>
   Math.max(1, Math.ceil(mediaTotal.value / mediaPageSize.value))
@@ -1322,14 +1329,20 @@ async function loadAboutInfo() {
   aboutInfo.value = await api<AboutInfo>('/api/about')
 }
 
-async function loadDashboard() {
-  dashboardLoading.value = true
+async function loadDashboard(silent = false) {
+  if (!silent) {
+    dashboardLoading.value = true
+  }
   try {
     dashboard.value = await api<DashboardSummary>('/api/dashboard')
   } catch (error) {
-    notify(error instanceof Error ? error.message : '仪表盘加载失败', 'error')
+    if (!silent) {
+      notify(error instanceof Error ? error.message : '仪表盘加载失败', 'error')
+    }
   } finally {
-    dashboardLoading.value = false
+    if (!silent) {
+      dashboardLoading.value = false
+    }
   }
 }
 
@@ -1340,8 +1353,12 @@ async function openSystemTasks(status: SystemTaskStatus) {
   await loadSystemTasks()
 }
 
-async function loadSystemTasks() {
-  systemTasksLoading.value = true
+async function loadSystemTasks(silent = false) {
+  if (systemTaskRefreshPending) return
+  systemTaskRefreshPending = true
+  if (!silent) {
+    systemTasksLoading.value = true
+  }
   try {
     const params = new URLSearchParams({
       status: systemTaskStatus.value,
@@ -1350,11 +1367,32 @@ async function loadSystemTasks() {
     systemTasks.value = await api<SystemTask[]>(`/api/system-tasks?${params.toString()}`)
     syncSelectedSystemTaskIds()
   } catch (error) {
-    notify(error instanceof Error ? error.message : '队列任务加载失败', 'error')
+    if (!silent) {
+      notify(error instanceof Error ? error.message : '队列任务加载失败', 'error')
+    }
     systemTasks.value = []
   } finally {
-    systemTasksLoading.value = false
+    systemTaskRefreshPending = false
+    if (!silent) {
+      systemTasksLoading.value = false
+    }
   }
+}
+
+function startSystemTaskPolling() {
+  window.clearInterval(systemTaskTimer)
+  systemTaskTimer = window.setInterval(() => {
+    if (!systemTasksDialog.value) {
+      stopSystemTaskPolling()
+      return
+    }
+    void Promise.all([loadSystemTasks(true), loadDashboard(true)]).catch(() => undefined)
+  }, 2000)
+}
+
+function stopSystemTaskPolling() {
+  window.clearInterval(systemTaskTimer)
+  systemTaskTimer = undefined
 }
 
 function syncSelectedSystemTaskIds() {
@@ -1363,7 +1401,7 @@ function syncSelectedSystemTaskIds() {
 }
 
 function canInterruptSystemTask(task: SystemTask) {
-  return task.status === 'WAIT'
+  return task.status === 'WAIT' || (systemTaskStatus.value === 'SLOW' && task.status === 'RUNNING')
 }
 
 async function interruptSystemTask(task: SystemTask) {
@@ -2984,6 +3022,15 @@ watch(downloadableTaskIds, () => {
   syncSelectedDownloadIds()
 })
 
+watch(systemTasksDialog, (open) => {
+  if (open) {
+    startSystemTaskPolling()
+    return
+  }
+  stopSystemTaskPolling()
+  selectedSystemTaskIds.value = []
+})
+
 watch(searchSiteFilter, () => {
   searchPage.value = 1
 })
@@ -3691,6 +3738,20 @@ function formatOptionalTime(value?: string | null) {
   return value ? formatTime(value) : '-'
 }
 
+function systemTaskElapsedText(task: SystemTask) {
+  if (!task.started_at) return '-'
+  const startedAt = Date.parse(task.started_at)
+  if (Number.isNaN(startedAt)) return '-'
+  const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  const remainingSeconds = seconds % 60
+  if (hours > 0) {
+    return `${hours}小时${minutes.toString().padStart(2, '0')}分`
+  }
+  return `${minutes}分${remainingSeconds.toString().padStart(2, '0')}秒`
+}
+
 function musicPlatformLabel(platform: MusicPlatform) {
   return `${platform.platform === 'spotify' ? 'Spotify' : platform.platform}${platform.display_name ? ` - ${platform.display_name}` : ''}`
 }
@@ -3774,6 +3835,7 @@ function systemTaskStatusText(status: string) {
   return {
     WAIT: '等待中',
     RUNNING: '运行中',
+    SLOW: '耗时异常',
     SUCCEEDED: '已完成',
     FAILED: '失败',
     INTERRUPTED: '已中断'
@@ -3784,6 +3846,7 @@ function systemTaskStatusColor(status: string) {
   return {
     WAIT: 'warning',
     RUNNING: 'info',
+    SLOW: 'warning',
     SUCCEEDED: 'success',
     FAILED: 'error',
     INTERRUPTED: 'warning'
@@ -3973,6 +4036,7 @@ onUnmounted(() => {
   window.clearInterval(logTimer)
   window.clearInterval(downloadTimer)
   window.clearInterval(artistBuildTimer)
+  stopSystemTaskPolling()
   stopMediaRefreshPolling()
   metadataSearchStream?.close()
 })
@@ -4172,10 +4236,14 @@ onUnmounted(() => {
                       <div class="dashboard-health-value">{{ dashboard.tasks.failed }}</div>
                       <div class="dashboard-health-label">失败</div>
                     </button>
-                    <div class="dashboard-health-card">
-                      <div class="dashboard-health-value">{{ dashboard.playlists.pending_tracks }}</div>
-                      <div class="dashboard-health-label">歌单待处理</div>
-                    </div>
+                    <button
+                      class="dashboard-health-card"
+                      type="button"
+                      @click="openSystemTasks('SLOW')"
+                    >
+                      <div class="dashboard-health-value">{{ dashboard.tasks.slow }}</div>
+                      <div class="dashboard-health-label">耗时异常</div>
+                    </button>
                   </div>
                   <div class="dashboard-status-row">
                     <v-chip color="success" variant="tonal">
@@ -6372,7 +6440,7 @@ onUnmounted(() => {
               :loading="systemTasksInterrupting"
               @click="interruptSelectedSystemTasks"
             >
-              中断选中
+              {{ systemTaskInterruptButtonText }}
             </v-btn>
           </div>
           <v-progress-linear v-if="systemTasksLoading" indeterminate class="mb-4" />
@@ -6392,6 +6460,7 @@ onUnmounted(() => {
                 <th>类型</th>
                 <th>状态</th>
                 <th>尝试</th>
+                <th>耗时</th>
                 <th>可执行时间</th>
                 <th>创建时间</th>
                 <th>错误</th>
@@ -6400,7 +6469,7 @@ onUnmounted(() => {
             </thead>
             <tbody>
               <tr v-if="!systemTasks.length">
-                <td colspan="9" class="empty-cell">暂无队列任务</td>
+                <td colspan="10" class="empty-cell">暂无队列任务</td>
               </tr>
               <tr v-for="task in systemTasks" :key="task.id">
                 <td class="select-cell">
@@ -6424,6 +6493,7 @@ onUnmounted(() => {
                   </v-chip>
                 </td>
                 <td>{{ task.attempts }} / {{ task.max_attempts }}</td>
+                <td>{{ systemTaskElapsedText(task) }}</td>
                 <td>{{ formatOptionalTime(task.available_at) }}</td>
                 <td>{{ formatOptionalTime(task.created_at) }}</td>
                 <td class="truncate-cell" :title="task.error_message || '-'">
@@ -6435,7 +6505,7 @@ onUnmounted(() => {
                     color="warning"
                     variant="text"
                     size="small"
-                    title="中断任务"
+                    :title="systemTaskStatus === 'SLOW' ? '强制中止任务' : '中断任务'"
                     :disabled="!canInterruptSystemTask(task) || systemTasksInterrupting"
                     @click="interruptSystemTask(task)"
                   />

@@ -83,6 +83,8 @@ class TaskManager:
         self._condition = asyncio.Condition()
         self._worker: asyncio.Task[None] | None = None
         self._running_tasks: set[asyncio.Task[None]] = set()
+        self._running_task_by_id: dict[int, asyncio.Task[None]] = {}
+        self._force_interrupted_task_ids: set[int] = set()
         self._stopping = False
 
     async def enqueue(self, task: TaskCreate) -> int:
@@ -112,7 +114,7 @@ class TaskManager:
                 task = await self.repository.get_system_task(task_id)
                 if task is None:
                     raise RuntimeError(f"System task not found: id={task_id}")
-                if task.status in {"SUCCEEDED", "FAILED"}:
+                if task.status in {"SUCCEEDED", "FAILED", "INTERRUPTED"}:
                     return task
                 async with self._condition:
                     with contextlib.suppress(asyncio.TimeoutError):
@@ -250,6 +252,19 @@ class TaskManager:
         async with self._condition:
             self._condition.notify_all()
 
+    async def force_interrupt_system_tasks(self, task_ids: list[int]) -> list[int]:
+        interrupted: list[int] = []
+        for task_id in sorted(set(task_ids)):
+            runner = self._running_task_by_id.get(task_id)
+            if runner is None or runner.done():
+                continue
+            self._force_interrupted_task_ids.add(task_id)
+            runner.cancel()
+            interrupted.append(task_id)
+        if interrupted:
+            await self.wake()
+        return interrupted
+
     async def _run(self) -> None:
         recovered = await self.repository.recover_stale_system_tasks(recover_all_running=True)
         if recovered:
@@ -301,12 +316,17 @@ class TaskManager:
                 name=f"musicpilot-system-task-{claimed.id}",
             )
             self._running_tasks.add(runner)
+            self._running_task_by_id[int(claimed.id)] = runner
             runner.add_done_callback(self._system_task_done)
             scheduled = True
         return scheduled
 
     def _system_task_done(self, task: asyncio.Task[None]) -> None:
         self._running_tasks.discard(task)
+        for task_id, runner in tuple(self._running_task_by_id.items()):
+            if runner is task:
+                self._running_task_by_id.pop(task_id, None)
+                break
         if not task.cancelled():
             with contextlib.suppress(Exception):
                 task.result()
@@ -314,10 +334,11 @@ class TaskManager:
             asyncio.create_task(self.wake())
 
     async def _execute_claimed(self, task: Any) -> None:
+        task_id = int(task.id)
         executor = self.executors.get(str(task.task_type))
         if executor is None:
             await self.repository.fail_system_task(
-                int(task.id),
+                task_id,
                 error_message=f"No executor registered for task type {task.task_type}.",
                 retry_delay_seconds=self.retry_delay_seconds,
             )
@@ -334,7 +355,7 @@ class TaskManager:
             "INFO",
         )
         lease_refresher = asyncio.create_task(
-            self._refresh_task_lease(int(task.id)),
+            self._refresh_task_lease(task_id),
             name=f"musicpilot-task-lease-{task.id}",
         )
         try:
@@ -343,32 +364,57 @@ class TaskManager:
             lease_refresher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await lease_refresher
-            with contextlib.suppress(Exception):
-                await asyncio.shield(
-                    self.repository.requeue_system_task(
-                        int(task.id),
-                        error_message="Task cancelled; restored to WAIT.",
+            if task_id in self._force_interrupted_task_ids:
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(
+                        self.repository.interrupt_running_system_tasks(
+                            [task_id],
+                            error_message="Task force interrupted by user.",
+                        )
                     )
-                )
+                self._force_interrupted_task_ids.discard(task_id)
+            else:
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(
+                        self.repository.requeue_system_task(
+                            task_id,
+                            error_message="Task cancelled; restored to WAIT.",
+                        )
+                    )
             await self.wake()
             raise
         except Exception as exc:  # noqa: BLE001
             lease_refresher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await lease_refresher
-            await self.repository.fail_system_task(
-                int(task.id),
-                error_message=str(exc),
-                retry_delay_seconds=self.retry_delay_seconds,
-            )
-            self._log("task", f"System task failed: id={task.id}, error={exc}", "ERROR")
+            if task_id in self._force_interrupted_task_ids:
+                await self.repository.interrupt_running_system_tasks(
+                    [task_id],
+                    error_message="Task force interrupted by user.",
+                )
+                self._force_interrupted_task_ids.discard(task_id)
+            else:
+                await self.repository.fail_system_task(
+                    task_id,
+                    error_message=str(exc),
+                    retry_delay_seconds=self.retry_delay_seconds,
+                )
+                self._log("task", f"System task failed: id={task.id}, error={exc}", "ERROR")
             await self.wake()
             return
         lease_refresher.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await lease_refresher
+        if task_id in self._force_interrupted_task_ids:
+            await self.repository.interrupt_running_system_tasks(
+                [task_id],
+                error_message="Task force interrupted by user.",
+            )
+            self._force_interrupted_task_ids.discard(task_id)
+            await self.wake()
+            return
         await self.repository.complete_system_task(
-            int(task.id),
+            task_id,
             result=result.result,
             next_tasks=[item.to_payload() for item in result.next_tasks],
         )

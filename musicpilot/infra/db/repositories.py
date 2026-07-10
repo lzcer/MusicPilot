@@ -47,6 +47,7 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
 
 logger = logging.getLogger(__name__)
 SLOW_DB_OPERATION_SECONDS = float(os.getenv("MP_SLOW_DB_OPERATION_SECONDS", "0.5"))
+SLOW_SYSTEM_TASK_SECONDS = int(os.getenv("MP_SLOW_SYSTEM_TASK_SECONDS", "300"))
 
 
 def _elapsed_ms(started_at: float) -> float:
@@ -478,6 +479,26 @@ class SqlAlchemyMediaRepository:
             )
             return list(result.scalars().all())
 
+    async def list_slow_running_system_tasks(
+        self,
+        *,
+        threshold_seconds: int = SLOW_SYSTEM_TASK_SECONDS,
+        limit: int = 200,
+    ) -> list[SystemTask]:
+        threshold = datetime.now(UTC) - timedelta(seconds=max(1, threshold_seconds))
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(SystemTask)
+                .where(
+                    SystemTask.status == "RUNNING",
+                    SystemTask.started_at.isnot(None),
+                    SystemTask.started_at <= threshold,
+                )
+                .order_by(SystemTask.started_at, SystemTask.id)
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
     async def get_system_task_by_idempotency_key(
         self,
         idempotency_key: str,
@@ -679,7 +700,7 @@ class SqlAlchemyMediaRepository:
         now = datetime.now(UTC)
         async with self.database.session() as session:
             task = await session.get(SystemTask, task_id)
-            if task is None:
+            if task is None or task.status != "RUNNING":
                 return None
             task.status = "SUCCEEDED"
             task.result = result
@@ -737,7 +758,7 @@ class SqlAlchemyMediaRepository:
         now = datetime.now(UTC)
         async with self.database.session() as session:
             task = await session.get(SystemTask, task_id)
-            if task is None:
+            if task is None or task.status != "RUNNING":
                 return None
             should_retry = task.attempts < task.max_attempts
             task.status = "WAIT" if should_retry else "FAILED"
@@ -815,6 +836,44 @@ class SqlAlchemyMediaRepository:
                             SystemTaskResourceLease.chain_id == chain_id,
                         )
                     )
+            await session.commit()
+            for task in tasks:
+                await session.refresh(task)
+            return tasks
+
+    async def interrupt_running_system_tasks(
+        self,
+        task_ids: list[int],
+        *,
+        error_message: str,
+    ) -> list[SystemTask]:
+        ids = sorted(set(task_ids))
+        if not ids:
+            return []
+        now = datetime.now(UTC)
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(SystemTask)
+                .where(SystemTask.id.in_(ids), SystemTask.status == "RUNNING")
+                .order_by(SystemTask.created_at, SystemTask.id)
+            )
+            tasks = list(result.scalars().all())
+            if not tasks:
+                return []
+            for task in tasks:
+                task.status = "INTERRUPTED"
+                task.error_message = error_message
+                task.finished_at = now
+                task.heartbeat_at = now
+                task.lease_until = None
+            await session.execute(
+                delete(SystemTaskResourceLease).where(
+                    or_(
+                        SystemTaskResourceLease.task_id.in_([task.id for task in tasks]),
+                        SystemTaskResourceLease.chain_id.in_({task.chain_id for task in tasks}),
+                    )
+                )
+            )
             await session.commit()
             for task in tasks:
                 await session.refresh(task)
@@ -1712,6 +1771,16 @@ class SqlAlchemyMediaRepository:
                 .select_from(SystemTask)
                 .group_by(SystemTask.status)
             )
+            slow_task_threshold = datetime.now(UTC) - timedelta(seconds=SLOW_SYSTEM_TASK_SECONDS)
+            slow_tasks = await session.execute(
+                select(func.count())
+                .select_from(SystemTask)
+                .where(
+                    SystemTask.status == "RUNNING",
+                    SystemTask.started_at.isnot(None),
+                    SystemTask.started_at <= slow_task_threshold,
+                )
+            )
 
             task_counts = {str(status): int(count) for status, count in task_status_rows.all()}
             return {
@@ -1750,6 +1819,7 @@ class SqlAlchemyMediaRepository:
                     "waiting": task_counts.get("WAIT", 0),
                     "running": task_counts.get("RUNNING", 0),
                     "failed": task_counts.get("FAILED", 0),
+                    "slow": int(slow_tasks.scalar_one()),
                 },
             }
 

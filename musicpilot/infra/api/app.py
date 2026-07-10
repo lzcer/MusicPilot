@@ -1040,10 +1040,13 @@ def create_app() -> FastAPI:
 
     @app.get("/api/system-tasks", response_model=list[SystemTaskResponse])
     async def system_tasks(
-        status: str = Query(default="WAIT", pattern="^(WAIT|RUNNING|FAILED)$"),
+        status: str = Query(default="WAIT", pattern="^(WAIT|RUNNING|FAILED|SLOW)$"),
         limit: int = Query(default=200, ge=1, le=500),
     ) -> list[SystemTaskResponse]:
-        tasks = await state.repository.list_system_tasks(status=status, limit=limit)
+        if status == "SLOW":
+            tasks = await state.repository.list_slow_running_system_tasks(limit=limit)
+        else:
+            tasks = await state.repository.list_system_tasks(status=status, limit=limit)
         return [_system_task_response(item) for item in tasks]
 
     @app.post("/api/system-tasks/interrupt", response_model=SystemTaskInterruptResponse)
@@ -1053,6 +1056,15 @@ def create_app() -> FastAPI:
         ids = sorted(set(payload.ids))
         existing = await state.repository.list_system_tasks_by_ids(ids)
         existing_by_id = {int(task.id): task for task in existing}
+        slow_tasks = await state.repository.list_slow_running_system_tasks(limit=500)
+        slow_task_ids = {int(task.id) for task in slow_tasks}
+        slow_running_ids = [
+            task_id
+            for task_id in ids
+            if existing_by_id.get(task_id) is not None
+            and existing_by_id[task_id].status == "RUNNING"
+            and task_id in slow_task_ids
+        ]
         waiting_ids = [
             task_id
             for task_id in ids
@@ -1063,6 +1075,15 @@ def create_app() -> FastAPI:
             waiting_ids,
             error_message="Task interrupted by user.",
         )
+        force_interrupted = await state.repository.interrupt_running_system_tasks(
+            slow_running_ids,
+            error_message="Task force interrupted by user.",
+        )
+        if force_interrupted:
+            await state.task_manager.force_interrupt_system_tasks(
+                [int(task.id) for task in force_interrupted]
+            )
+        interrupted.extend(force_interrupted)
         for task in interrupted:
             await _sync_interrupted_system_task(state, task)
         if interrupted:
