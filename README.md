@@ -417,6 +417,9 @@ MusicPilot 的设计和实现过程中参考了许多优秀开源项目。特别
 2. [musicdl](https://github.com/CharlesPikachu/musicdl)
    - MusicPilot 的多源音乐元数据检索和音乐信息补全能力，参考了 musicdl 项目中对音乐平台数据获取的实践。
 
+3. [Jackett/Jackett](https://github.com/Jackett/Jackett)
+   - MusicPilot 的站点搜索适配参考了 Jackett 对私有站点请求参数和结果解析规则的实践。
+
 同时感谢 FastAPI、SQLAlchemy、Vue、Vite、Vuetify、qBittorrent、Navidrome、MusicBrainz、NexusPHP 及相关开源生态提供的基础能力。
 
 本项目仍在持续演进中，欢迎通过 issue、讨论和代码贡献帮助它变得更稳定、更易用。

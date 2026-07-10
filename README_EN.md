@@ -236,6 +236,9 @@ MusicPilot's design and implementation reference many excellent open-source proj
 2. [musicdl](https://github.com/CharlesPikachu/musicdl)
    - MusicPilot's multi-source music metadata search and music information completion capabilities reference the practical work in musicdl around music platform data retrieval.
 
+3. [Jackett/Jackett](https://github.com/Jackett/Jackett)
+   - MusicPilot's site search integration references Jackett's approach to request parameters and result parsing rules for private trackers.
+
 Thanks also to FastAPI, SQLAlchemy, Vue, Vite, Vuetify, qBittorrent, Navidrome, MusicBrainz, NexusPHP, and the broader open-source ecosystem for the foundational capabilities they provide.
 
 This project is still evolving. Issues, discussions, and code contributions are welcome to help make it more stable and easier to use.
