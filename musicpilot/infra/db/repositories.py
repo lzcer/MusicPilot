@@ -449,6 +449,35 @@ class SqlAlchemyMediaRepository:
         async with self.database.session() as session:
             return await session.get(SystemTask, task_id)
 
+    async def list_system_tasks(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 200,
+    ) -> list[SystemTask]:
+        async with self.database.session() as session:
+            statement = select(SystemTask)
+            if status is not None:
+                statement = statement.where(SystemTask.status == status)
+            result = await session.execute(
+                statement
+                .order_by(SystemTask.priority.desc(), SystemTask.created_at, SystemTask.id)
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def list_system_tasks_by_ids(self, task_ids: list[int]) -> list[SystemTask]:
+        ids = sorted(set(task_ids))
+        if not ids:
+            return []
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(SystemTask)
+                .where(SystemTask.id.in_(ids))
+                .order_by(SystemTask.created_at, SystemTask.id)
+            )
+            return list(result.scalars().all())
+
     async def get_system_task_by_idempotency_key(
         self,
         idempotency_key: str,
@@ -737,6 +766,59 @@ class SqlAlchemyMediaRepository:
             await session.commit()
             await session.refresh(task)
             return task
+
+    async def interrupt_waiting_system_tasks(
+        self,
+        task_ids: list[int],
+        *,
+        error_message: str,
+    ) -> list[SystemTask]:
+        ids = sorted(set(task_ids))
+        if not ids:
+            return []
+        now = datetime.now(UTC)
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(SystemTask)
+                .where(SystemTask.id.in_(ids), SystemTask.status == "WAIT")
+                .order_by(SystemTask.created_at, SystemTask.id)
+            )
+            tasks = list(result.scalars().all())
+            if not tasks:
+                return []
+            for task in tasks:
+                task.status = "INTERRUPTED"
+                task.error_message = error_message
+                task.finished_at = now
+                task.heartbeat_at = now
+                task.lease_until = None
+            await session.execute(
+                delete(SystemTaskResourceLease).where(
+                    SystemTaskResourceLease.holder_kind == "task",
+                    SystemTaskResourceLease.task_id.in_([task.id for task in tasks]),
+                )
+            )
+            await session.flush()
+            for chain_id in {task.chain_id for task in tasks}:
+                active_result = await session.execute(
+                    select(func.count())
+                    .select_from(SystemTask)
+                    .where(
+                        SystemTask.chain_id == chain_id,
+                        SystemTask.status.in_(("WAIT", "RUNNING")),
+                    )
+                )
+                if int(active_result.scalar_one()) == 0:
+                    await session.execute(
+                        delete(SystemTaskResourceLease).where(
+                            SystemTaskResourceLease.holder_kind == "chain",
+                            SystemTaskResourceLease.chain_id == chain_id,
+                        )
+                    )
+            await session.commit()
+            for task in tasks:
+                await session.refresh(task)
+            return tasks
 
     async def refresh_system_task_lease(
         self,
@@ -1585,7 +1667,7 @@ class SqlAlchemyMediaRepository:
             download_active = await session.execute(
                 select(func.count())
                 .select_from(TorrentRecord)
-                .where(TorrentRecord.status != "library_refreshed")
+                .where(TorrentRecord.status.not_in(("library_refreshed", "interrupted")))
             )
             download_completed_7d = await session.execute(
                 select(func.count())

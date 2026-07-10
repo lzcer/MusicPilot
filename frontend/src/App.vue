@@ -277,6 +277,32 @@ type DashboardSummary = {
   }
 }
 
+type SystemTaskStatus = 'RUNNING' | 'WAIT' | 'FAILED'
+
+type SystemTask = {
+  id: number
+  task_type: string
+  status: string
+  chain_id: string
+  parent_task_id?: number | null
+  priority: number
+  payload: Record<string, unknown>
+  error_message?: string | null
+  attempts: number
+  max_attempts: number
+  available_at: string
+  started_at?: string | null
+  finished_at?: string | null
+  created_at: string
+  updated_at: string
+}
+
+type SystemTaskInterruptResponse = {
+  interrupted_ids: number[]
+  skipped_ids: number[]
+  not_found_ids: number[]
+}
+
 type DashboardMetric = {
   title: string
   value: number
@@ -551,6 +577,10 @@ const downloadTaskItems = ref<DownloadTaskItem[]>([])
 const selectedDownloadTask = ref<DownloadTask | null>(null)
 const selectedDownloadIds = ref<number[]>([])
 const downloadActiveOnly = ref(true)
+const systemTasksDialog = ref(false)
+const systemTaskStatus = ref<SystemTaskStatus>('WAIT')
+const systemTasks = ref<SystemTask[]>([])
+const selectedSystemTaskIds = ref<number[]>([])
 const mediaFiles = ref<MediaFile[]>([])
 const mediaQuery = ref('')
 const mediaPage = ref(1)
@@ -635,6 +665,8 @@ const playlistTracksDialog = ref(false)
 const playlistTrackEditDialog = ref(false)
 const deleteDialog = ref(false)
 const downloadItemsDialog = ref(false)
+const systemTasksLoading = ref(false)
+const systemTasksInterrupting = ref(false)
 const downloadDeleteDialog = ref(false)
 const mediaDeleteDialog = ref(false)
 const fileOrganizeDialog = ref(false)
@@ -1123,6 +1155,29 @@ const someDownloadsSelected = computed(
     !downloadableTaskIds.value.every((id) => selectedDownloadIds.value.includes(id))
 )
 
+const interruptibleSystemTaskIds = computed(() =>
+  systemTasks.value.filter((item) => canInterruptSystemTask(item)).map((item) => item.id)
+)
+
+const allSystemTasksSelected = computed({
+  get: () =>
+    interruptibleSystemTaskIds.value.length > 0 &&
+    interruptibleSystemTaskIds.value.every((id) => selectedSystemTaskIds.value.includes(id)),
+  set: (selected: boolean) => {
+    selectedSystemTaskIds.value = selected ? [...interruptibleSystemTaskIds.value] : []
+  }
+})
+
+const someSystemTasksSelected = computed(
+  () =>
+    selectedSystemTaskIds.value.length > 0 &&
+    !interruptibleSystemTaskIds.value.every((id) => selectedSystemTaskIds.value.includes(id))
+)
+
+const systemTasksDialogTitle = computed(
+  () => `队列任务 - ${systemTaskStatusText(systemTaskStatus.value)}`
+)
+
 const mediaFileIds = computed(() => mediaFiles.value.map((item) => item.id))
 const mediaPageLength = computed(() =>
   Math.max(1, Math.ceil(mediaTotal.value / mediaPageSize.value))
@@ -1275,6 +1330,76 @@ async function loadDashboard() {
     notify(error instanceof Error ? error.message : '仪表盘加载失败', 'error')
   } finally {
     dashboardLoading.value = false
+  }
+}
+
+async function openSystemTasks(status: SystemTaskStatus) {
+  systemTaskStatus.value = status
+  systemTasksDialog.value = true
+  selectedSystemTaskIds.value = []
+  await loadSystemTasks()
+}
+
+async function loadSystemTasks() {
+  systemTasksLoading.value = true
+  try {
+    const params = new URLSearchParams({
+      status: systemTaskStatus.value,
+      limit: '200'
+    })
+    systemTasks.value = await api<SystemTask[]>(`/api/system-tasks?${params.toString()}`)
+    syncSelectedSystemTaskIds()
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '队列任务加载失败', 'error')
+    systemTasks.value = []
+  } finally {
+    systemTasksLoading.value = false
+  }
+}
+
+function syncSelectedSystemTaskIds() {
+  const ids = new Set(interruptibleSystemTaskIds.value)
+  selectedSystemTaskIds.value = selectedSystemTaskIds.value.filter((id) => ids.has(id))
+}
+
+function canInterruptSystemTask(task: SystemTask) {
+  return task.status === 'WAIT'
+}
+
+async function interruptSystemTask(task: SystemTask) {
+  if (!canInterruptSystemTask(task)) return
+  await interruptSystemTasks([task.id])
+}
+
+async function interruptSelectedSystemTasks() {
+  const ids = [...selectedSystemTaskIds.value]
+  if (!ids.length) return
+  await interruptSystemTasks(ids)
+}
+
+async function interruptSystemTasks(ids: number[]) {
+  if (!ids.length || systemTasksInterrupting.value) return
+  systemTasksInterrupting.value = true
+  try {
+    const result = await api<SystemTaskInterruptResponse>('/api/system-tasks/interrupt', {
+      method: 'POST',
+      body: JSON.stringify({ ids })
+    })
+    selectedSystemTaskIds.value = selectedSystemTaskIds.value.filter(
+      (id) => !result.interrupted_ids.includes(id)
+    )
+    await Promise.all([loadSystemTasks(), loadDashboard()])
+    if (result.interrupted_ids.length) {
+      notify(`已中断 ${result.interrupted_ids.length} 个队列任务`)
+    }
+    if (result.skipped_ids.length) {
+      notify(`${result.skipped_ids.length} 个任务当前状态不可中断`, 'warning')
+    }
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '队列任务中断失败', 'error')
+    await loadSystemTasks().catch(() => undefined)
+  } finally {
+    systemTasksInterrupting.value = false
   }
 }
 
@@ -3625,7 +3750,8 @@ function downloadStatusText(status: string) {
     library_refreshed: '曲库已刷新',
     source_directory_not_found: '目录未找到',
     failed: '失败',
-    deleted: '已删除'
+    deleted: '已删除',
+    interrupted: '已中断'
   }[status] ?? status
 }
 
@@ -3639,8 +3765,41 @@ function downloadStatusColor(status: string) {
     library_refreshed: 'success',
     source_directory_not_found: 'error',
     failed: 'error',
-    deleted: 'error'
+    deleted: 'error',
+    interrupted: 'warning'
   }[status] ?? 'secondary'
+}
+
+function systemTaskStatusText(status: string) {
+  return {
+    WAIT: '等待中',
+    RUNNING: '运行中',
+    SUCCEEDED: '已完成',
+    FAILED: '失败',
+    INTERRUPTED: '已中断'
+  }[status] ?? status
+}
+
+function systemTaskStatusColor(status: string) {
+  return {
+    WAIT: 'warning',
+    RUNNING: 'info',
+    SUCCEEDED: 'success',
+    FAILED: 'error',
+    INTERRUPTED: 'warning'
+  }[status] ?? 'secondary'
+}
+
+function systemTaskTypeText(type: string) {
+  return {
+    PLAYLIST_TRACK_DOWNLOAD: '歌单单曲下载',
+    DOWNLOAD_ITEM_SCRAPE: '下载明细匹配',
+    FILE_ORGANIZE: '文件整理',
+    DOWNLOAD_REFRESH_LIBRARY: '曲库刷新',
+    SEARCH_SITE: '站点搜索',
+    SEARCH_MEDIA: '媒体搜索',
+    SEARCH_SITE_CANDIDATES: '候选站点搜索'
+  }[type] ?? type
 }
 
 function playlistTrackStatusText(status: string) {
@@ -3658,7 +3817,8 @@ function playlistTrackStatusText(status: string) {
     not_found: '未找到',
     source_directory_not_found: '目录未找到',
     failed: '失败',
-    deleted: '已删除'
+    deleted: '已删除',
+    interrupted: '已中断'
   }[status] ?? status
 }
 
@@ -3676,7 +3836,8 @@ function playlistTrackStatusColor(status: string) {
     not_found: 'error',
     source_directory_not_found: 'error',
     failed: 'error',
-    deleted: 'error'
+    deleted: 'error',
+    interrupted: 'warning'
   }[status] ?? 'secondary'
 }
 
@@ -3690,7 +3851,8 @@ function downloadTaskItemStatusText(status: string) {
     organized: '已整理',
     organize_failed: '整理失败',
     organize_skipped: '已跳过',
-    failed: '失败'
+    failed: '失败',
+    interrupted: '已中断'
   }[status] ?? status
 }
 
@@ -3704,7 +3866,8 @@ function downloadTaskItemStatusColor(status: string) {
     organized: 'success',
     organize_failed: 'error',
     organize_skipped: 'warning',
-    failed: 'error'
+    failed: 'error',
+    interrupted: 'warning'
   }[status] ?? 'secondary'
 }
 
@@ -3985,19 +4148,31 @@ onUnmounted(() => {
                 <v-card class="dashboard-panel">
                   <v-card-title class="dashboard-panel-title">队列健康</v-card-title>
                   <div class="dashboard-health-grid">
-                    <div>
+                    <button
+                      class="dashboard-health-card"
+                      type="button"
+                      @click="openSystemTasks('RUNNING')"
+                    >
                       <div class="dashboard-health-value">{{ dashboard.tasks.running }}</div>
                       <div class="dashboard-health-label">运行中</div>
-                    </div>
-                    <div>
+                    </button>
+                    <button
+                      class="dashboard-health-card"
+                      type="button"
+                      @click="openSystemTasks('WAIT')"
+                    >
                       <div class="dashboard-health-value">{{ dashboard.tasks.waiting }}</div>
                       <div class="dashboard-health-label">等待中</div>
-                    </div>
-                    <div>
+                    </button>
+                    <button
+                      class="dashboard-health-card"
+                      type="button"
+                      @click="openSystemTasks('FAILED')"
+                    >
                       <div class="dashboard-health-value">{{ dashboard.tasks.failed }}</div>
                       <div class="dashboard-health-label">失败</div>
-                    </div>
-                    <div>
+                    </button>
+                    <div class="dashboard-health-card">
                       <div class="dashboard-health-value">{{ dashboard.playlists.pending_tracks }}</div>
                       <div class="dashboard-health-label">歌单待处理</div>
                     </div>
@@ -6177,6 +6352,105 @@ onUnmounted(() => {
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="systemTasksDialog" max-width="1120">
+      <v-card :title="systemTasksDialogTitle">
+        <v-card-text>
+          <div class="toolbar-row mb-4">
+            <v-btn
+              prepend-icon="mdi-refresh"
+              variant="tonal"
+              :loading="systemTasksLoading"
+              @click="loadSystemTasks"
+            >
+              刷新
+            </v-btn>
+            <v-btn
+              prepend-icon="mdi-stop-circle-outline"
+              color="warning"
+              variant="tonal"
+              :disabled="!selectedSystemTaskIds.length || systemTasksInterrupting"
+              :loading="systemTasksInterrupting"
+              @click="interruptSelectedSystemTasks"
+            >
+              中断选中
+            </v-btn>
+          </div>
+          <v-progress-linear v-if="systemTasksLoading" indeterminate class="mb-4" />
+          <v-table class="fixed-table">
+            <thead>
+              <tr>
+                <th class="select-cell">
+                  <v-checkbox
+                    v-model="allSystemTasksSelected"
+                    :disabled="!interruptibleSystemTaskIds.length"
+                    :indeterminate="someSystemTasksSelected"
+                    density="compact"
+                    hide-details
+                  />
+                </th>
+                <th>ID</th>
+                <th>类型</th>
+                <th>状态</th>
+                <th>尝试</th>
+                <th>可执行时间</th>
+                <th>创建时间</th>
+                <th>错误</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="!systemTasks.length">
+                <td colspan="9" class="empty-cell">暂无队列任务</td>
+              </tr>
+              <tr v-for="task in systemTasks" :key="task.id">
+                <td class="select-cell">
+                  <v-checkbox
+                    v-if="canInterruptSystemTask(task)"
+                    v-model="selectedSystemTaskIds"
+                    :value="task.id"
+                    density="compact"
+                    hide-details
+                  />
+                </td>
+                <td>{{ task.id }}</td>
+                <td>{{ systemTaskTypeText(task.task_type) }}</td>
+                <td>
+                  <v-chip
+                    :color="systemTaskStatusColor(task.status)"
+                    size="small"
+                    variant="tonal"
+                  >
+                    {{ systemTaskStatusText(task.status) }}
+                  </v-chip>
+                </td>
+                <td>{{ task.attempts }} / {{ task.max_attempts }}</td>
+                <td>{{ formatOptionalTime(task.available_at) }}</td>
+                <td>{{ formatOptionalTime(task.created_at) }}</td>
+                <td class="truncate-cell" :title="task.error_message || '-'">
+                  {{ task.error_message || '-' }}
+                </td>
+                <td class="table-actions">
+                  <v-btn
+                    icon="mdi-stop-circle-outline"
+                    color="warning"
+                    variant="text"
+                    size="small"
+                    title="中断任务"
+                    :disabled="!canInterruptSystemTask(task) || systemTasksInterrupting"
+                    @click="interruptSystemTask(task)"
+                  />
+                </td>
+              </tr>
+            </tbody>
+          </v-table>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="systemTasksDialog = false">关闭</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="downloadItemsDialog" max-width="1120">
       <v-card :title="`下载明细${selectedDownloadTask?.name ? ` - ${selectedDownloadTask.name}` : ''}`">
         <v-card-text>
@@ -6814,10 +7088,25 @@ onUnmounted(() => {
   padding: 0 16px 12px;
 }
 
-.dashboard-health-grid > div {
+.dashboard-health-card {
   background: rgba(var(--v-theme-on-surface), 0.04);
   border-radius: 8px;
+  border: 0;
+  color: inherit;
+  font: inherit;
   padding: 14px;
+  text-align: left;
+}
+
+button.dashboard-health-card {
+  cursor: pointer;
+}
+
+button.dashboard-health-card:focus-visible,
+button.dashboard-health-card:hover {
+  background: rgba(var(--v-theme-primary), 0.08);
+  outline: 2px solid rgba(var(--v-theme-primary), 0.28);
+  outline-offset: 2px;
 }
 
 .dashboard-health-value {

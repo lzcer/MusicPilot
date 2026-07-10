@@ -171,6 +171,9 @@ from musicpilot.infra.api.schemas import (
     SiteResponse,
     SubscriptionCreateRequest,
     SubscriptionResponse,
+    SystemTaskInterruptRequest,
+    SystemTaskInterruptResponse,
+    SystemTaskResponse,
     SystemSettingsRequest,
     SystemSettingsResponse,
     TestResponse,
@@ -192,6 +195,7 @@ from musicpilot.infra.db.models import (
     NotifierChannel,
     Playlist,
     PlaylistTrack,
+    SystemTask,
     TorrentRecord,
     TorrentRecordItem,
 )
@@ -1033,6 +1037,51 @@ def create_app() -> FastAPI:
     async def dashboard() -> DashboardResponse:
         summary = await state.repository.dashboard_summary()
         return _dashboard_response(summary)
+
+    @app.get("/api/system-tasks", response_model=list[SystemTaskResponse])
+    async def system_tasks(
+        status: str = Query(default="WAIT", pattern="^(WAIT|RUNNING|FAILED)$"),
+        limit: int = Query(default=200, ge=1, le=500),
+    ) -> list[SystemTaskResponse]:
+        tasks = await state.repository.list_system_tasks(status=status, limit=limit)
+        return [_system_task_response(item) for item in tasks]
+
+    @app.post("/api/system-tasks/interrupt", response_model=SystemTaskInterruptResponse)
+    async def interrupt_system_tasks(
+        payload: SystemTaskInterruptRequest,
+    ) -> SystemTaskInterruptResponse:
+        ids = sorted(set(payload.ids))
+        existing = await state.repository.list_system_tasks_by_ids(ids)
+        existing_by_id = {int(task.id): task for task in existing}
+        waiting_ids = [
+            task_id
+            for task_id in ids
+            if existing_by_id.get(task_id) is not None
+            and existing_by_id[task_id].status == "WAIT"
+        ]
+        interrupted = await state.repository.interrupt_waiting_system_tasks(
+            waiting_ids,
+            error_message="Task interrupted by user.",
+        )
+        for task in interrupted:
+            await _sync_interrupted_system_task(state, task)
+        if interrupted:
+            await state.task_manager.wake()
+            state.add_log(
+                "task",
+                f"System task interrupted: ids={','.join(str(task.id) for task in interrupted)}",
+                "WARNING",
+            )
+        interrupted_ids = [int(task.id) for task in interrupted]
+        return SystemTaskInterruptResponse(
+            interrupted_ids=interrupted_ids,
+            skipped_ids=[
+                task_id
+                for task_id in ids
+                if task_id in existing_by_id and task_id not in interrupted_ids
+            ],
+            not_found_ids=[task_id for task_id in ids if task_id not in existing_by_id],
+        )
 
     @app.post("/api/auth/login", response_model=LoginResponse)
     async def login(payload: LoginRequest, response: Response) -> LoginResponse:
@@ -3900,6 +3949,56 @@ async def _bind_playlist_track_to_task(
     )
 
 
+async def _sync_interrupted_system_task(state: AppState, task: SystemTask) -> None:
+    payload = task.payload or {}
+    reason = "任务已中断。"
+    if task.task_type == "PLAYLIST_TRACK_DOWNLOAD":
+        playlist_id = _optional_int(payload.get("playlist_id"))
+        track_id = _optional_int(payload.get("track_id"))
+        if track_id is None:
+            return
+        track = await state.repository.get_playlist_track(track_id)
+        if track is None:
+            return
+        await state.repository.update_playlist_track(
+            track.id,
+            download_status="interrupted",
+            last_checked_at=datetime.now(UTC),
+            last_error=reason,
+        )
+        await _update_playlist_download_completion(state, playlist_id or track.playlist_id)
+        return
+    if task.task_type in {"DOWNLOAD_ITEM_SCRAPE", "FILE_ORGANIZE"}:
+        item_id = _optional_int(payload.get("item_id"))
+        task_id = _optional_int(payload.get("torrent_record_id"))
+        if item_id is not None:
+            await state.repository.update_download_task_item(
+                item_id,
+                status="interrupted",
+                last_error=reason,
+            )
+        if task_id is not None:
+            record = await state.repository.update_download_task(
+                task_id,
+                status="interrupted",
+                last_error=reason,
+            )
+            if record is not None:
+                await _sync_playlist_tracks_for_download_task(state, record)
+        return
+    if task.task_type == "DOWNLOAD_REFRESH_LIBRARY":
+        task_id = _optional_int(payload.get("torrent_record_id"))
+        if task_id is None:
+            return
+        record = await state.repository.update_download_task(
+            task_id,
+            status="interrupted",
+            last_error=reason,
+        )
+        if record is not None:
+            await _sync_playlist_tracks_for_download_task(state, record)
+
+
 def _playlist_download_status_for_task(task: TorrentRecord) -> str:
     if task.status in {
         "submitted",
@@ -3910,6 +4009,7 @@ def _playlist_download_status_for_task(task: TorrentRecord) -> str:
         "source_directory_not_found",
         "failed",
         "deleted",
+        "interrupted",
     }:
         return task.status
     return "submitted" if task.status == "queued" else task.status
@@ -3925,7 +4025,7 @@ async def _sync_playlist_tracks_for_download_task(
     status = _playlist_download_status_for_task(task)
     last_error = (
         task.last_error
-        if status in {"failed", "deleted", "source_directory_not_found"}
+        if status in {"failed", "deleted", "interrupted", "source_directory_not_found"}
         else None
     )
     for track in tracks:
@@ -5360,6 +5460,26 @@ def _dashboard_response(summary: dict[str, Any]) -> DashboardResponse:
             ],
         ),
         tasks=DashboardTaskSummaryResponse(**tasks),
+    )
+
+
+def _system_task_response(item: SystemTask) -> SystemTaskResponse:
+    return SystemTaskResponse(
+        id=item.id,
+        task_type=item.task_type,
+        status=item.status,
+        chain_id=item.chain_id,
+        parent_task_id=item.parent_task_id,
+        priority=item.priority,
+        payload=item.payload or {},
+        error_message=item.error_message,
+        attempts=item.attempts,
+        max_attempts=item.max_attempts,
+        available_at=item.available_at,
+        started_at=item.started_at,
+        finished_at=item.finished_at,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
     )
 
 

@@ -214,6 +214,34 @@ class DashboardResponse(BaseModel):
     tasks: DashboardTaskSummaryResponse
 
 
+class SystemTaskResponse(BaseModel):
+    id: int
+    task_type: str
+    status: str
+    chain_id: str
+    parent_task_id: int | None = None
+    priority: int
+    payload: dict[str, object] = Field(default_factory=dict)
+    error_message: str | None = None
+    attempts: int
+    max_attempts: int
+    available_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class SystemTaskInterruptRequest(BaseModel):
+    ids: list[int] = Field(min_length=1)
+
+
+class SystemTaskInterruptResponse(BaseModel):
+    interrupted_ids: list[int] = Field(default_factory=list)
+    skipped_ids: list[int] = Field(default_factory=list)
+    not_found_ids: list[int] = Field(default_factory=list)
+
+
 class FileEntryResponse(BaseModel):
     name: str
     path: str
