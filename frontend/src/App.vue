@@ -1,5 +1,7 @@
 ﻿<script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import ScrollableTable from './components/ScrollableTable.vue'
+import TruncatedTableCell from './components/TruncatedTableCell.vue'
 
 type ParserField = {
   selector: string
@@ -3793,7 +3795,9 @@ function systemTaskElapsedText(task: SystemTask) {
   if (!task.started_at) return '-'
   const startedAt = Date.parse(task.started_at)
   if (Number.isNaN(startedAt)) return '-'
-  const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+  const finishedAt = task.finished_at ? Date.parse(task.finished_at) : Date.now()
+  const endedAt = Number.isNaN(finishedAt) ? Date.now() : finishedAt
+  const seconds = Math.max(0, Math.floor((endedAt - startedAt) / 1000))
   const hours = Math.floor(seconds / 3600)
   const minutes = Math.floor((seconds % 3600) / 60)
   const remainingSeconds = seconds % 60
@@ -6119,7 +6123,7 @@ onUnmounted(() => {
             </v-btn>
           </div>
           <v-progress-linear v-if="playlistTrackLoading" indeterminate color="primary" />
-          <v-table class="playlist-track-table fixed-table">
+          <ScrollableTable class="playlist-track-table fixed-table" :min-width="1180">
             <thead>
               <tr>
                 <th class="track-position-col">#</th>
@@ -6138,10 +6142,10 @@ onUnmounted(() => {
               </tr>
               <tr v-for="track in playlistTracks" :key="track.id">
                 <td>{{ track.position }}</td>
-                <td class="truncate-cell" :title="track.title">{{ track.title }}</td>
-                <td class="truncate-cell" :title="track.artist || '-'">{{ track.artist || '-' }}</td>
-                <td class="truncate-cell" :title="track.album || '-'">{{ track.album || '-' }}</td>
-                <td class="truncate-cell" :title="track.last_error || '-'">{{ track.last_error || '-' }}</td>
+                <td><TruncatedTableCell :value="track.title" /></td>
+                <td><TruncatedTableCell :value="track.artist || '-'" /></td>
+                <td><TruncatedTableCell :value="track.album || '-'" /></td>
+                <td><TruncatedTableCell :value="track.last_error || '-'" /></td>
                 <td class="sticky-track-col sticky-track-library-col">
                   <v-icon
                     v-if="track.exists_in_library"
@@ -6183,7 +6187,7 @@ onUnmounted(() => {
                 </td>
               </tr>
             </tbody>
-          </v-table>
+          </ScrollableTable>
           <div class="pagination-row">
             <v-select
               v-model="playlistTrackPageSize"
@@ -6509,7 +6513,7 @@ onUnmounted(() => {
             </v-btn>
           </div>
           <v-progress-linear v-if="systemTasksLoading" indeterminate class="mb-4" />
-          <v-table class="fixed-table">
+          <ScrollableTable class="fixed-table system-task-table" :min-width="1240">
             <thead>
               <tr>
                 <th class="select-cell">
@@ -6521,15 +6525,15 @@ onUnmounted(() => {
                     hide-details
                   />
                 </th>
-                <th>ID</th>
-                <th>类型</th>
-                <th>状态</th>
-                <th>尝试</th>
-                <th>耗时</th>
-                <th>可执行时间</th>
-                <th>创建时间</th>
-                <th>错误</th>
-                <th>操作</th>
+                <th class="system-task-id-col">ID</th>
+                <th class="system-task-type-col">类型</th>
+                <th class="system-task-status-col">状态</th>
+                <th class="system-task-attempts-col">尝试</th>
+                <th class="system-task-elapsed-col">耗时</th>
+                <th class="system-task-time-col">可执行时间</th>
+                <th class="system-task-time-col">创建时间</th>
+                <th class="system-task-error-col">错误</th>
+                <th class="system-task-action-col">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -6547,7 +6551,9 @@ onUnmounted(() => {
                   />
                 </td>
                 <td>{{ task.id }}</td>
-                <td>{{ systemTaskTypeText(task.task_type) }}</td>
+                <td>
+                  <TruncatedTableCell :value="systemTaskTypeText(task.task_type)" />
+                </td>
                 <td>
                   <v-chip
                     :color="systemTaskStatusColor(task.status)"
@@ -6559,10 +6565,14 @@ onUnmounted(() => {
                 </td>
                 <td>{{ task.attempts }} / {{ task.max_attempts }}</td>
                 <td>{{ systemTaskElapsedText(task) }}</td>
-                <td>{{ formatOptionalTime(task.available_at) }}</td>
-                <td>{{ formatOptionalTime(task.created_at) }}</td>
-                <td class="truncate-cell" :title="task.error_message || '-'">
-                  {{ task.error_message || '-' }}
+                <td>
+                  <TruncatedTableCell :value="formatOptionalTime(task.available_at)" />
+                </td>
+                <td>
+                  <TruncatedTableCell :value="formatOptionalTime(task.created_at)" />
+                </td>
+                <td>
+                  <TruncatedTableCell :value="task.error_message || '-'" />
                 </td>
                 <td class="table-actions">
                   <v-btn
@@ -6577,7 +6587,7 @@ onUnmounted(() => {
                 </td>
               </tr>
             </tbody>
-          </v-table>
+          </ScrollableTable>
         </v-card-text>
         <v-card-actions>
           <v-spacer />
@@ -6590,7 +6600,7 @@ onUnmounted(() => {
       <v-card :title="`下载明细${selectedDownloadTask?.name ? ` - ${selectedDownloadTask.name}` : ''}`">
         <v-card-text>
           <v-progress-linear v-if="downloadItemsLoading" indeterminate class="mb-4" />
-          <v-table class="fixed-table">
+          <ScrollableTable class="fixed-table download-items-table" :min-width="1360">
             <thead>
               <tr>
                 <th class="download-item-file-col">文件名</th>
@@ -6609,13 +6619,13 @@ onUnmounted(() => {
                 <td colspan="9" class="empty-cell">暂无明细</td>
               </tr>
               <tr v-for="item in downloadTaskItems" :key="item.id">
-                <td class="truncate-cell" :title="item.file_path">{{ item.file_name }}</td>
+                <td><TruncatedTableCell :value="item.file_name" :tooltip="item.file_path" /></td>
                 <td>{{ formatSize(item.size_bytes) }}</td>
-                <td class="truncate-cell" :title="item.parsed_title || '-'">{{ item.parsed_title || '-' }}</td>
-                <td class="truncate-cell" :title="item.artist || '-'">{{ item.artist || '-' }}</td>
-                <td class="truncate-cell" :title="item.metadata_title || '-'">{{ item.metadata_title || '-' }}</td>
-                <td class="truncate-cell" :title="item.metadata_artist || '-'">{{ item.metadata_artist || '-' }}</td>
-                <td class="truncate-cell" :title="item.metadata_album || '-'">{{ item.metadata_album || '-' }}</td>
+                <td><TruncatedTableCell :value="item.parsed_title || '-'" /></td>
+                <td><TruncatedTableCell :value="item.artist || '-'" /></td>
+                <td><TruncatedTableCell :value="item.metadata_title || '-'" /></td>
+                <td><TruncatedTableCell :value="item.metadata_artist || '-'" /></td>
+                <td><TruncatedTableCell :value="item.metadata_album || '-'" /></td>
                 <td>
                   <v-chip
                     :color="downloadTaskItemStatusColor(item.status)"
@@ -6625,10 +6635,10 @@ onUnmounted(() => {
                     {{ downloadTaskItemStatusText(item.status) }}
                   </v-chip>
                 </td>
-                <td class="truncate-cell" :title="item.last_error || '-'">{{ item.last_error || '-' }}</td>
+                <td><TruncatedTableCell :value="item.last_error || '-'" /></td>
               </tr>
             </tbody>
-          </v-table>
+          </ScrollableTable>
         </v-card-text>
         <v-card-actions>
           <v-spacer />
@@ -7512,6 +7522,38 @@ button.dashboard-health-card:hover {
 .table-actions {
   min-width: 96px;
   white-space: nowrap;
+}
+
+.system-task-id-col {
+  width: 88px;
+}
+
+.system-task-type-col {
+  width: 190px;
+}
+
+.system-task-status-col {
+  width: 100px;
+}
+
+.system-task-attempts-col {
+  width: 84px;
+}
+
+.system-task-elapsed-col {
+  width: 124px;
+}
+
+.system-task-time-col {
+  width: 190px;
+}
+
+.system-task-error-col {
+  width: 250px;
+}
+
+.system-task-action-col {
+  width: 96px;
 }
 
 .download-item-file-col {
