@@ -4041,6 +4041,7 @@ async def _sync_playlist_tracks_for_download_task(
         await state.repository.update_playlist_track(
             track.id,
             download_status=status,
+            torrent_record_id=None if status == "deleted" else track.torrent_record_id,
             last_checked_at=datetime.now(UTC),
             last_error=last_error,
         )
@@ -4059,6 +4060,7 @@ async def _mark_playlist_tracks_for_deleted_download_task(
         await state.repository.update_playlist_track(
             track.id,
             download_status="deleted",
+            torrent_record_id=None,
             last_checked_at=datetime.now(UTC),
             last_error="下载任务已删除。",
         )
@@ -6397,7 +6399,7 @@ async def _poll_download_tasks_once(state: AppState) -> None:
         return
 
     default = await state.repository.default_downloader()
-    if default is None or default.listen_mode != "polling" or not default.enabled:
+    if default is None or not default.enabled:
         return
     if state.downloader is None:
         await state.reload_downloader()
