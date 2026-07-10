@@ -51,6 +51,7 @@ from musicpilot.adapters.metadata import (
     MutagenTagWriter,
     NetEaseMusicProvider,
 )
+from musicpilot.adapters.metadata.spotify import spotify_metadata_config_from_mapping
 from musicpilot.adapters.music_platforms.public_playlist import (
     PublicPlaylist,
     PublicPlaylistImporter,
@@ -676,9 +677,10 @@ class AppState:
             enabled=settings.subscriptions_enabled,
         )
         self.downloader: QBittorrentClient | None = None
+        self.metadata_source = MultiSourceMusicProvider(source_gate=self.run_metadata_source)
         self.metadata = MetadataCascade(
             [
-                MultiSourceMusicProvider(source_gate=self.run_metadata_source),
+                self.metadata_source,
                 NetEaseMusicProvider(),
                 MusicBrainzProvider(user_agent=settings.musicbrainz_user_agent),
             ]
@@ -694,9 +696,10 @@ class AppState:
         self.artist_build_finished_at: datetime | None = None
         self.artist_build_last_error: str | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
-        self.scraping_metadata = MetadataCascade(
-            [MultiSourceMusicProvider(source_gate=self.run_metadata_source)]
+        self.scraping_metadata_source = MultiSourceMusicProvider(
+            source_gate=self.run_metadata_source
         )
+        self.scraping_metadata = MetadataCascade([self.scraping_metadata_source])
         self.scraper = LocalMusicScraper(
             metadata=self.scraping_metadata,
             tag_writer=MutagenTagWriter(),
@@ -737,6 +740,17 @@ class AppState:
             proxy_url=proxy_url,
         )
         self.pipeline.indexers = self.indexers
+
+    async def reload_metadata_sources(
+        self,
+        system_settings: dict[str, Any] | None = None,
+    ) -> None:
+        settings = system_settings or await self.repository.get_system_settings()
+        scraping = settings.get("scraping")
+        spotify = scraping.get("spotify") if isinstance(scraping, dict) else None
+        config = spotify_metadata_config_from_mapping(spotify)
+        self.metadata_source.update_spotify_config(config)
+        self.scraping_metadata_source.update_spotify_config(config)
 
     async def migrate_legacy_runtime_config(self) -> None:
         path = self.settings.runtime_config
@@ -1093,6 +1107,7 @@ def create_app() -> FastAPI:
         await state.database.create_all()
         await state.database.migrate_phase_one_schema()
         await state.migrate_legacy_runtime_config()
+        await state.reload_metadata_sources()
         migrated_playlist_track_keys = await state.repository.migrate_playlist_track_source_keys()
         if migrated_playlist_track_keys:
             state.add_log(
@@ -1623,7 +1638,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/settings/system", response_model=SystemSettingsResponse)
     async def system_settings() -> SystemSettingsResponse:
-        return SystemSettingsResponse(**await state.repository.get_system_settings())
+        return _system_settings_response(await state.repository.get_system_settings())
 
     @app.put("/api/settings/system", response_model=SystemSettingsResponse)
     async def update_system_settings(
@@ -1641,10 +1656,11 @@ def create_app() -> FastAPI:
         payload: SystemSettingsRequest,
     ) -> SystemSettingsResponse:
         settings_payload = await state.repository.update_system_settings(payload.model_dump())
+        await state.reload_metadata_sources(settings_payload)
         await state.reload_bots()
         await state.reload_notifiers()
         state.add_log("settings", "System settings saved")
-        return SystemSettingsResponse(**settings_payload)
+        return _system_settings_response(settings_payload)
 
     @app.get("/api/settings/database/export")
     async def export_database() -> StreamingResponse:
@@ -7645,6 +7661,21 @@ async def _stream_temporary_file(path: Path) -> AsyncIterator[bytes]:
     finally:
         with contextlib.suppress(FileNotFoundError):
             await asyncio.to_thread(path.unlink)
+
+
+def _system_settings_response(settings_payload: dict[str, Any]) -> SystemSettingsResponse:
+    payload = dict(settings_payload)
+    scraping = payload.get("scraping")
+    scraping_payload = dict(scraping) if isinstance(scraping, dict) else {}
+    spotify = scraping_payload.get("spotify")
+    spotify_payload = dict(spotify) if isinstance(spotify, dict) else {}
+    scraping_payload["spotify"] = {
+        "client_id": str(spotify_payload.get("client_id") or ""),
+        "client_secret_configured": bool(str(spotify_payload.get("client_secret") or "").strip()),
+        "markets": str(spotify_payload.get("markets") or "JP,KR"),
+    }
+    payload["scraping"] = scraping_payload
+    return SystemSettingsResponse(**payload)
 
 
 def _proxy_url(settings_payload: dict[str, object]) -> str | None:

@@ -638,7 +638,19 @@ class ProxySettings(BaseModel):
     password: str = ""
 
 
-class ScrapingSettings(BaseModel):
+class SpotifyMetadataSettingsRequest(BaseModel):
+    client_id: str = ""
+    client_secret: str = ""
+    markets: str = "JP,KR"
+
+
+class SpotifyMetadataSettingsResponse(BaseModel):
+    client_id: str = ""
+    client_secret_configured: bool = False
+    markets: str = "JP,KR"
+
+
+class ScrapingSettingsRequest(BaseModel):
     enabled: bool = False
     mode: Literal["source", "mapped", "copy"] = "mapped"
     source_directory: str = ""
@@ -649,6 +661,23 @@ class ScrapingSettings(BaseModel):
     auto_classify: bool = False
     classify_by: Literal["artist", "album"] = "artist"
     duplicate_handling: Literal["ignore", "overwrite", "keep_largest"] = "ignore"
+    spotify: SpotifyMetadataSettingsRequest = Field(default_factory=SpotifyMetadataSettingsRequest)
+
+
+class ScrapingSettingsResponse(BaseModel):
+    enabled: bool = False
+    mode: Literal["source", "mapped", "copy"] = "mapped"
+    source_directory: str = ""
+    mapped_directory: str = ""
+    scrape_when_missing: list[Literal["album", "artist", "lyrics"]] = Field(default_factory=list)
+    required_metadata: list[Literal["album", "artist", "lyrics"]] = Field(default_factory=list)
+    auto_rename: bool = False
+    auto_classify: bool = False
+    classify_by: Literal["artist", "album"] = "artist"
+    duplicate_handling: Literal["ignore", "overwrite", "keep_largest"] = "ignore"
+    spotify: SpotifyMetadataSettingsResponse = Field(
+        default_factory=SpotifyMetadataSettingsResponse
+    )
 
 
 class SearchSettings(BaseModel):
@@ -658,13 +687,13 @@ class SearchSettings(BaseModel):
 
 class SystemSettingsRequest(BaseModel):
     proxy: ProxySettings = Field(default_factory=ProxySettings)
-    scraping: ScrapingSettings = Field(default_factory=ScrapingSettings)
+    scraping: ScrapingSettingsRequest = Field(default_factory=ScrapingSettingsRequest)
     search: SearchSettings = Field(default_factory=SearchSettings)
 
 
 class SystemSettingsResponse(BaseModel):
     proxy: ProxySettings = Field(default_factory=ProxySettings)
-    scraping: ScrapingSettings = Field(default_factory=ScrapingSettings)
+    scraping: ScrapingSettingsResponse = Field(default_factory=ScrapingSettingsResponse)
     search: SearchSettings = Field(default_factory=SearchSettings)
 
 

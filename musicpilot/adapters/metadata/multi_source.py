@@ -12,10 +12,14 @@ from uuid import uuid1
 import httpx
 from opencc import OpenCC
 
+from musicpilot.adapters.metadata.spotify import (
+    SpotifyMetadataClient,
+    SpotifyMetadataConfig,
+)
 from musicpilot.ports.metadata import TrackMetadata
 
 _OPENCC_T2S = OpenCC("t2s")
-_RESOURCE_ORDER = ("qmusic", "netease", "migu", "kuwo")
+_RESOURCE_ORDER = ("qmusic", "netease", "migu", "kuwo", "spotify")
 T = TypeVar("T")
 
 
@@ -35,6 +39,7 @@ class MultiSourceMusicProvider:
         self,
         client: httpx.AsyncClient | None = None,
         source_gate: Callable[[str, Callable[[], Awaitable[T]]], Awaitable[T]] | None = None,
+        spotify_config: SpotifyMetadataConfig | None = None,
     ) -> None:
         self._client = client or httpx.AsyncClient(timeout=20, follow_redirects=True)
         self._owns_client = client is None
@@ -42,14 +47,22 @@ class MultiSourceMusicProvider:
         self._kuwo_cross = _sha1_and_md5(self._kuwo_token)
         self._source_gate = source_gate
         self._source_rotation = random.randrange(len(_RESOURCE_ORDER))
+        self._spotify = SpotifyMetadataClient(
+            config=spotify_config,
+            client=self._client,
+        )
 
     @property
     def name(self) -> str:
         return "multi-source"
 
     async def close(self) -> None:
+        await self._spotify.close()
         if self._owns_client:
             await self._client.aclose()
+
+    def update_spotify_config(self, config: SpotifyMetadataConfig) -> None:
+        self._spotify.update_config(config)
 
     async def lookup(self, *, title: str, artist: str | None = None) -> TrackMetadata | None:
         candidates = await self.search_metadata(title=title, artist=artist, limit=1)
@@ -158,9 +171,30 @@ class MultiSourceMusicProvider:
                 return await self._fetch_migu_id3_by_title(title, artist=artist)
             if resource == "kuwo":
                 return await self._fetch_kuwo_id3_by_title(title, artist=artist)
+            if resource == "spotify":
+                return await self._fetch_spotify_id3_by_title(title, artist=artist)
         except Exception:
             return ()
         return ()
+
+    async def _fetch_spotify_id3_by_title(
+        self,
+        title: str,
+        artist: str | None = None,
+    ) -> tuple[_SourceSong, ...]:
+        tracks = await self._spotify.search_tracks(title=title, artist=artist, limit=10)
+        return tuple(
+            _SourceSong(
+                source="spotify",
+                song_id=track.track_id,
+                name=track.title,
+                artist=track.artist,
+                album=track.album,
+                album_img=track.cover_url,
+                year=track.year,
+            )
+            for track in tracks
+        )
 
     async def _fetch_lyric(self, song: _SourceSong) -> str | None:
         try:

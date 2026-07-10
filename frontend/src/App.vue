@@ -480,6 +480,12 @@ type SystemSettings = {
     auto_classify: boolean
     classify_by: 'artist' | 'album'
     duplicate_handling: 'ignore' | 'overwrite' | 'keep_largest'
+    spotify: {
+      client_id: string
+      client_secret: string
+      client_secret_configured: boolean
+      markets: string
+    }
   }
   search: {
     exclude_keywords: string
@@ -841,7 +847,13 @@ const systemForm = ref<SystemSettings>({
     auto_rename: false,
     auto_classify: false,
     classify_by: 'artist',
-    duplicate_handling: 'ignore'
+    duplicate_handling: 'ignore',
+    spotify: {
+      client_id: '',
+      client_secret: '',
+      client_secret_configured: false,
+      markets: 'JP,KR'
+    }
   },
   search: {
     exclude_keywords: '整轨|整軌|WAV|wav',
@@ -3595,7 +3607,12 @@ async function loadSystemSettings() {
     },
     scraping: {
       ...systemForm.value.scraping,
-      ...(settings.scraping ?? {})
+      ...(settings.scraping ?? {}),
+      spotify: {
+        ...systemForm.value.scraping.spotify,
+        ...(settings.scraping?.spotify ?? {}),
+        client_secret: ''
+      }
     },
     search: {
       ...systemForm.value.search,
@@ -5675,6 +5692,30 @@ onUnmounted(() => {
                         v-model="systemForm.scraping.duplicate_handling"
                         :items="duplicateHandlingOptions"
                         label="重复文件处理"
+                      />
+                    </div>
+
+                    <v-divider class="my-4" />
+                    <div class="settings-checks-label">Spotify 元数据源</div>
+                    <div class="settings-grid">
+                      <v-text-field
+                        v-model="systemForm.scraping.spotify.client_id"
+                        label="Client ID"
+                        autocomplete="off"
+                      />
+                      <v-text-field
+                        v-model="systemForm.scraping.spotify.client_secret"
+                        label="Client Secret"
+                        type="password"
+                        autocomplete="new-password"
+                        :hint="systemForm.scraping.spotify.client_secret_configured ? '已配置；留空则保留现有密钥。' : '留空时将跳过 Spotify 元数据源。'"
+                        persistent-hint
+                      />
+                      <v-text-field
+                        v-model="systemForm.scraping.spotify.markets"
+                        label="市场"
+                        hint="用英文逗号分隔，例如 JP,KR。"
+                        persistent-hint
                       />
                     </div>
                   </v-card-text>

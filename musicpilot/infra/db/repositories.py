@@ -370,6 +370,7 @@ class SqlAlchemyMediaRepository:
                 row = SystemSetting(key="runtime", value={})
                 session.add(row)
             current = dict(row.value or {})
+            payload = _preserve_spotify_client_secret(current, payload)
             current.update(payload)
             row.value = current
             await session.commit()
@@ -2302,6 +2303,36 @@ def _assign_config_fields(row: object, payload: dict[str, Any], fields: tuple[st
 def _merge_system_settings_defaults(value: object) -> dict[str, Any]:
     settings = dict(value) if isinstance(value, dict) else {}
     return _merge_dict_defaults(settings, DEFAULT_SYSTEM_SETTINGS)
+
+
+def _preserve_spotify_client_secret(
+    current: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    scraping = payload.get("scraping")
+    if not isinstance(scraping, dict):
+        return payload
+    spotify = scraping.get("spotify")
+    if not isinstance(spotify, dict) or str(spotify.get("client_secret") or "").strip():
+        return payload
+    current_scraping = current.get("scraping")
+    current_spotify = (
+        current_scraping.get("spotify") if isinstance(current_scraping, dict) else {}
+    )
+    client_secret = (
+        str(current_spotify.get("client_secret") or "")
+        if isinstance(current_spotify, dict)
+        else ""
+    )
+    if not client_secret:
+        return payload
+    updated = dict(payload)
+    updated_scraping = dict(scraping)
+    updated_spotify = dict(spotify)
+    updated_spotify["client_secret"] = client_secret
+    updated_scraping["spotify"] = updated_spotify
+    updated["scraping"] = updated_scraping
+    return updated
 
 
 def _merge_dict_defaults(value: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
