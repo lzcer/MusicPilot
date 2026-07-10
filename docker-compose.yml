@@ -1,4 +1,19 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${MP_POSTGRES_DB:-musicpilot}
+      POSTGRES_USER: ${MP_POSTGRES_USER:-musicpilot}
+      POSTGRES_PASSWORD: ${MP_POSTGRES_PASSWORD:-musicpilot-change-me}
+    volumes:
+      - ${MP_HOST_POSTGRES_PATH:-./postgres}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   musicpilot:
     build:
       context: .
@@ -13,7 +28,7 @@ services:
       MP_ADMIN_USERNAME: ${MP_ADMIN_USERNAME:-admin}
       MP_ADMIN_PASSWORD: ${MP_ADMIN_PASSWORD:-musicpilot}
       MP_SESSION_SECRET: ${MP_SESSION_SECRET:-musicpilot-change-me}
-      MP_DATABASE_URL: ${MP_DATABASE_URL:-sqlite+aiosqlite:////data/musicpilot.db}
+      MP_DATABASE_URL: ${MP_DATABASE_URL:-postgresql+asyncpg://musicpilot:${MP_POSTGRES_PASSWORD:-musicpilot-change-me}@postgres:5432/musicpilot}
       MP_MUSIC_LIBRARY_PATH: ${MP_MUSIC_LIBRARY_PATH:-/music}
       MP_DOWNLOAD_STAGING_PATH: ${MP_DOWNLOAD_STAGING_PATH:-/downloads}
       MP_STATIC_DIR: /app/frontend/dist
@@ -24,6 +39,9 @@ services:
       MP_SUBSCRIPTIONS_ENABLED: ${MP_SUBSCRIPTIONS_ENABLED:-true}
       MP_SUBSCRIPTION_CHECK_INTERVAL_MINUTES: ${MP_SUBSCRIPTION_CHECK_INTERVAL_MINUTES:-1440}
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     mem_limit: 512m
     mem_reservation: 256m
     ports:

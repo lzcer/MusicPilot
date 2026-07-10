@@ -16,7 +16,7 @@ MusicPilot 是一个面向自托管用户的音乐库自动化工具，用来把
 
 1. 用一个 Web 界面管理音乐搜索、下载、整理、歌单和音乐库状态。
 2. 通过任务队列处理耗时操作，尽量让下载、刮削、整理和同步可以自动推进。
-3. 保持部署简单，SQLite 可用于快速起步；长期运行和正式部署推荐使用 PostgreSQL，并提供 Docker Compose 方式在 NAS 或服务器上运行。
+3. 保持部署简单，默认使用 PostgreSQL，并提供 Docker Compose 方式在 NAS 或服务器上运行；SQLite 作为备用数据库用于测试和快速试用。
 4. 保留清晰的适配层，方便后续接入更多站点、下载器、音乐平台、元数据源和媒体服务器。
 
 ## 2. 支持范围
@@ -114,7 +114,13 @@ MusicPilot 当前提供以下能力：
 
 推荐在 NAS 或服务器上直接使用已发布的 Docker 镜像部署 MusicPilot。需要本地修改源码或调试构建时，再使用源码构建方式。
 
-### 6.1. 使用 Docker 镜像部署
+### 6.1. 配置教程
+
+开始部署前，建议先阅读[详细配置教程](docs/configuration.md)，了解数据库、目录映射、环境变量以及 Web UI 配置顺序。
+
+默认部署使用 Compose 中的 PostgreSQL 容器。SQLite 仅作为备用方案，适合测试或快速试用；在任务较多、并发较高或长期运行时可能出现性能和锁竞争问题。
+
+### 6.2. 使用 Docker 镜像部署
 
 1. 创建部署目录并进入目录：
 
@@ -136,8 +142,7 @@ services:
       MP_ADMIN_USERNAME: admin
       MP_ADMIN_PASSWORD: change-this-password
       MP_SESSION_SECRET: change-this-random-secret
-      # 快速试用可以使用 SQLite；长期运行和正式部署建议改为 PostgreSQL。
-      MP_DATABASE_URL: sqlite+aiosqlite:////data/musicpilot.db
+      MP_DATABASE_URL: postgresql+asyncpg://musicpilot:musicpilot-change-me@postgres:5432/musicpilot
       MP_MUSIC_LIBRARY_PATH: /music
       MP_DOWNLOAD_STAGING_PATH: /downloads
       MP_STATIC_DIR: /app/frontend/dist
@@ -155,6 +160,23 @@ services:
       - ./config:/config
       - /volume1/music:/music
       - /volume1/downloads:/downloads
+    depends_on:
+      postgres:
+        condition: service_healthy
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: musicpilot
+      POSTGRES_USER: musicpilot
+      POSTGRES_PASSWORD: musicpilot-change-me
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 EOF
 ```
 
@@ -223,7 +245,7 @@ docker compose pull
 docker compose up -d
 ```
 
-### 6.2. 从源码构建部署
+### 6.3. 从源码构建部署
 
 以下方式适合在 NAS 或服务器上直接从源码构建并运行 MusicPilot。
 
@@ -290,7 +312,7 @@ git pull
 docker compose up -d --build
 ```
 
-### 6.3. 本地开发启动
+### 6.4. 本地开发启动
 
 以下方式适合在本机修改源码、调试接口和开发前端页面。需要提前安装 Python、`uv`、Node.js 和 npm。
 
@@ -376,47 +398,6 @@ uvicorn musicpilot.infra.api.app:create_app --factory --reload
 ```text
 http://127.0.0.1:8000
 ```
-
-### 6.4. 推荐 PostgreSQL 数据库
-
-MusicPilot 可以使用 SQLite 快速启动，但长期运行和正式部署推荐使用 PostgreSQL。下载轮询、任务队列、歌单同步、媒体库刷新和数据库备份都会持续写入运行数据，PostgreSQL 在并发、恢复和维护上更稳妥。
-
-如果已有 PostgreSQL，可以把 `docker-compose.yml` 中的 `MP_DATABASE_URL` 改为 PostgreSQL 连接串：
-
-```yaml
-MP_DATABASE_URL: postgresql+asyncpg://musicpilot:change-this-password@postgres:5432/musicpilot
-```
-
-PostgreSQL 数据库和用户需要提前创建。MusicPilot 启动时会通过 Alembic 自动初始化或升级表结构。
-
-如果希望把 PostgreSQL 一起放进 Compose，可以增加一个 `postgres` 服务，并让 MusicPilot 依赖它：
-
-```yaml
-services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: musicpilot
-      POSTGRES_USER: musicpilot
-      POSTGRES_PASSWORD: change-this-password
-    volumes:
-      - ./postgres:/var/lib/postgresql/data
-    restart: unless-stopped
-
-  musicpilot:
-    environment:
-      MP_DATABASE_URL: postgresql+asyncpg://musicpilot:change-this-password@postgres:5432/musicpilot
-    depends_on:
-      - postgres
-```
-
-### 6.5. 配置教程
-
-首次启动后，还需要在 Web UI 中配置站点、下载器、音乐库、整理规则和通知渠道。
-
-配置教程入口：[MusicPilot 配置教程](docs/configuration.md)
-
-该文档集中说明启动环境变量、站点解析器、站点账号、下载器、音乐库、刮削、搜索、通知和数据库备份等配置步骤。
 
 ## 7. 免责声明
 
