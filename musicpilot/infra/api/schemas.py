@@ -382,6 +382,7 @@ class NexusPHPParserRequest(BaseModel):
     )
     fields: dict[str, ParserFieldRequest] = Field(default_factory=dict)
     filter: dict[str, object] = Field(default_factory=dict)
+    search_path: str = "torrents.php"
     search_query_param: str = "search"
     search_params: dict[str, str] = Field(default_factory=dict)
 

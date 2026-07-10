@@ -147,6 +147,9 @@ def parser_config_from_mapping(raw: Any) -> NexusPHPParserConfig:
     raw_filter = raw.get("filter", {})
     if not isinstance(raw_filter, dict):
         raise ValueError("Invalid parser.filter config: expected mapping")
+    search_path = str(raw.get("search_path", "torrents.php")).strip()
+    if not search_path:
+        raise ValueError("Invalid parser.search_path config: value is required")
     search_query_param = str(raw.get("search_query_param", "search")).strip()
     if not search_query_param:
         raise ValueError("Invalid parser.search_query_param config: value is required")
@@ -184,6 +187,7 @@ def parser_config_from_mapping(raw: Any) -> NexusPHPParserConfig:
         list_selector=list_selector,
         fields=fields,
         result_filter=result_filter,
+        search_path=search_path,
         search_query_param=search_query_param,
         search_params={
             str(name): str(value)

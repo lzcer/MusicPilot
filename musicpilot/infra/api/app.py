@@ -7619,6 +7619,7 @@ def _parser_response(parser: NexusPHPParserConfig) -> NexusPHPParserRequest:
             }
             for name, rule in parser.result_filter.items()
         },
+        search_path=parser.search_path,
         search_query_param=parser.search_query_param,
         search_params=parser.search_params,
     )

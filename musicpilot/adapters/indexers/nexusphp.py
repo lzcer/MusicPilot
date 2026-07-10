@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from copy import copy
 from dataclasses import dataclass, field
 from urllib.parse import urljoin
 
@@ -35,6 +36,7 @@ class NexusPHPParserConfig:
     )
     fields: dict[str, FieldRule] = field(default_factory=dict)
     result_filter: dict[str, ResultFilterRule] = field(default_factory=dict)
+    search_path: str = "torrents.php"
     search_query_param: str = "search"
     search_params: dict[str, str] = field(default_factory=dict)
 
@@ -140,7 +142,7 @@ class NexusPHPCrawler:
         query: str,
         headers: dict[str, str],
     ) -> str:
-        url = urljoin(self.config.base_url, "torrents.php")
+        url = urljoin(self.config.base_url, self.config.parser.search_path)
         params = dict(self.config.parser.search_params)
         params[self.config.parser.search_query_param] = query
         response = await client.get(url, params=params, headers=headers)
@@ -274,11 +276,12 @@ def _extract_field(row: Tag | BeautifulSoup, rule: FieldRule | None) -> str | No
     for node in candidates:
         if node is None:
             continue
-        value = _read_node_value(node, rule.attribute)
+        field_node = copy(node) if rule.remove else node
+        value = _read_node_value(field_node, rule.attribute)
         for selector in rule.remove:
-            for removable in node.select(selector):
+            for removable in field_node.select(selector):
                 removable.extract()
-            value = _read_node_value(node, rule.attribute)
+            value = _read_node_value(field_node, rule.attribute)
         value = _apply_filters(value, rule.filters)
         if rule.regex:
             match = re.search(rule.regex, value, re.IGNORECASE)

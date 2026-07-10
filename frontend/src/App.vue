@@ -16,6 +16,7 @@ type ParserConfig = {
   list_selector: string
   fields: Record<string, ParserField>
   filter?: Record<string, unknown>
+  search_path?: string
   search_query_param?: string
   search_params?: Record<string, string>
 }

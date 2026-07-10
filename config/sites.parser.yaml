@@ -4,6 +4,8 @@ sites:
         base_url: https://open.cd
       - name: HDFans
         base_url: https://hdfans.org/
+      - name: CarPT
+        base_url: https://carpt.net/
     parser:
       list_selector: "table.torrents tr:has(a[href*='details.php']):has(a[href*='download.php'])"
       fields:
@@ -44,6 +46,57 @@ sites:
         type:
           include:
             - music
+  - targets:
+      - name: JPopSuki
+        base_url: https://jpopsuki.eu/
+    parser:
+      search_path: ajax.php
+      search_query_param: searchstr
+      search_params:
+        section: torrents
+        disablegrouping: "1"
+        action: basic
+        searchtags: ""
+        tags_type: "0"
+        order_by: s3
+        order_way: desc
+        "filter_cat[1]": "1"
+        "filter_cat[2]": "1"
+      list_selector: "table#torrent_table tr[class^='torrent']:has(a[title='Download'])"
+      fields:
+        type:
+          selector: "td:first-child"
+          filters: ["collapse_space"]
+        title:
+          selector: "td:nth-last-child(7)"
+          remove:
+            - span
+            - div.tags
+            - "a[title='View Comments']"
+          filters: ["collapse_space"]
+          regex: '^(.*?)\s*(?:\(\s*\))?$'
+        subtitle:
+          selector: "div.tags"
+          filters: ["collapse_space"]
+        details:
+          selector: "a[href^='torrents.php?id=']"
+          attribute: href
+        download:
+          selector: "a[title='Download'][href^='torrents.php?action=download']"
+          attribute: href
+        size:
+          selector: "td:nth-last-child(4)"
+          filters: ["collapse_space"]
+        published_at:
+          selector: "td:nth-last-child(5)"
+          attribute: title
+        promotion:
+          selector: strong
+          filters: ["promotion"]
+        seeders:
+          selector: "td:nth-last-child(2)"
+        leechers:
+          selector: "td:nth-last-child(1)"
   - targets:
       - name: HHClub
         base_url: https://hhanclub.net/
