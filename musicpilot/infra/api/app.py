@@ -31,7 +31,12 @@ from fastapi.staticfiles import StaticFiles
 from opencc import OpenCC
 from sqlalchemy.exc import IntegrityError
 
-from musicpilot.adapters.bots import TelegramBotAdapter, TelegramHttpNotifier
+from musicpilot.adapters.bots import (
+    TelegramBotAdapter,
+    TelegramDashboard,
+    TelegramDownloadTask,
+    TelegramHttpNotifier,
+)
 from musicpilot.adapters.downloaders import QBittorrentClient
 from musicpilot.adapters.indexers import build_nexusphp_indexers, load_merged_parser_catalog
 from musicpilot.adapters.indexers.nexusphp import (
@@ -172,11 +177,11 @@ from musicpilot.infra.api.schemas import (
     SiteResponse,
     SubscriptionCreateRequest,
     SubscriptionResponse,
+    SystemSettingsRequest,
+    SystemSettingsResponse,
     SystemTaskInterruptRequest,
     SystemTaskInterruptResponse,
     SystemTaskResponse,
-    SystemSettingsRequest,
-    SystemSettingsResponse,
     TestResponse,
     TrackMetadataResponse,
     UpdateArtistRequest,
@@ -599,9 +604,7 @@ class ManualScrapeExecutor:
         payload = getattr(task, "payload", {}) or {}
         task_name = str(payload.get("task_name") or "manual")
         source_files = tuple(
-            Path(item)
-            for item in payload.get("source_files", [])
-            if isinstance(item, str) and item
+            Path(item) for item in payload.get("source_files", []) if isinstance(item, str) and item
         )
         manual_metadata = _manual_metadata_by_source_file(payload.get("manual_metadata"))
         contextual_metadata = _contextual_metadata_by_source_file(
@@ -700,7 +703,8 @@ class AppState:
             artist_service=self.artist_service,
         )
         self.configured_notifiers: tuple[TelegramHttpNotifier, ...] = ()
-        self.bots = self._build_bots(settings)
+        self.bots: tuple[TelegramBotAdapter, ...] = ()
+        self._bots_started = False
         self.notification_sinks = (*self.configured_notifiers, *self.bots)
         self.media_processor = MediaProcessor(
             library_root=settings.music_library_path,
@@ -772,6 +776,107 @@ class AppState:
     ) -> tuple[str, tuple[SearchResult, ...]]:
         return await _search_indexer(self, indexer, query, limit)
 
+    async def search_telegram_media(
+        self,
+        title: str,
+        artist: str | None,
+    ) -> list[MediaCandidateResponse]:
+        return await _search_media_candidates(
+            self,
+            title,
+            50,
+            artist=artist,
+            log_category="telegram",
+        )
+
+    async def search_telegram_torrents(
+        self,
+        media: MediaCandidateResponse,
+    ) -> list[SearchResult]:
+        keywords = _metadata_search_keywords(media)
+        exclude = await _get_exclude_keywords(self)
+        results: list[SearchResult] = []
+        indexer: object
+        for indexer in self.indexers:
+            for keyword in keywords:
+                try:
+                    _source, found = await _search_indexer(self, indexer, keyword, 200)
+                except Exception as exc:  # noqa: BLE001
+                    self.add_log("search", f"Telegram torrent search failed: {exc}", "WARNING")
+                    continue
+                results.extend(found)
+        merged = _filter_by_exclude_keywords(_dedupe_results(results), exclude)
+        filtered = await _filter_by_artist_with_aliases(self, merged, media.artist)
+        ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)
+        self.add_log(
+            "search",
+            f"Telegram torrent search completed: {media.title}, {len(ranked)} result(s)",
+        )
+        return ranked
+
+    async def submit_telegram_download(
+        self,
+        result: SearchResult,
+        media: MediaCandidateResponse,
+    ) -> None:
+        await _submit_download_request(
+            self,
+            DownloadRequest(
+                title=result.title,
+                download_url=result.download_url,
+                source=result.source,
+                seeders=result.seeders,
+                leechers=result.leechers,
+                size_bytes=result.size_bytes,
+                details_url=result.details_url,
+                subtitle=result.subtitle,
+                published_at=result.published_at,
+                promotion=result.promotion,
+                media_metadata=media,
+                resource=_search_result_response(result),
+            ),
+        )
+
+    async def telegram_active_downloads(self) -> list[TelegramDownloadTask]:
+        active_statuses = {
+            "queued",
+            "submitted",
+            "downloading",
+            "completed",
+            "refreshing_library",
+        }
+        tasks = await self.repository.list_download_tasks()
+        return [
+            TelegramDownloadTask(
+                name=task.name,
+                submitted_at=task.submitted_at,
+                progress=task.progress,
+            )
+            for task in tasks
+            if task.status in active_statuses
+        ]
+
+    async def telegram_dashboard(self) -> TelegramDashboard:
+        summary = await self.repository.dashboard_summary()
+        library = summary["library"]
+        downloads = summary["downloads"]
+        playlists = summary["playlists"]
+        tasks = summary["tasks"]
+        return TelegramDashboard(
+            library_songs=int(library["songs"]),
+            library_albums=int(library["albums"]),
+            library_artists=int(library["artists"]),
+            library_recent_7d_songs=int(library["recent_7d_songs"]),
+            downloads_active=int(downloads["active"]),
+            downloads_completed_7d=int(downloads["completed_7d"]),
+            downloads_failed=int(downloads["failed"]),
+            playlists=int(playlists["playlists"]),
+            playlist_pending_tracks=int(playlists["pending_tracks"]),
+            tasks_waiting=int(tasks["waiting"]),
+            tasks_running=int(tasks["running"]),
+            tasks_failed=int(tasks["failed"]),
+        )
+
     async def reload_downloader(self) -> None:
         if self.downloader is not None:
             await self.downloader.close()
@@ -783,6 +888,34 @@ class AppState:
         self.configured_notifiers = await self._build_configured_notifiers()
         self.notification_sinks = (*self.configured_notifiers, *self.bots)
         self.pipeline.notifiers = self.notification_sinks
+
+    async def reload_bots(self) -> None:
+        system_settings = await self.repository.get_system_settings()
+        proxy = _proxy_url(system_settings)
+        previous_bots = self.bots
+        if self._bots_started:
+            for bot in previous_bots:
+                await bot.stop()
+        self.bots = await self._build_bots(proxy=proxy)
+        self.notification_sinks = (*self.configured_notifiers, *self.bots)
+        self.pipeline.notifiers = self.notification_sinks
+        if self._bots_started:
+            for bot in self.bots:
+                await bot.start()
+
+    async def start_bots(self) -> None:
+        if self._bots_started:
+            return
+        for bot in self.bots:
+            await bot.start()
+        self._bots_started = True
+
+    async def stop_bots(self) -> None:
+        if not self._bots_started:
+            return
+        for bot in self.bots:
+            await bot.stop()
+        self._bots_started = False
 
     async def _build_downloader(self) -> QBittorrentClient | None:
         configured = await self.repository.default_downloader()
@@ -806,20 +939,32 @@ class AppState:
             download_path=str(self.settings.download_staging_path),
         )
 
-    def _build_bots(self, settings: Settings) -> tuple[TelegramBotAdapter, ...]:
-        if not settings.telegram_bot_token:
-            return ()
-        chat_ids = tuple(
-            int(item.strip())
-            for item in settings.telegram_chat_ids.split(",")
-            if item.strip()
-        )
-        return (
+    async def _build_bots(self, *, proxy: str | None) -> tuple[TelegramBotAdapter, ...]:
+        chat_ids_by_token: dict[str, set[int]] = {}
+        for item in await self.repository.list_notifiers():
+            if not item.enabled or item.type != "telegram":
+                continue
+            token = item.bot_token.strip()
+            if not token:
+                continue
+            chat_ids = chat_ids_by_token.setdefault(token, set())
+            chat_ids.update(
+                int(chat_id.strip())
+                for chat_id in item.chat_ids.split(",")
+                if chat_id.strip().isdigit()
+            )
+        return tuple(
             TelegramBotAdapter(
-                token=settings.telegram_bot_token,
-                event_bus=self.event_bus,
-                chat_ids=chat_ids,
-            ),
+                token=token,
+                chat_ids=tuple(sorted(chat_ids)),
+                proxy=proxy,
+                search_media=self.search_telegram_media,
+                search_torrents=self.search_telegram_torrents,
+                submit_download=self.submit_telegram_download,
+                list_active_downloads=self.telegram_active_downloads,
+                dashboard=self.telegram_dashboard,
+            )
+            for token, chat_ids in chat_ids_by_token.items()
         )
 
     async def _build_configured_notifiers(self) -> tuple[TelegramHttpNotifier, ...]:
@@ -952,8 +1097,7 @@ def create_app() -> FastAPI:
         if migrated_playlist_track_keys:
             state.add_log(
                 "playlist",
-                "Migrated playlist track source keys: "
-                f"count={migrated_playlist_track_keys}",
+                f"Migrated playlist track source keys: count={migrated_playlist_track_keys}",
             )
         migrated_waiting_tracks = await state.repository.reset_waiting_playlist_tracks()
         if migrated_waiting_tracks:
@@ -974,6 +1118,7 @@ def create_app() -> FastAPI:
             task.add_done_callback(state._background_tasks.discard)
         await state.reload_indexers()
         await state.reload_downloader()
+        await state.reload_bots()
         await state.reload_notifiers()
         await _restore_playlist_download_tasks(state)
         await _restore_pending_download_item_scrapes(state)
@@ -982,8 +1127,7 @@ def create_app() -> FastAPI:
         state.start_download_polling()
         state.start_music_library_sync()
         state.scheduler.start()
-        for bot in state.bots:
-            await bot.start()
+        await state.start_bots()
         yield
         state.add_log("system", "MusicPilot stopping")
         root_logger.removeHandler(state.log_handler)
@@ -999,8 +1143,7 @@ def create_app() -> FastAPI:
         for task in state._background_tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        for bot in state.bots:
-            await bot.stop()
+        await state.stop_bots()
         state.scheduler.stop()
         await state.pipeline.stop()
         if state.downloader is not None:
@@ -1069,8 +1212,7 @@ def create_app() -> FastAPI:
         waiting_ids = [
             task_id
             for task_id in ids
-            if existing_by_id.get(task_id) is not None
-            and existing_by_id[task_id].status == "WAIT"
+            if existing_by_id.get(task_id) is not None and existing_by_id[task_id].status == "WAIT"
         ]
         interrupted = await state.repository.interrupt_waiting_system_tasks(
             waiting_ids,
@@ -1314,59 +1456,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/downloads", response_model=DownloadResponse, status_code=202)
     async def add_download(payload: DownloadRequest) -> DownloadResponse:
-        if state.downloader is None:
-            await state.reload_downloader()
-        if state.downloader is None:
-            state.add_log(
-                "download",
-                f"Download rejected: no downloader for {payload.title}",
-                "ERROR",
-            )
-            raise HTTPException(status_code=503, detail="No downloader is configured.")
-        resource = (payload.resource or SearchResultResponse(**payload.model_dump())).model_dump()
-        media_metadata = payload.media_metadata.model_dump() if payload.media_metadata else {}
-        task = await state.repository.create_download_task(
-            resource=resource,
-            media_metadata=media_metadata,
-            selected_site_ids=payload.selected_site_ids,
-            category=payload.category,
-        )
-        try:
-            submitted = await _submit_torrent_to_downloader(
-                state,
-                resource,
-                payload.selected_site_ids,
-                payload.category,
-            )
-        except Exception as exc:  # noqa: BLE001
-            await state.repository.update_download_task(
-                task.id,
-                status="failed",
-                last_error=str(exc),
-            )
-            raise HTTPException(status_code=502, detail=f"Downloader submit failed: {exc}") from exc
-        default_downloader = await state.repository.default_downloader()
-        task_changes: dict[str, object] = {
-            "status": "submitted",
-            "downloader_id": default_downloader.id if default_downloader else None,
-            "submitted_at": datetime.now(UTC),
-        }
-        if submitted.torrent_hash:
-            task_changes["torrent_hash"] = submitted.torrent_hash
-        task = await state.repository.update_download_task(task.id, **task_changes)
-        item_ids = await _record_submitted_torrent_items(
-            state,
-            task.id if task else None,
-            submitted.torrent_data,
-        )
-        await _schedule_download_task_item_scraping(state, task.id if task else None, item_ids)
-        await _send_event_notifications(state, "download", task)
-        state.add_log("download", f"Download submitted: {payload.title}")
-        return DownloadResponse(
-            status="submitted",
-            task_id=task.id if task else None,
-            torrent_hash=submitted.torrent_hash or None,
-        )
+        return await _submit_download_request(state, payload)
 
     @app.get("/api/downloads", response_model=list[DownloadTaskResponse])
     async def downloads() -> list[DownloadTaskResponse]:
@@ -1551,6 +1641,7 @@ def create_app() -> FastAPI:
         payload: SystemSettingsRequest,
     ) -> SystemSettingsResponse:
         settings_payload = await state.repository.update_system_settings(payload.model_dump())
+        await state.reload_bots()
         await state.reload_notifiers()
         state.add_log("settings", "System settings saved")
         return SystemSettingsResponse(**settings_payload)
@@ -1585,6 +1676,7 @@ def create_app() -> FastAPI:
             counts = await DatabaseMigrationService(state.database).import_zip(content)
             await state.reload_indexers()
             await state.reload_downloader()
+            await state.reload_bots()
             await state.reload_notifiers()
             state.add_log("settings", "Database imported")
         except DatabaseMigrationError as exc:
@@ -1596,8 +1688,7 @@ def create_app() -> FastAPI:
     @app.get("/api/settings/media-servers", response_model=list[MediaServerResponse])
     async def media_servers() -> list[MediaServerResponse]:
         return [
-            _media_server_response(item)
-            for item in await state.repository.list_media_servers()
+            _media_server_response(item) for item in await state.repository.list_media_servers()
         ]
 
     @app.post("/api/settings/media-servers", response_model=MediaServerResponse, status_code=201)
@@ -1640,6 +1731,7 @@ def create_app() -> FastAPI:
         if not payload.bot_token:
             raise HTTPException(status_code=422, detail="Bot token is required.")
         notifier = await state.repository.upsert_notifier(payload=payload.model_dump())
+        await state.reload_bots()
         await state.reload_notifiers()
         return _notifier_response(notifier)
 
@@ -1654,6 +1746,7 @@ def create_app() -> FastAPI:
             notifier_id=notifier_id,
             payload=payload.model_dump(),
         )
+        await state.reload_bots()
         await state.reload_notifiers()
         return _notifier_response(notifier)
 
@@ -1662,6 +1755,7 @@ def create_app() -> FastAPI:
         deleted = await state.repository.delete_notifier(notifier_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Notifier not found.")
+        await state.reload_bots()
         await state.reload_notifiers()
 
     @app.post("/api/settings/notifiers/test", response_model=TestResponse)
@@ -1673,9 +1767,7 @@ def create_app() -> FastAPI:
         if not bot_token:
             return TestResponse(ok=False, message="Telegram Bot Token 不能为空。")
         proxy = (
-            _proxy_url(await state.repository.get_system_settings())
-            if payload.use_proxy
-            else None
+            _proxy_url(await state.repository.get_system_settings()) if payload.use_proxy else None
         )
         if payload.use_proxy and proxy is None:
             return TestResponse(ok=False, message="已开启代理，但系统代理地址未配置。")
@@ -1685,9 +1777,7 @@ def create_app() -> FastAPI:
         )
         try:
             async with httpx.AsyncClient(timeout=20, proxy=proxy) as client:
-                response = await client.get(
-                    f"https://api.telegram.org/bot{bot_token}/getMe"
-                )
+                response = await client.get(f"https://api.telegram.org/bot{bot_token}/getMe")
                 response.raise_for_status()
                 data = response.json()
         except httpx.TimeoutException as exc:
@@ -1719,11 +1809,7 @@ def create_app() -> FastAPI:
     @app.get("/api/music-platforms", response_model=list[MusicPlatformResponse])
     async def music_platforms() -> list[MusicPlatformResponse]:
         rows = await state.repository.list_music_platform_connections()
-        return [
-            _music_platform_response(item)
-            for item in rows
-            if item.platform != "url_import"
-        ]
+        return [_music_platform_response(item) for item in rows if item.platform != "url_import"]
 
     @app.post(
         "/api/music-platforms/connect/start",
@@ -2301,9 +2387,7 @@ def create_app() -> FastAPI:
                         "task_name": task_name,
                         "source_files": [str(item) for item in source_files],
                     },
-                    resource_keys=[
-                        _scraping_batch_resource_key("manual-scrape", source_files)
-                    ],
+                    resource_keys=[_scraping_batch_resource_key("manual-scrape", source_files)],
                 )
             )
             task = await state.task_manager.wait_for_task(task_id)
@@ -2345,13 +2429,9 @@ def create_app() -> FastAPI:
                         "manual_metadata": {
                             str(source_path): [_track_metadata_payload(metadata)],
                         },
-                        "exclude_library_paths": [
-                            str(path) for path in exclude_library_paths
-                        ],
+                        "exclude_library_paths": [str(path) for path in exclude_library_paths],
                     },
-                    resource_keys=[
-                        _scraping_batch_resource_key("manual-scrape", (source_path,))
-                    ],
+                    resource_keys=[_scraping_batch_resource_key("manual-scrape", (source_path,))],
                 )
             )
             task = await state.task_manager.wait_for_task(task_id)
@@ -2378,9 +2458,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=409, detail="请先在刮削设置中开启刮削。")
         root = _scraping_source_root_or_409(config)
         source_dir = _resolve_source_relative_path(root, payload.path)
-        source_is_dir = await asyncio.to_thread(
-            lambda: source_dir.exists() and source_dir.is_dir()
-        )
+        source_is_dir = await asyncio.to_thread(lambda: source_dir.exists() and source_dir.is_dir())
         if not source_is_dir:
             raise HTTPException(status_code=404, detail="源目录不存在，无法手动整理。")
         source_files = await asyncio.to_thread(_source_audio_files, root, source_dir)
@@ -2395,9 +2473,7 @@ def create_app() -> FastAPI:
         )
         exclude_paths: list[Path] = []
         for source_file in source_files:
-            exclude_paths.extend(
-                await _prepare_source_file_reorganize(state, source_file, config)
-            )
+            exclude_paths.extend(await _prepare_source_file_reorganize(state, source_file, config))
         try:
             task_id = await state.task_manager.enqueue(
                 TaskCreate(
@@ -2411,16 +2487,12 @@ def create_app() -> FastAPI:
                         },
                         "exclude_library_paths": [str(path) for path in exclude_paths],
                     },
-                    resource_keys=[
-                        _scraping_batch_resource_key("manual-scrape", source_files)
-                    ],
+                    resource_keys=[_scraping_batch_resource_key("manual-scrape", source_files)],
                 )
             )
             task = await state.task_manager.wait_for_task(task_id)
             if task.status != "SUCCEEDED":
-                raise RuntimeError(
-                    task.error_message or f"Manual scrape failed: {source_dir.name}"
-                )
+                raise RuntimeError(task.error_message or f"Manual scrape failed: {source_dir.name}")
         except Exception as exc:  # noqa: BLE001
             state.add_log(
                 "metadata",
@@ -2560,13 +2632,9 @@ def create_app() -> FastAPI:
                         "manual_metadata": {
                             str(source_path): [_track_metadata_payload(metadata)],
                         },
-                        "exclude_library_paths": [
-                            str(path) for path in exclude_library_paths
-                        ],
+                        "exclude_library_paths": [str(path) for path in exclude_library_paths],
                     },
-                    resource_keys=[
-                        _scraping_batch_resource_key("manual-scrape", (source_path,))
-                    ],
+                    resource_keys=[_scraping_batch_resource_key("manual-scrape", (source_path,))],
                 )
             )
             task = await state.task_manager.wait_for_task(task_id)
@@ -2877,7 +2945,8 @@ async def _spotify_access_token(state: AppState, connection: MusicPlatformConnec
         refresh_token=refresh_token,
         access_token_expires_at=token_expiry(token_payload.get("expires_in")),
         refresh_token_expires_at=(
-            refresh_token_expiry() if refresh_token != connection.refresh_token
+            refresh_token_expiry()
+            if refresh_token != connection.refresh_token
             else connection.refresh_token_expires_at
         ),
         status="connected",
@@ -3081,8 +3150,7 @@ async def _import_spotify_playlist(
         await _mark_spotify_connection_error(state, connection.id, exc)
         raise _spotify_http_exception(exc) from exc
     tracks = [
-        _spotify_track_payload(entry, index)
-        for index, entry in enumerate(raw_tracks, start=1)
+        _spotify_track_payload(entry, index) for index, entry in enumerate(raw_tracks, start=1)
     ]
     await state.repository.upsert_playlist_tracks(
         playlist_id=playlist.id,
@@ -3369,7 +3437,9 @@ async def _download_playlist_tracks(state: AppState, playlist_id: int) -> None:
         for track in tracks:
             if track.exists_in_library:
                 await state.repository.update_playlist_track(
-                    track.id, download_status="existing", last_error=None,
+                    track.id,
+                    download_status="existing",
+                    last_error=None,
                 )
                 state.add_log(
                     "playlist",
@@ -3446,8 +3516,7 @@ async def _enqueue_playlist_track_download(
             },
             resource_keys=list(resource_keys),
             idempotency_key=(
-                f"playlist-track:{track_id}:download:"
-                f"{attempt_at.isoformat(timespec='seconds')}"
+                f"playlist-track:{track_id}:download:{attempt_at.isoformat(timespec='seconds')}"
             ),
         )
     )
@@ -3486,9 +3555,9 @@ async def _playlist_track_download_resource_keys(
 
 
 def _site_resource_key(indexer: object, site_id: str) -> str:
-    max_concurrency = _optional_int(
-        getattr(getattr(indexer, "config", None), "max_concurrency", 1)
-    ) or 1
+    max_concurrency = (
+        _optional_int(getattr(getattr(indexer, "config", None), "max_concurrency", 1)) or 1
+    )
     max_concurrency = max(1, max_concurrency)
     return f"pool:{max_concurrency}:site:{site_id}"
 
@@ -3496,11 +3565,14 @@ def _site_resource_key(indexer: object, site_id: str) -> str:
 async def _media_search_resource_key(state: AppState) -> str:
     settings = await state.repository.get_system_settings()
     search_settings = settings.get("search") if isinstance(settings, dict) else {}
-    concurrency = _optional_int(
-        search_settings.get("metadata_concurrency")
-        if isinstance(search_settings, dict)
-        else None
-    ) or 3
+    concurrency = (
+        _optional_int(
+            search_settings.get("metadata_concurrency")
+            if isinstance(search_settings, dict)
+            else None
+        )
+        or 3
+    )
     concurrency = min(max(concurrency, 1), 20)
     return f"pool:{concurrency}:media-search"
 
@@ -3508,11 +3580,14 @@ async def _media_search_resource_key(state: AppState) -> str:
 async def _metadata_source_resource_key(state: AppState, source: str) -> str:
     settings = await state.repository.get_system_settings()
     search_settings = settings.get("search") if isinstance(settings, dict) else {}
-    concurrency = _optional_int(
-        search_settings.get("metadata_concurrency")
-        if isinstance(search_settings, dict)
-        else None
-    ) or 3
+    concurrency = (
+        _optional_int(
+            search_settings.get("metadata_concurrency")
+            if isinstance(search_settings, dict)
+            else None
+        )
+        or 3
+    )
     concurrency = min(max(concurrency, 1), 20)
     source_key = _compact_search_text(normalize_search_text(source)) or "unknown"
     return f"pool:{concurrency}:metadata-source:{source_key}"
@@ -3534,7 +3609,8 @@ async def _update_playlist_download_completion(state: AppState, playlist_id: int
 
 
 async def _check_and_download_playlist_track(
-    state: AppState, track_id: int,
+    state: AppState,
+    track_id: int,
 ) -> str:
     track = await state.repository.get_playlist_track(track_id)
     if track is None:
@@ -3581,7 +3657,8 @@ async def _check_and_download_playlist_track(
 
 
 async def _execute_playlist_download(
-    state: AppState, track: PlaylistTrack,
+    state: AppState,
+    track: PlaylistTrack,
 ) -> str:
     try:
         await state.repository.update_playlist_track(
@@ -4081,9 +4158,9 @@ def _playlist_media_candidate(track: PlaylistTrack) -> MediaCandidateResponse:
 
 def _oauth_html(title: str, message: str, *, status_code: int = 200) -> HTMLResponse:
     body = (
-        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        '<!doctype html><html><head><meta charset="utf-8">'
         f"<title>{escape(title)}</title></head>"
-        "<body style=\"font-family: sans-serif; padding: 32px;\">"
+        '<body style="font-family: sans-serif; padding: 32px;">'
         f"<h1>{escape(title)}</h1><p>{escape(message)}</p>"
         "</body></html>"
     )
@@ -4096,9 +4173,7 @@ async def _search_indexer(
     query: str,
     limit: int,
 ) -> tuple[str, tuple[SearchResult, ...]]:
-    site_id = str(
-        getattr(getattr(indexer, "config", None), "site_id", "") or indexer.name
-    )
+    site_id = str(getattr(getattr(indexer, "config", None), "site_id", "") or indexer.name)
     site_name = str(getattr(indexer, "name", site_id))
     task_id = await state.task_manager.enqueue(
         TaskCreate(
@@ -4132,9 +4207,7 @@ async def _search_site_candidates(
     *,
     use_task_manager: bool = True,
 ) -> tuple[str, tuple[SearchResult, ...]]:
-    site_id = str(
-        getattr(getattr(indexer, "config", None), "site_id", "") or indexer.name
-    )
+    site_id = str(getattr(getattr(indexer, "config", None), "site_id", "") or indexer.name)
     site_name = str(getattr(indexer, "name", site_id))
     resource_keys = [_site_resource_key(indexer, site_id)]
     if not use_task_manager:
@@ -4288,6 +4361,62 @@ async def _search_media_candidates_direct(
         if len(candidates) >= limit:
             break
     return _aggregate_media_candidates(candidates, limit=limit)
+
+
+async def _submit_download_request(state: AppState, payload: DownloadRequest) -> DownloadResponse:
+    if state.downloader is None:
+        await state.reload_downloader()
+    if state.downloader is None:
+        state.add_log(
+            "download",
+            f"Download rejected: no downloader for {payload.title}",
+            "ERROR",
+        )
+        raise HTTPException(status_code=503, detail="No downloader is configured.")
+    resource = (payload.resource or SearchResultResponse(**payload.model_dump())).model_dump()
+    media_metadata = payload.media_metadata.model_dump() if payload.media_metadata else {}
+    task = await state.repository.create_download_task(
+        resource=resource,
+        media_metadata=media_metadata,
+        selected_site_ids=payload.selected_site_ids,
+        category=payload.category,
+    )
+    try:
+        submitted = await _submit_torrent_to_downloader(
+            state,
+            resource,
+            payload.selected_site_ids,
+            payload.category,
+        )
+    except Exception as exc:  # noqa: BLE001
+        await state.repository.update_download_task(
+            task.id,
+            status="failed",
+            last_error=str(exc),
+        )
+        raise HTTPException(status_code=502, detail=f"Downloader submit failed: {exc}") from exc
+    default_downloader = await state.repository.default_downloader()
+    task_changes: dict[str, object] = {
+        "status": "submitted",
+        "downloader_id": default_downloader.id if default_downloader else None,
+        "submitted_at": datetime.now(UTC),
+    }
+    if submitted.torrent_hash:
+        task_changes["torrent_hash"] = submitted.torrent_hash
+    task = await state.repository.update_download_task(task.id, **task_changes)
+    item_ids = await _record_submitted_torrent_items(
+        state,
+        task.id if task else None,
+        submitted.torrent_data,
+    )
+    await _schedule_download_task_item_scraping(state, task.id if task else None, item_ids)
+    await _send_event_notifications(state, "download", task)
+    state.add_log("download", f"Download submitted: {payload.title}")
+    return DownloadResponse(
+        status="submitted",
+        task_id=task.id if task else None,
+        torrent_hash=submitted.torrent_hash or None,
+    )
 
 
 def _find_indexer(state: AppState, site_id: str) -> object | None:
@@ -6212,9 +6341,7 @@ def _scraping_file_resource_key(path: Path) -> str:
 
 
 def _scraping_batch_resource_key(prefix: str, source_files: Iterable[Path]) -> str:
-    identity = "|".join(
-        sorted(str(path.expanduser()) for path in source_files)
-    )
+    identity = "|".join(sorted(str(path.expanduser()) for path in source_files))
     digest = hashlib.sha1(identity.encode("utf-8", errors="ignore")).hexdigest()[:16]
     return f"{prefix}:{digest}"
 
@@ -6277,14 +6404,10 @@ async def _scrape_manual_source_files(
             "WARNING",
         )
     library_roots = tuple(
-        path
-        for path in (config.mapped_directory, config.source_directory)
-        if path is not None
+        path for path in (config.mapped_directory, config.source_directory) if path is not None
     )
     excluded_library_keys = {
-        key
-        for path in exclude_library_paths
-        for key in _path_match_keys(path, library_roots)
+        key for path in exclude_library_paths for key in _path_match_keys(path, library_roots)
     }
     library_tracks = tuple(
         LibraryTrackSnapshot(
@@ -6316,6 +6439,7 @@ async def _scrape_manual_source_files(
         )
         and (media_file_size := _file_size_or_none(item.library_path)) is not None
     )
+
     async def record_file_result(item: ScrapingFileResult) -> None:
         if item.status in {"success", "skipped"}:
             await _ensure_artist_from_metadata(
@@ -6557,9 +6681,7 @@ def _normalize_match_text(value: str) -> str:
 def _match_tokens(value: str) -> set[str]:
     normalized = _normalize_match_text(value)
     return {
-        token
-        for token in re.split(r"[^0-9a-zA-Z\u4e00-\u9fff.]+", normalized)
-        if len(token) >= 2
+        token for token in re.split(r"[^0-9a-zA-Z\u4e00-\u9fff.]+", normalized) if len(token) >= 2
     }
 
 
@@ -6711,6 +6833,7 @@ async def _scrape_download_for_task(
             task,
             source_files,
         )
+
         async def run_scrape() -> ScrapingSummary:
             return await state.scraper.process_download(
                 task_name=task.name,
@@ -6803,9 +6926,7 @@ async def _organize_download_task_item(
             status="organize_failed",
             last_error="Scraping is disabled.",
         )
-    source_exists = await asyncio.to_thread(
-        lambda: source_file.exists() and source_file.is_file()
-    )
+    source_exists = await asyncio.to_thread(lambda: source_file.exists() and source_file.is_file())
     if not source_exists:
         return await state.repository.update_download_task_item(
             item_id,
@@ -6932,9 +7053,7 @@ async def _finalize_download_refresh_if_ready_direct(state: AppState, task_id: i
     items = await state.repository.list_download_task_items(task_id)
     payload = task.payload if isinstance(task.payload, dict) else {}
     organize_item_ids = {
-        int(item)
-        for item in payload.get("organize_item_ids", [])
-        if isinstance(item, int)
+        int(item) for item in payload.get("organize_item_ids", []) if isinstance(item, int)
     }
     if organize_item_ids:
         items = [item for item in items if item.id in organize_item_ids]
@@ -7348,8 +7467,10 @@ async def _send_event_notifications(
     await state.reload_notifiers()
     channels = await state.repository.list_notifiers()
     enabled = [
-        item for item in channels
-        if item.enabled and (
+        item
+        for item in channels
+        if item.enabled
+        and (
             (event_name == "download" and item.enable_download_notify)
             or (event_name == "library" and item.enable_library_notify)
         )

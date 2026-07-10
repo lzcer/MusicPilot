@@ -22,6 +22,7 @@ dependencies = [
   "mutagen>=1.47",
   "apscheduler>=3.10",
   "aiogram>=3.10",
+  "aiohttp-socks>=0.10",
   "pydantic>=2.8",
   "pydantic-settings>=2.3",
   "pyyaml>=6.0",
