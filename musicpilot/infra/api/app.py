@@ -168,6 +168,7 @@ from musicpilot.infra.api.schemas import (
     SearchResponse,
     SearchResultResponse,
     SiteCreateRequest,
+    SitePriorityUpdateRequest,
     SiteResponse,
     SubscriptionCreateRequest,
     SubscriptionResponse,
@@ -1173,33 +1174,39 @@ def create_app() -> FastAPI:
             if not selected_ids or str(getattr(indexer.config, "site_id", "")) in selected_ids
         ]
         keywords = _metadata_search_keywords(payload.media)
-        raw_results: list[SearchResult] = []
-        for keyword in keywords:
-            groups = await asyncio.gather(
-                *(
-                    _search_indexer(state, indexer, keyword, payload.limit)
-                    for indexer in indexers
-                ),
-                return_exceptions=True,
-            )
-            for group in groups:
-                if isinstance(group, Exception):
-                    state.add_log("search", f"Metadata site search failed: {group}", "ERROR")
-                    continue
-                raw_results.extend(group[1])
-        merged = _dedupe_results(raw_results)
         exclude = await _get_exclude_keywords(state)
-        merged = _filter_by_exclude_keywords(merged, exclude)
-        filtered = await _filter_by_artist_with_aliases(state, merged, payload.media.artist)
-        ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[: payload.limit]
+        for indexer in indexers:
+            raw_results: list[SearchResult] = []
+            for keyword in keywords:
+                try:
+                    _source, results = await _search_indexer(state, indexer, keyword, payload.limit)
+                except Exception as exc:  # noqa: BLE001
+                    state.add_log("search", f"Metadata site search failed: {exc}", "ERROR")
+                    continue
+                raw_results.extend(results)
+            merged = _filter_by_exclude_keywords(_dedupe_results(raw_results), exclude)
+            filtered = await _filter_by_artist_with_aliases(state, merged, payload.media.artist)
+            if filtered:
+                ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[
+                    : payload.limit
+                ]
+                state.add_log(
+                    "search",
+                    f"Metadata site search completed: raw={len(merged)}, filtered={len(filtered)}",
+                )
+                return MetadataSiteSearchResponse(
+                    raw_count=len(merged),
+                    filtered_count=len(filtered),
+                    results=[_search_result_response(item) for item in ranked],
+                )
         state.add_log(
             "search",
-            f"Metadata site search completed: raw={len(merged)}, filtered={len(filtered)}",
+            "Metadata site search completed: raw=0, filtered=0",
         )
         return MetadataSiteSearchResponse(
-            raw_count=len(merged),
-            filtered_count=len(filtered),
-            results=[_search_result_response(item) for item in ranked],
+            raw_count=0,
+            filtered_count=0,
+            results=[],
         )
 
     @app.post("/api/search/by-metadata/stream/start")
@@ -1274,14 +1281,10 @@ def create_app() -> FastAPI:
                 return
 
             state.add_log("search", f"Search started: {query}")
-            tasks = [
-                asyncio.create_task(_search_indexer(state, indexer, query, limit))
-                for indexer in state.indexers
-            ]
             count = 0
-            for task in asyncio.as_completed(tasks):
+            for indexer in state.indexers:
                 try:
-                    _source, results = await task
+                    _source, results = await _search_indexer(state, indexer, query, limit)
                 except Exception as exc:  # noqa: BLE001
                     state.add_log("search", f"Indexer failed: {exc}", "ERROR")
                     yield _sse("error", {"source": "unknown", "message": str(exc)})
@@ -1437,6 +1440,17 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=409, detail="Site already exists.") from exc
         await state.reload_indexers()
         return _site_response(site, parser)
+
+    @app.put("/api/sites/priorities", response_model=list[SiteResponse])
+    async def reorder_sites(payload: SitePriorityUpdateRequest) -> list[SiteResponse]:
+        try:
+            sites = await state.repository.reorder_indexer_sites(payload.site_ids)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        await state.reload_indexers()
+        return [
+            _site_response(site, _supported_parser_or_422(state, site.base_url)) for site in sites
+        ]
 
     @app.put("/api/sites/{site_id}", response_model=SiteResponse)
     async def update_site(site_id: str, payload: SiteCreateRequest) -> SiteResponse:
@@ -3581,47 +3595,46 @@ async def _execute_playlist_download(
             "playlist",
             f"Playlist track search started: {_playlist_track_log_text(track)}",
         )
-        candidates = await _playlist_download_results(state, track)
-        state.add_log(
-            "playlist",
-            "Playlist track search completed: "
-            f"track={_playlist_track_log_text(track)}, candidates={len(candidates)}",
-        )
-        if not candidates:
-            await state.repository.update_playlist_track(
-                track.id,
-                download_status="not_found",
-                last_error="No artist-matched torrent result found.",
-            )
-            state.add_log(
-                "playlist",
-                "Playlist track not found, no torrent candidates: "
-                f"{_playlist_track_log_text(track)}",
-                "WARNING",
-            )
-            return "not_found"
         last_error: str | None = None
-        for index, (result, media) in enumerate(candidates, start=1):
-            state.add_log(
-                "playlist",
-                "Playlist candidate trying: "
-                f"track={_playlist_track_log_text(track)}, "
-                f"index={index}/{len(candidates)}, "
-                f"media={_media_candidate_log_text(media)}, "
-                f"result={_search_result_log_text(result)}",
-            )
-            try:
-                task = await _try_playlist_candidate_download(state, track, result, media)
-            except Exception as exc:  # noqa: BLE001
-                last_error = str(exc)
+        candidate_count = 0
+        seen: set[tuple[str, str]] = set()
+        for media in await _playlist_media_candidates(state, track):
+            async for site_name, results in _iter_metadata_download_results_by_site(state, media):
+                candidates = [result for result in results if result.identity_key not in seen]
+                seen.update(result.identity_key for result in candidates)
+                candidate_count += len(candidates)
                 state.add_log(
                     "playlist",
-                    f"Playlist candidate skipped for {track.title}: {exc}",
-                    "WARNING",
+                    "Playlist site candidate results: "
+                    f"track={_playlist_track_log_text(track)}, site={site_name}, "
+                    f"media={_media_candidate_log_text(media)}, candidates={len(candidates)}",
                 )
-                continue
-            if task is not None:
-                return _playlist_download_status_for_task(task)
+                for index, result in enumerate(candidates, start=1):
+                    state.add_log(
+                        "playlist",
+                        "Playlist candidate trying: "
+                        f"track={_playlist_track_log_text(track)}, "
+                        f"site={site_name}, index={index}/{len(candidates)}, "
+                        f"media={_media_candidate_log_text(media)}, "
+                        f"result={_search_result_log_text(result)}",
+                    )
+                    try:
+                        task = await _try_playlist_candidate_download(state, track, result, media)
+                    except Exception as exc:  # noqa: BLE001
+                        last_error = str(exc)
+                        state.add_log(
+                            "playlist",
+                            f"Playlist candidate skipped for {track.title}: {exc}",
+                            "WARNING",
+                        )
+                        continue
+                    if task is not None:
+                        return _playlist_download_status_for_task(task)
+                state.add_log(
+                    "playlist",
+                    "Playlist site candidates did not match; trying next priority site: "
+                    f"track={_playlist_track_log_text(track)}, site={site_name}",
+                )
         await state.repository.update_playlist_track(
             track.id,
             download_status="not_found",
@@ -3630,7 +3643,7 @@ async def _execute_playlist_download(
         state.add_log(
             "playlist",
             "Playlist track not found in candidate torrents: "
-            f"track={_playlist_track_log_text(track)}, tried={len(candidates)}, "
+            f"track={_playlist_track_log_text(track)}, tried={candidate_count}, "
             f"last_error={last_error or ''}",
             "WARNING",
         )
@@ -3647,31 +3660,6 @@ async def _execute_playlist_download(
             "ERROR",
         )
         return "failed"
-
-
-async def _playlist_download_results(
-    state: AppState,
-    track: PlaylistTrack,
-) -> list[tuple[SearchResult, MediaCandidateResponse]]:
-    if not state.indexers:
-        return []
-    results: list[tuple[SearchResult, MediaCandidateResponse]] = []
-    seen: set[tuple[str, str]] = set()
-    for media in await _playlist_media_candidates(state, track):
-        media_results = await _metadata_download_results(state, media)
-        state.add_log(
-            "playlist",
-            "Playlist media candidate results: "
-            f"track={_playlist_track_log_text(track)}, "
-            f"media={_media_candidate_log_text(media)}, results={len(media_results)}",
-        )
-        for result in media_results:
-            key = result.identity_key
-            if key in seen:
-                continue
-            seen.add(key)
-            results.append((result, media))
-    return results
 
 
 async def _playlist_media_candidates(
@@ -3704,38 +3692,36 @@ async def _playlist_media_candidates(
     return (aggregated or [fallback])[:10]
 
 
-async def _metadata_download_results(
+async def _iter_metadata_download_results_by_site(
     state: AppState,
     media: MediaCandidateResponse,
-) -> list[SearchResult]:
+) -> AsyncIterator[tuple[str, list[SearchResult]]]:
     keywords = _metadata_search_keywords(media)
     if not keywords:
-        return []
-    raw_results: list[SearchResult] = []
-    groups = await asyncio.gather(
-        *(
-            _search_site_candidates(state, indexer, media, keywords, 50, use_task_manager=False)
-            for indexer in state.indexers
-        ),
-        return_exceptions=True,
-    )
-    for group in groups:
-        if isinstance(group, Exception):
-            state.add_log("playlist", f"Playlist track search failed: {group}", "WARNING")
-            continue
-        raw_results.extend(group[1])
-    deduped = _dedupe_results(raw_results)
+        return
     exclude = await _get_exclude_keywords(state)
-    deduped = _filter_by_exclude_keywords(deduped, exclude)
-    filtered = await _filter_by_artist_with_aliases(state, deduped, media.artist)
-    ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)
-    state.add_log(
-        "search",
-        "Playlist site search completed: "
-        f"media={_media_candidate_log_text(media)}, raw={len(raw_results)}, "
-        f"deduped={len(deduped)}, artist_filtered={len(filtered)}",
-    )
-    return ranked
+    for indexer in state.indexers:
+        site_name = str(getattr(indexer, "name", "unknown"))
+        try:
+            _source, results = await _search_site_candidates(
+                state, indexer, media, keywords, 50, use_task_manager=False
+            )
+        except Exception as exc:  # noqa: BLE001
+            state.add_log(
+                "playlist", f"Playlist track search failed: {site_name}: {exc}", "WARNING"
+            )
+            continue
+        deduped = _filter_by_exclude_keywords(_dedupe_results(results), exclude)
+        filtered = await _filter_by_artist_with_aliases(state, deduped, media.artist)
+        ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)
+        state.add_log(
+            "search",
+            "Playlist site search completed: "
+            f"media={_media_candidate_log_text(media)}, site={site_name}, raw={len(results)}, "
+            f"artist_filtered={len(filtered)}",
+        )
+        if ranked:
+            yield site_name, ranked
 
 
 async def _try_playlist_candidate_download(
@@ -5210,12 +5196,8 @@ async def _run_metadata_site_search_stream(
         await task.finish()
         return
     try:
-        await asyncio.gather(
-            *(
-                _run_metadata_site_search_for_indexer(state, task, indexer, limit)
-                for indexer in indexers
-            )
-        )
+        for indexer in indexers:
+            await _run_metadata_site_search_for_indexer(state, task, indexer, limit)
     except Exception as exc:  # noqa: BLE001
         state.add_log("search", f"Streaming metadata site search failed: {exc}", "ERROR")
     finally:
@@ -5579,6 +5561,7 @@ def _site_payload(site: IndexerSite) -> dict[str, object]:
         "base_url": site.base_url,
         "cookie": site.cookie,
         "user_agent": site.user_agent,
+        "priority": site.priority,
         "max_concurrency": site.max_concurrency,
         "use_proxy": site.use_proxy,
         "enabled": site.enabled,

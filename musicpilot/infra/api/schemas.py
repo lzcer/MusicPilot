@@ -391,6 +391,7 @@ class SiteCreateRequest(BaseModel):
     base_url: str = Field(min_length=1)
     cookie: str | None = None
     user_agent: str | None = None
+    priority: int = Field(default=100, ge=0)
     max_concurrency: int = Field(default=2, ge=1, le=10)
     use_proxy: bool = False
     enabled: bool = True
@@ -399,6 +400,10 @@ class SiteCreateRequest(BaseModel):
 class SiteResponse(SiteCreateRequest):
     id: str | None = None
     parser: NexusPHPParserRequest
+
+
+class SitePriorityUpdateRequest(BaseModel):
+    site_ids: list[str] = Field(min_length=1)
 
 
 class DownloaderCreateRequest(BaseModel):

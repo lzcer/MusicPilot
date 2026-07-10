@@ -319,6 +319,7 @@ type Site = {
   cookie?: string | null
   user_agent?: string | null
   parser?: ParserConfig
+  priority: number
   max_concurrency: number
   use_proxy: boolean
   enabled: boolean
@@ -733,6 +734,8 @@ const artistMergeDialog = ref(false)
 const artistMergeForm = ref({ target_id: 0, source_id: 0, target_name: '', source_name: '' })
 const clearArtistDialog = ref(false)
 const editingSiteId = ref<string | null>(null)
+const draggedSiteId = ref<string | null>(null)
+const sitePrioritySaving = ref(false)
 const editingDownloaderId = ref<string | null>(null)
 const editingMediaServerId = ref<string | null>(null)
 const editingNotifierId = ref<string | null>(null)
@@ -759,6 +762,7 @@ const siteForm = ref({
   base_url: '',
   cookie: '',
   user_agent: '',
+  priority: 100,
   max_concurrency: 2,
   use_proxy: false,
   enabled: true
@@ -3042,6 +3046,7 @@ function openNewSiteDialog() {
     base_url: '',
     cookie: '',
     user_agent: '',
+    priority: 100,
     max_concurrency: 2,
     use_proxy: false,
     enabled: true
@@ -3056,6 +3061,7 @@ function editSite(site: Site) {
     base_url: site.base_url,
     cookie: site.cookie ?? '',
     user_agent: site.user_agent ?? '',
+    priority: site.priority,
     max_concurrency: site.max_concurrency,
     use_proxy: site.use_proxy,
     enabled: site.enabled
@@ -3083,6 +3089,51 @@ async function saveSite() {
     notify('站点已保存')
   } catch (error) {
     notify(error instanceof Error ? error.message : '站点保存失败', 'error')
+  }
+}
+
+function startSiteDrag(site: Site) {
+  if (!site.id || sitePrioritySaving.value) return
+  draggedSiteId.value = site.id
+}
+
+function finishSiteDrag() {
+  draggedSiteId.value = null
+}
+
+async function dropSite(site: Site) {
+  const sourceId = draggedSiteId.value
+  const targetId = site.id
+  finishSiteDrag()
+  if (!sourceId || !targetId || sourceId === targetId || sitePrioritySaving.value) return
+
+  const original = [...sites.value]
+  const sourceIndex = original.findIndex((item) => item.id === sourceId)
+  const targetIndex = original.findIndex((item) => item.id === targetId)
+  if (sourceIndex < 0 || targetIndex < 0) return
+
+  const reordered = [...original]
+  const [moved] = reordered.splice(sourceIndex, 1)
+  if (!moved) return
+  reordered.splice(targetIndex, 0, moved)
+  const siteIds = reordered
+    .map((item) => item.id)
+    .filter((id): id is string => Boolean(id))
+  if (siteIds.length !== reordered.length) return
+
+  sites.value = reordered.map((item, index) => ({ ...item, priority: index + 1 }))
+  sitePrioritySaving.value = true
+  try {
+    sites.value = await api<Site[]>('/api/sites/priorities', {
+      method: 'PUT',
+      body: JSON.stringify({ site_ids: siteIds })
+    })
+    notify('站点优先级已更新')
+  } catch (error) {
+    sites.value = original
+    notify(error instanceof Error ? error.message : '站点优先级保存失败', 'error')
+  } finally {
+    sitePrioritySaving.value = false
   }
 }
 
@@ -5217,8 +5268,20 @@ onUnmounted(() => {
               <v-btn color="primary" prepend-icon="mdi-plus" @click="openNewSiteDialog">新增站点</v-btn>
             </div>
             <div class="card-grid">
-              <v-card v-for="site in sites" :key="site.id || site.name" class="config-card" @click="editSite(site)">
+              <v-card
+                v-for="site in sites"
+                :key="site.id || site.name"
+                class="config-card site-config-card"
+                :class="{ 'site-config-card-dragging': draggedSiteId === site.id }"
+                :draggable="Boolean(site.id) && !sitePrioritySaving"
+                @click="editSite(site)"
+                @dragend="finishSiteDrag"
+                @dragover.prevent
+                @dragstart="startSiteDrag(site)"
+                @drop.prevent="dropSite(site)"
+              >
                 <v-card-title class="config-card-title d-flex align-center">
+                  <v-icon class="site-drag-handle" icon="mdi-drag-vertical" size="small" />
                   <span>{{ site.name }}</span>
                   <v-spacer />
                   <div v-if="site.id" class="config-card-menu" @click.stop>
@@ -5251,6 +5314,7 @@ onUnmounted(() => {
                       {{ site.enabled ? '启用' : '停用' }}
                     </v-chip>
                     <v-chip size="small" variant="tonal" class="ml-1">{{ site.max_concurrency }} 并发</v-chip>
+                    <v-chip size="small" variant="tonal" class="ml-1">优先级 {{ site.priority }}</v-chip>
                     <v-chip
                       v-if="site.use_proxy"
                       size="small"
@@ -6221,6 +6285,7 @@ onUnmounted(() => {
           <v-text-field v-model="siteForm.base_url" label="站点地址" />
           <v-textarea v-model="siteForm.cookie" label="Cookie" rows="3" />
           <v-text-field v-model="siteForm.user_agent" label="User-Agent" />
+          <v-text-field v-model.number="siteForm.priority" label="优先级（数字越小越靠前）" type="number" min="0" />
           <v-text-field v-model.number="siteForm.max_concurrency" label="最大并发" type="number" />
           <v-switch
             v-model="siteForm.enabled"
@@ -7234,6 +7299,21 @@ button.dashboard-health-card:hover {
 .config-card {
   overflow: visible !important;
   position: relative;
+}
+
+.site-config-card {
+  cursor: grab;
+}
+
+.site-config-card-dragging {
+  cursor: grabbing;
+  opacity: 0.55;
+}
+
+.site-drag-handle {
+  color: rgb(var(--v-theme-on-surface-variant));
+  cursor: grab;
+  margin-right: 8px;
 }
 
 .config-card-title {

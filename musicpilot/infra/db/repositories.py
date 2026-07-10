@@ -1981,7 +1981,9 @@ class SqlAlchemyMediaRepository:
 
     async def list_indexer_sites(self) -> list[IndexerSite]:
         async with self.database.session() as session:
-            result = await session.execute(select(IndexerSite).order_by(IndexerSite.name))
+            result = await session.execute(
+                select(IndexerSite).order_by(IndexerSite.priority, IndexerSite.name, IndexerSite.id)
+            )
             return list(result.scalars().all())
 
     async def create_indexer_site(
@@ -1991,6 +1993,7 @@ class SqlAlchemyMediaRepository:
         base_url: str,
         cookie: str | None = None,
         user_agent: str | None = None,
+        priority: int = 100,
         max_concurrency: int = 2,
         use_proxy: bool = False,
         enabled: bool = True,
@@ -2001,6 +2004,7 @@ class SqlAlchemyMediaRepository:
                 base_url=base_url,
                 cookie=cookie,
                 user_agent=user_agent,
+                priority=priority,
                 max_concurrency=max_concurrency,
                 use_proxy=use_proxy,
                 enabled=enabled,
@@ -2018,6 +2022,7 @@ class SqlAlchemyMediaRepository:
         base_url: str,
         cookie: str | None = None,
         user_agent: str | None = None,
+        priority: int = 100,
         max_concurrency: int = 2,
         use_proxy: bool = False,
         enabled: bool = True,
@@ -2031,12 +2036,24 @@ class SqlAlchemyMediaRepository:
             site.base_url = base_url
             site.cookie = cookie
             site.user_agent = user_agent
+            site.priority = priority
             site.max_concurrency = max_concurrency
             site.use_proxy = use_proxy
             site.enabled = enabled
             await session.commit()
             await session.refresh(site)
             return site
+
+    async def reorder_indexer_sites(self, site_ids: list[str]) -> list[IndexerSite]:
+        async with self.database.session() as session:
+            result = await session.execute(select(IndexerSite))
+            sites_by_id = {site.id: site for site in result.scalars().all()}
+            if set(site_ids) != set(sites_by_id) or len(site_ids) != len(sites_by_id):
+                raise ValueError("Site order must include every configured site exactly once.")
+            for priority, site_id in enumerate(site_ids, start=1):
+                sites_by_id[site_id].priority = priority
+            await session.commit()
+            return [sites_by_id[site_id] for site_id in site_ids]
 
     async def delete_indexer_site(self, site_id: str) -> bool:
         async with self.database.session() as session:

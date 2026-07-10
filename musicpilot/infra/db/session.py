@@ -90,6 +90,7 @@ class Database:
                 {
                     "enabled": "BOOLEAN NOT NULL DEFAULT 1",
                     "use_proxy": "BOOLEAN NOT NULL DEFAULT 0",
+                    "priority": "INTEGER NOT NULL DEFAULT 100",
                 },
             )
             await _add_sqlite_columns(
