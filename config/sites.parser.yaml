@@ -50,7 +50,7 @@ sites:
         type:
           include:
             - music
-            - audio
+            - HQ / Audio
   - targets:
       - name: JPopSuki
         base_url: https://jpopsuki.eu/
