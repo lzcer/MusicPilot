@@ -32,6 +32,7 @@ Common environment variables:
 | --- | --- | --- |
 | `MP_APP_NAME` | `MusicPilot` | Application name. |
 | `MP_LOG_LEVEL` | `INFO` | Log level. |
+| `TZ` | `Asia/Shanghai` | Container time zone. Shanghai time is the default; change it for the deployment location if needed. |
 | `MP_ADMIN_USERNAME` | `admin` | Administrator login username. |
 | `MP_ADMIN_PASSWORD` | `musicpilot` | Administrator login password. Change this in production. |
 | `MP_SESSION_SECRET` | `musicpilot-dev-session-secret` | Session secret. Change this to a long random string in production. |
@@ -51,6 +52,7 @@ At minimum, change the administrator password and session secret in Docker Compo
 
 ```yaml
 environment:
+  TZ: Asia/Shanghai
   MP_ADMIN_USERNAME: admin
   MP_ADMIN_PASSWORD: change-this-password
   MP_SESSION_SECRET: change-this-random-secret
@@ -84,6 +86,7 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
+      TZ: Asia/Shanghai
       POSTGRES_DB: musicpilot
       POSTGRES_USER: musicpilot
       POSTGRES_PASSWORD: change-this-password
@@ -93,6 +96,7 @@ services:
 
   musicpilot:
     environment:
+      TZ: Asia/Shanghai
       MP_DATABASE_URL: postgresql+asyncpg://musicpilot:change-this-password@postgres:5432/musicpilot
     depends_on:
       - postgres

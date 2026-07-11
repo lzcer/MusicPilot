@@ -143,6 +143,7 @@ services:
   musicpilot:
     image: ghcr.io/lzcer/musicpilot:latest
     environment:
+      TZ: Asia/Shanghai
       MP_APP_NAME: MusicPilot
       MP_LOG_LEVEL: INFO
       MP_ADMIN_USERNAME: admin
@@ -172,6 +173,7 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
+      TZ: Asia/Shanghai
       POSTGRES_DB: musicpilot
       POSTGRES_USER: musicpilot
       POSTGRES_PASSWORD: musicpilot-change-me
@@ -273,6 +275,7 @@ volumes:
   - /volume1/music:/music
   - /volume1/downloads:/downloads
 environment:
+  TZ: Asia/Shanghai
   MP_ADMIN_USERNAME: admin
   MP_ADMIN_PASSWORD: change-this-password
   MP_SESSION_SECRET: change-this-random-secret

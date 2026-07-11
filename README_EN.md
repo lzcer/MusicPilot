@@ -138,6 +138,7 @@ volumes:
   - /volume1/music:/music
   - /volume1/downloads:/downloads
 environment:
+  TZ: Asia/Shanghai
   MP_ADMIN_USERNAME: admin
   MP_ADMIN_PASSWORD: change-this-password
   MP_SESSION_SECRET: change-this-random-secret
