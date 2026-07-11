@@ -33,6 +33,11 @@ MusicPilot 是一个面向自托管用户的音乐库自动化工具，用来把
 
 - [x] OpenCD
 - [x] HDFans
+- [x] HHClub
+- [x] JPOP
+- [x] ZMPT
+- [x] Musopia
+- [x] CarPT
 
 ## 3. 项目功能
 

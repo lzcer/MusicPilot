@@ -33,6 +33,11 @@ Site support:
 
 - [x] OpenCD
 - [x] HDFans
+- [x] HHClub
+- [x] JPOP
+- [x] ZMPT
+- [x] Musopia
+- [x] CarPT
 
 ## 3. Features
 
