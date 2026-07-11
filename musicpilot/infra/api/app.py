@@ -1283,9 +1283,17 @@ def create_app() -> FastAPI:
 
     @app.get("/api/about", response_model=AboutResponse)
     async def about() -> AboutResponse:
+        system_settings = await state.repository.get_system_settings()
+        latest_version = await _latest_github_tag(_proxy_url(system_settings))
         return AboutResponse(
             app=settings.app_name,
             version=_current_app_version(),
+            latest_version=latest_version,
+            latest_release_url=(
+                f"https://github.com/lzcer/MusicPilot/releases/tag/{quote(latest_version, safe='')}"
+                if latest_version
+                else None
+            ),
             repository_name="lzcer/MusicPilot",
             repository_url="https://github.com/lzcer/MusicPilot",
             description="用于自动化处理音乐文件的搜索、元数据刮削、整理等流程。灵感来自于MoviePilot。",
@@ -7824,6 +7832,32 @@ def _current_app_version() -> str:
         return importlib.metadata.version("musicpilot")
     except importlib.metadata.PackageNotFoundError:
         return "unknown"
+
+
+async def _latest_github_tag(proxy_url: str | None = None) -> str | None:
+    proxy_urls = (proxy_url, None) if proxy_url else (None,)
+    for request_proxy_url in proxy_urls:
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(5.0, connect=3.0),
+                proxy=request_proxy_url,
+            ) as client:
+                response = await client.get(
+                    "https://api.github.com/repos/lzcer/MusicPilot/tags",
+                    params={"per_page": 1},
+                    headers={"Accept": "application/vnd.github+json"},
+                )
+                response.raise_for_status()
+                tags = response.json()
+        except (httpx.HTTPError, ValueError):
+            continue
+
+        if not isinstance(tags, list) or not tags or not isinstance(tags[0], dict):
+            continue
+        tag_name = tags[0].get("name")
+        if tag_name:
+            return str(tag_name)
+    return None
 
 
 async def _resolve_proxy_for_site(

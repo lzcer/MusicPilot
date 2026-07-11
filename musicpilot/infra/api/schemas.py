@@ -16,6 +16,8 @@ class HealthResponse(BaseModel):
 class AboutResponse(BaseModel):
     app: str
     version: str
+    latest_version: str | None
+    latest_release_url: str | None
     repository_name: str
     repository_url: str
     description: str

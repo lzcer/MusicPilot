@@ -491,6 +491,8 @@ type SystemSettings = {
 type AboutInfo = {
   app: string
   version: string
+  latest_version: string | null
+  latest_release_url: string | null
   repository_name: string
   repository_url: string
   description: string
@@ -5769,7 +5771,19 @@ onUnmounted(() => {
                       </div>
                       <div class="about-info-row">
                         <span>系统版本号</span>
-                        <strong>{{ aboutInfo?.version || '-' }}</strong>
+                        <div class="about-version">
+                          <strong>{{ aboutInfo?.version || '-' }}</strong>
+                          <a
+                            v-if="aboutInfo?.latest_version && aboutInfo.latest_release_url"
+                            :href="aboutInfo.latest_release_url"
+                            rel="noreferrer"
+                            target="_blank"
+                          >
+                            <v-chip color="primary" size="small" variant="tonal">
+                              最新版 {{ aboutInfo.latest_version }}
+                            </v-chip>
+                          </a>
+                        </div>
                       </div>
                       <div class="about-info-row">
                         <span>GitHub</span>
@@ -5779,6 +5793,12 @@ onUnmounted(() => {
                           target="_blank"
                         >
                           {{ aboutInfo?.repository_name || 'lzcer/MusicPilot' }}
+                        </a>
+                      </div>
+                      <div class="about-info-row">
+                        <span>发布频道</span>
+                        <a href="https://t.me/musicpilot_channel" rel="noreferrer" target="_blank">
+                          @musicpilot_channel
                         </a>
                       </div>
                       <div class="about-info-row">
@@ -7996,6 +8016,13 @@ button.dashboard-health-card:hover {
 
 .about-info-row span {
   color: rgba(var(--v-theme-on-surface), 0.62);
+}
+
+.about-version {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .about-info-row a,
