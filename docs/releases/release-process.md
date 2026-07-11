@@ -38,7 +38,7 @@ git tag -a v0.1.1 -m "v0.1.1"
 git push origin v0.1.1
 ```
 
-当存在上一个 `v*` 标签时，workflow 会自动汇总上一个标签到当前标签之间的提交标题和正文，并按 `feat`、`fix`、`perf`、`refactor` 前缀分类写入 Release 内容。其他前缀不会进入自动发布说明。
+当存在上一个 `v*` 标签时，workflow 会自动汇总上一个标签到当前标签之间的提交标题和正文，并按 `feat`、`fix`、`perf`、`refactor` 前缀分类写入 Release 内容。每个分类会继续按 Conventional Commit 的 scope 分组；没有 scope 的提交归入该分类最后的“其他”分组。其他前缀不会进入自动发布说明。
 
 ## 1.4. 镜像标签
 
@@ -68,3 +68,5 @@ ghcr.io/lzcer/musicpilot:latest
 2. `TELEGRAM_CHAT_ID`：目标频道标识。公开频道可填写 `@频道用户名`；私有频道填写形如 `-1001234567890` 的频道 ID。
 
 机器人必须加入目标频道并被授予发布消息的管理员权限。两个密钥未配置时，发布仍会成功完成，workflow 仅跳过 Telegram 通知并输出提示。
+
+Telegram 通知作为独立任务在 GitHub Release 创建后执行。通知任务因网络或 Telegram API 错误失败时，镜像构建和 GitHub Release 不会重复执行；在 Actions 页面重新运行失败任务即可单独补发通知。

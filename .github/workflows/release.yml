@@ -20,6 +20,10 @@ jobs:
   publish:
     name: Build image and publish release
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      image: ${{ steps.release.outputs.image }}
+      release_url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.release.outputs.tag }}
 
     steps:
       - name: Check out repository
@@ -131,6 +135,7 @@ jobs:
               section_file="${RUNNER_TEMP}/release-${commit_type}.txt"
               entries_file="${RUNNER_TEMP}/release-${commit_type}-entries.txt"
               commit_pattern="^${commit_type}(\\([^)]+\\))?!?:[[:space:]]"
+              scope_pattern="^${commit_type}\\(([^)]+)\\)!?:"
 
               : > "${section_file}"
               : > "${entries_file}"
@@ -148,8 +153,13 @@ jobs:
 
                 title="${subject#*: }"
                 scope=""
-                if [[ "${subject}" =~ ^${commit_type}\\(([^)]+)\\)!?: ]]; then
+                if [[ "${subject}" =~ ${scope_pattern} ]]; then
                   scope="${BASH_REMATCH[1]}"
+                fi
+
+                scope_sort_group=0
+                if [[ -z "${scope}" ]]; then
+                  scope_sort_group=1
                 fi
 
                 commit_file="${RUNNER_TEMP}/release-${commit_type}-${commit_index}.md"
@@ -182,13 +192,33 @@ jobs:
                   fi
                 } > "${commit_file}"
 
-                printf '%s\x1f%s\x1f%s\n' "${scope}" "${title}" "${commit_file}" >> "${entries_file}"
+                printf '%s\x1f%s\x1f%s\x1f%s\n' "${scope_sort_group}" "${scope}" "${title}" "${commit_file}" >> "${entries_file}"
                 ((commit_index += 1))
               done < <(git log -z "${previous_tag}..${tag_sha}" --no-merges --format="%s%x1f%b%x1f%h")
 
-              while IFS=$'\x1f' read -r _ _ commit_file; do
+              current_scope=""
+              has_current_scope=0
+              scope_index=0
+
+              while IFS=$'\x1f' read -r _ scope _ commit_file; do
+                if [[ "${has_current_scope}" -eq 0 || "${scope}" != "${current_scope}" ]]; then
+                  if [[ "${has_current_scope}" -ne 0 ]]; then
+                    echo >> "${section_file}"
+                  fi
+
+                  current_scope="${scope}"
+                  has_current_scope=1
+                  ((scope_index += 1))
+
+                  if [[ -z "${scope}" ]]; then
+                    scope="其他"
+                  fi
+
+                  printf '#### %s.%s. %s\n\n' "${section_number}" "${scope_index}" "${scope}" >> "${section_file}"
+                fi
+
                 cat "${commit_file}" >> "${section_file}"
-              done < <(LC_ALL=C sort -f -t $'\x1f' -k1,1 -k2,2 "${entries_file}")
+              done < <(LC_ALL=C sort -f -t $'\x1f' -k1,1n -k2,2 -k3,3 "${entries_file}")
 
               if [[ -s "${section_file}" ]]; then
                 {
@@ -250,14 +280,20 @@ jobs:
             gh release create "${tag}" --verify-tag --title "${tag}" --notes-file "${notes_file}" "${release_flags[@]}"
           fi
 
+  notify_telegram:
+    name: Notify Telegram channel
+    needs: publish
+    runs-on: ubuntu-latest
+
+    steps:
       - name: Notify Telegram channel
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          RELEASE_IMAGE: ${{ steps.release.outputs.image }}
-          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.release.outputs.tag }}
+          RELEASE_TAG: ${{ needs.publish.outputs.tag }}
+          RELEASE_IMAGE: ${{ needs.publish.outputs.image }}
+          RELEASE_URL: ${{ needs.publish.outputs.release_url }}
         run: |
           set -euo pipefail
 
@@ -268,7 +304,7 @@ jobs:
 
           message="$(printf '<b>MusicPilot %s 已发布</b>\n\n<a href=\"%s\">查看 GitHub Release</a>\nDocker 镜像：<code>%s:%s</code>' "${RELEASE_TAG}" "${RELEASE_URL}" "${RELEASE_IMAGE}" "${RELEASE_TAG}")"
 
-          curl --fail --silent --show-error --retry 3 \
+          curl --fail --silent --show-error --retry 3 --connect-timeout 10 --max-time 30 \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "parse_mode=HTML" \
