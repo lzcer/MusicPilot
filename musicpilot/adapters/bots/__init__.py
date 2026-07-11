@@ -4,6 +4,9 @@ from musicpilot.adapters.bots.telegram import (
     TelegramDashboard,
     TelegramDownloadTask,
     TelegramHttpNotifier,
+    TelegramMusicServiceUser,
+    TelegramPlaylist,
+    TelegramPlaylistSyncSummary,
 )
 
 __all__ = [
@@ -12,4 +15,7 @@ __all__ = [
     "TelegramDashboard",
     "TelegramDownloadTask",
     "TelegramHttpNotifier",
+    "TelegramMusicServiceUser",
+    "TelegramPlaylist",
+    "TelegramPlaylistSyncSummary",
 ]

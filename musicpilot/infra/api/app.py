@@ -36,6 +36,9 @@ from musicpilot.adapters.bots import (
     TelegramDashboard,
     TelegramDownloadTask,
     TelegramHttpNotifier,
+    TelegramMusicServiceUser,
+    TelegramPlaylist,
+    TelegramPlaylistSyncSummary,
 )
 from musicpilot.adapters.downloaders import QBittorrentClient
 from musicpilot.adapters.indexers import build_nexusphp_indexers, load_merged_parser_catalog
@@ -866,6 +869,7 @@ class AppState:
         playlists = summary["playlists"]
         tasks = summary["tasks"]
         return TelegramDashboard(
+            app_version=_current_app_version(),
             library_songs=int(library["songs"]),
             library_albums=int(library["albums"]),
             library_artists=int(library["artists"]),
@@ -878,6 +882,108 @@ class AppState:
             tasks_waiting=int(tasks["waiting"]),
             tasks_running=int(tasks["running"]),
             tasks_failed=int(tasks["failed"]),
+        )
+
+    async def telegram_playlists(self) -> list[TelegramPlaylist]:
+        return [
+            TelegramPlaylist(
+                id=playlist.id,
+                name=playlist.name,
+                platform=playlist.platform,
+                track_count=playlist.track_count,
+                owner_name=playlist.owner_name,
+                description=playlist.description,
+            )
+            for playlist in await self.repository.list_playlists()
+        ]
+
+    async def preview_telegram_playlist(self, url: str) -> TelegramPlaylist:
+        system_settings = await self.repository.get_system_settings()
+        parsed = await self.public_playlist_importer.parse(
+            url,
+            proxy_url=_proxy_url(system_settings),
+        )
+        import_token = token_urlsafe(24)
+        self._prune_expired(self.playlist_import_previews, self._preview_ttl, 1800)
+        self.playlist_import_previews[import_token] = parsed
+        self._preview_ttl[import_token] = time.time()
+        return TelegramPlaylist(
+            id=None,
+            name=parsed.name,
+            platform=parsed.platform,
+            track_count=len(parsed.tracks),
+            owner_name=parsed.owner_name,
+            description=parsed.description,
+            import_token=import_token,
+        )
+
+    async def import_telegram_playlist(self, import_token: str) -> TelegramPlaylist:
+        parsed = self.playlist_import_previews.pop(import_token, None)
+        self._preview_ttl.pop(import_token, None)
+        if parsed is None:
+            raise ValueError("歌单预览已过期，请重新解析链接。")
+        playlist = await _import_public_playlist(self, parsed)
+        return TelegramPlaylist(
+            id=playlist.id,
+            name=playlist.name,
+            platform=playlist.platform,
+            track_count=playlist.track_count,
+            owner_name=playlist.owner_name,
+            description=playlist.description,
+        )
+
+    async def refresh_telegram_music_service(self) -> str:
+        server = await self.repository.default_media_server()
+        if server is None:
+            raise ValueError("未配置已启用的默认音乐服务。")
+        client = build_media_server_client(server)
+        await client.start_scan()
+        self.add_log("library", f"Media library refresh requested via Telegram: {server.name}")
+        sync_task = asyncio.create_task(
+            _sync_music_library_after_refresh(self),
+            name="musicpilot-music-library-sync-after-telegram-refresh",
+        )
+        self._background_tasks.add(sync_task)
+        sync_task.add_done_callback(self._background_tasks.discard)
+        return server.name
+
+    async def telegram_music_service_users(self) -> list[TelegramMusicServiceUser]:
+        return [
+            TelegramMusicServiceUser(
+                id=server.id,
+                name=server.name,
+                username=server.username,
+            )
+            for server in await self.repository.list_media_servers()
+            if server.enabled
+        ]
+
+    async def sync_telegram_playlists(
+        self,
+        playlist_id: int,
+        media_server_id: str,
+        public: bool,
+    ) -> TelegramPlaylistSyncSummary:
+        server = await self.repository.get_media_server(media_server_id)
+        if server is None or not server.enabled:
+            raise ValueError("音乐库用户不存在或已停用。")
+        playlist = await self.repository.get_playlist(playlist_id)
+        if playlist is None:
+            raise ValueError("歌单不存在。")
+        _library_playlist_id, synced_count, _mode = await _sync_playlist_to_media_server(
+            self,
+            playlist,
+            media_server_id=server.id,
+            public=public,
+        )
+        return TelegramPlaylistSyncSummary(
+            service_name=server.name,
+            username=server.username,
+            public=public,
+            playlists_synced=1,
+            tracks_synced=synced_count,
+            skipped_playlists=0,
+            failed_playlists=0,
         )
 
     async def reload_downloader(self) -> None:
@@ -966,6 +1072,12 @@ class AppState:
                 submit_download=self.submit_telegram_download,
                 list_active_downloads=self.telegram_active_downloads,
                 dashboard=self.telegram_dashboard,
+                list_playlists=self.telegram_playlists,
+                preview_playlist=self.preview_telegram_playlist,
+                import_playlist=self.import_telegram_playlist,
+                refresh_music_service=self.refresh_telegram_music_service,
+                list_music_service_users=self.telegram_music_service_users,
+                sync_playlists=self.sync_telegram_playlists,
             )
             for token, chat_ids in chat_ids_by_token.items()
         )

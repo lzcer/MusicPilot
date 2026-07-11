@@ -24,6 +24,14 @@ from musicpilot.infra.api.schemas import MediaCandidateResponse
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_BOT_COMMANDS = (
+    ("downloading", "查看当前下载任务"),
+    ("info", "查看 MusicPilot 概览"),
+    ("playlist", "查看或导入歌单"),
+    ("playlist_sync", "同步系统歌单到音乐库"),
+    ("musicservice_refresh", "刷新音乐服务媒体库"),
+)
+
 MediaSearch = Callable[[str, str | None], Awaitable[list[MediaCandidateResponse]]]
 TorrentSearch = Callable[[MediaCandidateResponse], Awaitable[list[SearchResult]]]
 DownloadSubmitter = Callable[[SearchResult, MediaCandidateResponse], Awaitable[None]]
@@ -38,6 +46,7 @@ class TelegramDownloadTask:
 
 @dataclass(frozen=True, slots=True)
 class TelegramDashboard:
+    app_version: str
     library_songs: int
     library_albums: int
     library_artists: int
@@ -52,8 +61,43 @@ class TelegramDashboard:
     tasks_failed: int
 
 
+@dataclass(frozen=True, slots=True)
+class TelegramPlaylist:
+    id: int | None
+    name: str
+    platform: str
+    track_count: int
+    owner_name: str | None = None
+    description: str | None = None
+    import_token: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramMusicServiceUser:
+    id: str
+    name: str
+    username: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramPlaylistSyncSummary:
+    service_name: str
+    username: str
+    public: bool
+    playlists_synced: int
+    tracks_synced: int
+    skipped_playlists: int
+    failed_playlists: int
+
+
 ActiveDownloads = Callable[[], Awaitable[list[TelegramDownloadTask]]]
 DashboardProvider = Callable[[], Awaitable[TelegramDashboard]]
+PlaylistProvider = Callable[[], Awaitable[list[TelegramPlaylist]]]
+PlaylistPreviewer = Callable[[str], Awaitable[TelegramPlaylist]]
+PlaylistImporter = Callable[[str], Awaitable[TelegramPlaylist]]
+MusicServiceRefresher = Callable[[], Awaitable[str]]
+MusicServiceUsersProvider = Callable[[], Awaitable[list[TelegramMusicServiceUser]]]
+PlaylistSynchronizer = Callable[[int, str, bool], Awaitable[TelegramPlaylistSyncSummary]]
 T = TypeVar("T")
 
 
@@ -106,6 +150,12 @@ class TelegramBotAdapter:
         submit_download: DownloadSubmitter,
         list_active_downloads: ActiveDownloads,
         dashboard: DashboardProvider,
+        list_playlists: PlaylistProvider,
+        preview_playlist: PlaylistPreviewer,
+        import_playlist: PlaylistImporter,
+        refresh_music_service: MusicServiceRefresher,
+        list_music_service_users: MusicServiceUsersProvider,
+        sync_playlists: PlaylistSynchronizer,
     ) -> None:
         self.token = token
         self.chat_ids = chat_ids
@@ -115,6 +165,12 @@ class TelegramBotAdapter:
         self.submit_download = submit_download
         self.list_active_downloads = list_active_downloads
         self.dashboard = dashboard
+        self.list_playlists = list_playlists
+        self.preview_playlist = preview_playlist
+        self.import_playlist = import_playlist
+        self.refresh_music_service = refresh_music_service
+        self.list_music_service_users = list_music_service_users
+        self.sync_playlists = sync_playlists
         self._bot: Any = None
         self._dispatcher: Any = None
         self._task: asyncio.Task[None] | None = None
@@ -128,10 +184,11 @@ class TelegramBotAdapter:
     async def start(self) -> None:
         from aiogram import Bot, Dispatcher, F
         from aiogram.filters import Command
-        from aiogram.types import CallbackQuery, Message
+        from aiogram.types import BotCommand, CallbackQuery, Message
 
         self._bot = Bot(self.token, session=TelegramAiohttpSession(self.proxy))
         self._dispatcher = Dispatcher()
+        await self._sync_commands(BotCommand)
 
         async def handle_text(message: Message) -> None:
             if not message.text:
@@ -207,11 +264,44 @@ class TelegramBotAdapter:
                     ),
                 )
             )
-            await message.answer(text, parse_mode="HTML")
+            await message.answer(
+                f"{text}\n\n系统版本：{escape(info.app_version)}",
+                parse_mode="HTML",
+            )
             logger.info(
                 "Telegram command completed: chat=%s, command=info",
                 _chat_log_label(message),
             )
+
+        async def handle_playlist(message: Message) -> None:
+            arguments = (message.text or "").partition(" ")[2].strip()
+            if not arguments:
+                await self._list_playlists(message)
+                return
+            await self._preview_playlist(message, arguments)
+
+        async def handle_musicservice_refresh(message: Message) -> None:
+            logger.info(
+                "Telegram command received: chat=%s, command=musicservice_refresh",
+                _chat_log_label(message),
+            )
+            await message.answer("正在请求音乐服务扫描…")
+            try:
+                server_name = await self.refresh_music_service()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Telegram music service refresh failed")
+                await message.answer(
+                    f"音乐服务扫描请求失败：{escape(_error_text(exc))}",
+                    parse_mode="HTML",
+                )
+                return
+            await message.answer(
+                f"已请求 <b>{escape(_short(server_name, 120))}</b> 扫描音乐媒体库。",
+                parse_mode="HTML",
+            )
+
+        async def handle_playlist_sync(message: Message) -> None:
+            await self._show_playlist_sync_playlists(message)
 
         async def handle_callback(callback: CallbackQuery) -> None:
             data = callback.data or ""
@@ -219,6 +309,43 @@ class TelegramBotAdapter:
             if len(parts) != 4 or parts[0] != "tg":
                 return
             message = callback.message
+            if parts[1] == "p":
+                if message is None or not hasattr(message, "message_id"):
+                    await callback.answer("该操作已失效。", show_alert=True)
+                    return
+                await callback.answer()
+                await self._import_playlist(message, parts[2])
+                return
+            if parts[1] == "u":
+                if message is None or not hasattr(message, "message_id"):
+                    await callback.answer("该操作已失效。", show_alert=True)
+                    return
+                await callback.answer()
+                await self._show_playlist_sync_visibility(message, parts[2], parts[3])
+                return
+            if parts[1] == "v":
+                if message is None or not hasattr(message, "message_id"):
+                    await callback.answer("该操作已失效。", show_alert=True)
+                    return
+                await callback.answer()
+                user_id, separator, playlist_id_text = parts[2].partition("|")
+                if not separator or not playlist_id_text.isdigit():
+                    await message.edit_text("无效的歌单选择。", reply_markup=None)
+                    return
+                await self._sync_playlists(
+                    message,
+                    int(playlist_id_text),
+                    user_id,
+                    parts[3] == "1",
+                )
+                return
+            if parts[1] == "l":
+                if message is None or not hasattr(message, "message_id"):
+                    await callback.answer("该操作已失效。", show_alert=True)
+                    return
+                await callback.answer()
+                await self._show_playlist_sync_users(message, parts[2])
+                return
             if message is None or not hasattr(message, "message_id"):
                 await callback.answer("该操作已失效。", show_alert=True)
                 return
@@ -253,11 +380,227 @@ class TelegramBotAdapter:
 
         self._dispatcher.message.register(handle_downloading, Command("downloading"))
         self._dispatcher.message.register(handle_info, Command("info"))
+        self._dispatcher.message.register(handle_playlist, Command("playlist"))
+        self._dispatcher.message.register(
+            handle_musicservice_refresh,
+            Command("musicservice_refresh"),
+        )
+        self._dispatcher.message.register(handle_playlist_sync, Command("playlist_sync"))
         self._dispatcher.callback_query.register(handle_callback, F.data.startswith("tg:"))
         self._dispatcher.message.register(handle_text, F.text)
         self._task = asyncio.create_task(
             self._run_polling(),
             name="musicpilot-telegram-bot",
+        )
+
+    async def _sync_commands(self, bot_command_type: type[Any]) -> None:
+        if self._bot is None:
+            return
+        try:
+            await self._bot.set_my_commands(
+                [
+                    bot_command_type(command=name, description=description)
+                    for name, description in TELEGRAM_BOT_COMMANDS
+                ]
+            )
+            logger.info(
+                "Telegram command menu synchronized: commands=%d",
+                len(TELEGRAM_BOT_COMMANDS),
+            )
+        except Exception:
+            logger.exception("Unable to synchronize Telegram command menu")
+
+    async def _list_playlists(self, message: Any) -> None:
+        logger.info(
+            "Telegram command received: chat=%s, command=playlist",
+            _chat_log_label(message),
+        )
+        playlists = await self.list_playlists()
+        if not playlists:
+            await message.answer("<b>系统歌单</b>\n暂无已导入歌单。", parse_mode="HTML")
+            return
+        lines = [f"<b>系统歌单（{len(playlists)}）</b>"]
+        for index, playlist in enumerate(playlists, start=1):
+            owner = f" · {escape(_short(playlist.owner_name, 80))}" if playlist.owner_name else ""
+            lines.append(
+                f"\n{index}. <b>{escape(_short(playlist.name, 180))}</b>\n"
+                f"{escape(playlist.platform)}{owner} · {playlist.track_count} 首"
+            )
+        await message.answer(_short("\n".join(lines), 4000), parse_mode="HTML")
+
+    async def _preview_playlist(self, message: Any, url: str) -> None:
+        await message.answer("正在解析歌单链接…")
+        try:
+            playlist = await self.preview_playlist(url)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Telegram playlist parsing failed")
+            await message.answer(f"歌单解析失败：{escape(_error_text(exc))}", parse_mode="HTML")
+            return
+        if not playlist.import_token:
+            await message.answer("歌单解析失败：未生成导入凭据。")
+            return
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        lines = [
+            "<b>歌单解析结果</b>",
+            f"名称：<b>{escape(_short(playlist.name, 240))}</b>",
+            f"平台：{escape(playlist.platform)}",
+            f"曲目：{playlist.track_count} 首",
+        ]
+        if playlist.owner_name:
+            lines.append(f"创建者：{escape(_short(playlist.owner_name, 120))}")
+        if playlist.description:
+            lines.append(f"简介：{escape(_short(playlist.description, 500))}")
+        await message.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="导入",
+                            callback_data=f"tg:p:{playlist.import_token}:0",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+    async def _import_playlist(self, message: Any, import_token: str) -> None:
+        await message.edit_text("正在导入歌单…", reply_markup=None)
+        try:
+            playlist = await self.import_playlist(import_token)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Telegram playlist import failed")
+            await message.edit_text(
+                f"歌单导入失败：{escape(_error_text(exc))}",
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+            return
+        await message.edit_text(
+            "<b>歌单已导入</b>\n"
+            f"名称：<b>{escape(_short(playlist.name, 240))}</b>\n"
+            f"平台：{escape(playlist.platform)} · 曲目：{playlist.track_count} 首",
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+
+    async def _show_playlist_sync_playlists(self, message: Any) -> None:
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        playlists = await self.list_playlists()
+        selectable = [playlist for playlist in playlists if playlist.id is not None]
+        if not selectable:
+            await message.answer("暂无可同步的系统歌单。")
+            return
+        lines = [f"<b>系统歌单（{len(selectable)}）</b>", "请选择要同步的歌单："]
+        buttons = []
+        for index, playlist in enumerate(selectable, start=1):
+            lines.append(f"{index}. {escape(_short(playlist.name, 180))}")
+            buttons.append(
+                InlineKeyboardButton(
+                    text=str(index),
+                    callback_data=f"tg:l:{playlist.id}:0",
+                )
+            )
+        rows = [buttons[index : index + 5] for index in range(0, len(buttons), 5)]
+        await message.answer(
+            _short("\n".join(lines), 4000),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    async def _show_playlist_sync_users(self, message: Any, playlist_id: str) -> None:
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        if not playlist_id.isdigit():
+            await message.edit_text("无效的歌单选择。", reply_markup=None)
+            return
+        users = await self.list_music_service_users()
+        if not users:
+            await message.edit_text("未配置已启用的音乐库用户。", reply_markup=None)
+            return
+        rows = []
+        for user in users:
+            label = _short(f"同步到 {user.name}（{user.username or '-'}）", 60)
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=label,
+                        callback_data=f"tg:u:{user.id}:{playlist_id}",
+                    )
+                ]
+            )
+        await message.edit_text(
+            "<b>同步歌单</b>\n请选择音乐库用户：",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    async def _show_playlist_sync_visibility(
+        self,
+        message: Any,
+        user_id: str,
+        playlist_id: str,
+    ) -> None:
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        users = await self.list_music_service_users()
+        user = next((item for item in users if item.id == user_id), None)
+        if user is None or not playlist_id.isdigit():
+            await message.edit_text("音乐库用户不存在或已停用。", reply_markup=None)
+            return
+        await message.edit_text(
+            "<b>同步系统歌单</b>\n"
+            f"目标：{escape(_short(user.name, 120))}"
+            f"（{escape(_short(user.username or '-', 80))}）\n"
+            "请选择同步歌单的可见性：",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="公开",
+                            callback_data=f"tg:v:{user.id}|{playlist_id}:1",
+                        ),
+                        InlineKeyboardButton(
+                            text="私有",
+                            callback_data=f"tg:v:{user.id}|{playlist_id}:0",
+                        ),
+                    ]
+                ]
+            ),
+        )
+
+    async def _sync_playlists(
+        self,
+        message: Any,
+        playlist_id: int,
+        user_id: str,
+        public: bool,
+    ) -> None:
+        visibility = "公开" if public else "私有"
+        await message.edit_text(f"正在将系统歌单同步为{visibility}歌单…", reply_markup=None)
+        try:
+            summary = await self.sync_playlists(playlist_id, user_id, public)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Telegram playlist synchronization failed")
+            await message.edit_text(
+                f"歌单同步失败：{escape(_error_text(exc))}",
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+            return
+        await message.edit_text(
+            "<b>歌单同步完成</b>\n"
+            f"目标：{escape(_short(summary.service_name, 120))}"
+            f"（{escape(_short(summary.username or '-', 80))}）\n"
+            f"可见性：{'公开' if summary.public else '私有'}\n"
+            f"已同步：{summary.playlists_synced} 个歌单，{summary.tracks_synced} 首歌曲\n"
+            f"跳过：{summary.skipped_playlists} 个，失败：{summary.failed_playlists} 个",
+            parse_mode="HTML",
+            reply_markup=None,
         )
 
     async def stop(self) -> None:
