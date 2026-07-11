@@ -1617,7 +1617,7 @@ function subscribeMetadataSiteSearch() {
     metadataSearchStream?.close()
     metadataSearchStream = undefined
     if (!searchResults.value.length && (payload.raw_count ?? 0) > 0) {
-      notify('艺人过滤后没有匹配资源', 'warning')
+      notify('未找到资源', 'warning')
     }
   })
 
@@ -4339,7 +4339,7 @@ onUnmounted(() => {
                 <v-progress-circular indeterminate size="16" width="2" />
                 搜索媒体信息
               </v-chip>
-              <div v-if="torrentSearchLoading || searchStats.raw_count" class="torrent-status-panel">
+              <div v-if="torrentSearchLoading || hasSearchedTorrents" class="torrent-status-panel">
                 <div class="torrent-status-counts">
                   <v-progress-circular
                     v-if="torrentSearchLoading"
@@ -4347,8 +4347,8 @@ onUnmounted(() => {
                     size="16"
                     width="2"
                   />
-                  <span>结果 {{ searchStats.raw_count }}</span>
-                  <span>过滤 {{ searchStats.filtered_count }}</span>
+                  <span>原始 {{ searchStats.raw_count }}</span>
+                  <span>过滤后 {{ searchStats.filtered_count }}</span>
                 </div>
                 <div v-if="torrentSearchLoading" class="torrent-status-condition">
                   {{ torrentSearchConditionText }}

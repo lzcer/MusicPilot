@@ -5481,6 +5481,7 @@ async def _run_metadata_site_search_for_indexer(
 ) -> None:
     site_name = str(getattr(indexer, "name", "unknown"))
     try:
+        exclude = await _get_exclude_keywords(state)
         minimum_seeders = await _get_minimum_seeders(state)
         keywords = task.keywords
         if not keywords:
@@ -5499,12 +5500,15 @@ async def _run_metadata_site_search_for_indexer(
         errors: list[str] = []
 
         async def publish_site_progress() -> None:
-            merged = _filter_by_minimum_seeders(_dedupe_results(raw_results), minimum_seeders)
+            merged = _filter_by_minimum_seeders(
+                _filter_by_exclude_keywords(_dedupe_results(raw_results), exclude),
+                minimum_seeders,
+            )
             filtered = await _filter_by_artist_with_aliases(state, merged, task.media.artist)
             ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[:limit]
             await task.site_progress(
                 site=site_name,
-                raw_count=len(merged),
+                raw_count=len(raw_results),
                 filtered_count=len(filtered),
                 results=[_search_result_response(item) for item in ranked],
                 errors=errors,
@@ -5526,12 +5530,15 @@ async def _run_metadata_site_search_for_indexer(
                         await task.keyword_finished(keyword)
 
         await asyncio.gather(*(search_keyword(keyword) for keyword in keywords))
-        merged = _filter_by_minimum_seeders(_dedupe_results(raw_results), minimum_seeders)
+        merged = _filter_by_minimum_seeders(
+            _filter_by_exclude_keywords(_dedupe_results(raw_results), exclude),
+            minimum_seeders,
+        )
         filtered = await _filter_by_artist_with_aliases(state, merged, task.media.artist)
         ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[:limit]
         await task.site_done(
             site=site_name,
-            raw_count=len(merged),
+            raw_count=len(raw_results),
             filtered_count=len(filtered),
             results=[_search_result_response(item) for item in ranked],
             errors=errors,

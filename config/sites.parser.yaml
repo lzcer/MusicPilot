@@ -6,6 +6,10 @@ sites:
         base_url: https://hdfans.org/
       - name: CarPT
         base_url: https://carpt.net/
+      - name: ZMPT
+        base_url: https://zmpt.cc/
+      - name: Musopia
+        base_url: https://www.musopia.vip/
     parser:
       list_selector: "table.torrents tr:has(a[href*='details.php']):has(a[href*='download.php'])"
       fields:
@@ -46,6 +50,7 @@ sites:
         type:
           include:
             - music
+            - audio
   - targets:
       - name: JPopSuki
         base_url: https://jpopsuki.eu/
