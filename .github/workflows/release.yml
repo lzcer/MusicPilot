@@ -231,3 +231,28 @@ jobs:
           else
             gh release create "${tag}" --verify-tag --title "${tag}" --notes-file "${notes_file}" "${release_flags[@]}"
           fi
+
+      - name: Notify Telegram channel
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_IMAGE: ${{ steps.release.outputs.image }}
+          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TELEGRAM_BOT_TOKEN}" || -z "${TELEGRAM_CHAT_ID}" ]]; then
+            echo "::notice::Telegram notification skipped because TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured."
+            exit 0
+          fi
+
+          message="$(printf '<b>MusicPilot %s 已发布</b>\n\n<a href=\"%s\">查看 GitHub Release</a>\nDocker 镜像：<code>%s:%s</code>' "${RELEASE_TAG}" "${RELEASE_URL}" "${RELEASE_IMAGE}" "${RELEASE_TAG}")"
+
+          curl --fail --silent --show-error --retry 3 \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "disable_web_page_preview=true" \
+            --data-urlencode "text=${message}"

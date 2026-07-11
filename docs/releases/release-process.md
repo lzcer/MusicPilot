@@ -57,3 +57,14 @@ ghcr.io/lzcer/musicpilot:latest
 ## 1.5. GHCR 可见性
 
 首次推送 GHCR 包后，如果镜像需要公开访问，需要在 GitHub Packages 页面确认包的可见性为 public。构建、推送和 Release 创建本身由 workflow 自动完成。
+
+## 1.6. Telegram 频道通知
+
+发布成功并创建 GitHub Release 后，workflow 会向 Telegram 频道发送包含版本号、Release 链接和 Docker 镜像标签的通知。
+
+在仓库的 `Settings` → `Secrets and variables` → `Actions` 中新增以下 Repository secrets：
+
+1. `TELEGRAM_BOT_TOKEN`：BotFather 创建或管理机器人时提供的 Bot Token。
+2. `TELEGRAM_CHAT_ID`：目标频道标识。公开频道可填写 `@频道用户名`；私有频道填写形如 `-1001234567890` 的频道 ID。
+
+机器人必须加入目标频道并被授予发布消息的管理员权限。两个密钥未配置时，发布仍会成功完成，workflow 仅跳过 Telegram 通知并输出提示。
