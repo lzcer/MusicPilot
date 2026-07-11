@@ -40,7 +40,7 @@ from musicpilot.adapters.bots import (
     TelegramPlaylist,
     TelegramPlaylistSyncSummary,
 )
-from musicpilot.adapters.downloaders import QBittorrentClient
+from musicpilot.adapters.downloaders import QBittorrentClient, TransmissionClient
 from musicpilot.adapters.indexers import build_nexusphp_indexers, load_merged_parser_catalog
 from musicpilot.adapters.indexers.nexusphp import (
     NexusPHPCrawler,
@@ -209,7 +209,7 @@ from musicpilot.infra.db.models import (
     TorrentRecordItem,
 )
 from musicpilot.infra.scheduler import SubscriptionScheduler
-from musicpilot.ports.downloader import DownloadStatus
+from musicpilot.ports.downloader import Downloader, DownloadStatus
 from musicpilot.ports.metadata import MediaCandidate, TrackMetadata
 
 _OPENCC_T2S = OpenCC("t2s")
@@ -678,7 +678,7 @@ class AppState:
             interval_minutes=settings.subscription_check_interval_minutes,
             enabled=settings.subscriptions_enabled,
         )
-        self.downloader: QBittorrentClient | None = None
+        self.downloader: Downloader | None = None
         self.metadata = MetadataCascade(
             [
                 MultiSourceMusicProvider(source_gate=self.run_metadata_source),
@@ -1026,10 +1026,15 @@ class AppState:
             await bot.stop()
         self._bots_started = False
 
-    async def _build_downloader(self) -> QBittorrentClient | None:
+    async def _build_downloader(self) -> Downloader | None:
         configured = await self.repository.default_downloader()
         if configured is not None:
-            return QBittorrentClient(
+            client_type = (
+                TransmissionClient
+                if configured.type == "transmission"
+                else QBittorrentClient
+            )
+            return client_type(
                 configured.base_url,
                 username=configured.username,
                 password=configured.password,
@@ -1698,7 +1703,7 @@ def create_app() -> FastAPI:
     @app.post("/api/settings/downloaders", response_model=DownloaderResponse, status_code=201)
     async def create_downloader(payload: DownloaderCreateRequest) -> DownloaderResponse:
         _validate_downloader_paths(payload)
-        if not payload.password:
+        if payload.type == "qbittorrent" and not payload.password:
             raise HTTPException(status_code=422, detail="Password is required.")
         downloader = await state.repository.upsert_downloader(payload=_downloader_payload(payload))
         await state.reload_downloader()
@@ -1735,9 +1740,10 @@ def create_app() -> FastAPI:
         if not password and payload.id:
             existing = await state.repository.get_downloader(payload.id)
             password = existing.password if existing else ""
-        if not password:
+        if payload.type == "qbittorrent" and not password:
             return TestResponse(ok=False, message="下载器密码不能为空。")
-        client = QBittorrentClient(
+        client_type = TransmissionClient if payload.type == "transmission" else QBittorrentClient
+        client = client_type(
             payload.base_url,
             username=payload.username,
             password=password,
@@ -1749,7 +1755,7 @@ def create_app() -> FastAPI:
             return TestResponse(ok=False, message=f"下载器连接失败：{exc}")
         finally:
             await client.close()
-        return TestResponse(ok=True, message="qBittorrent 登录成功")
+        return TestResponse(ok=True, message=f"{payload.name} 连接成功")
 
     @app.get("/api/settings/system", response_model=SystemSettingsResponse)
     async def system_settings() -> SystemSettingsResponse:

@@ -3187,6 +3187,11 @@ function openNewDownloaderDialog() {
   downloaderDialog.value = true
 }
 
+function selectDownloaderType(type: string) {
+  downloaderForm.value.name = type === 'transmission' ? 'Transmission' : 'qBittorrent'
+  downloaderForm.value.listen_mode = 'polling'
+}
+
 function editDownloader(downloader: DownloaderConfig) {
   editingDownloaderId.value = downloader.id ?? null
   downloaderForm.value = {
@@ -3232,7 +3237,7 @@ async function saveDownloader() {
     return
   }
   const editing = Boolean(editingDownloaderId.value)
-  const downloader = await api<DownloaderConfig>(
+  await api<DownloaderConfig>(
     editing
       ? `/api/settings/downloaders/${editingDownloaderId.value}`
       : '/api/settings/downloaders',
@@ -3241,13 +3246,7 @@ async function saveDownloader() {
       body: JSON.stringify(downloaderForm.value)
     }
   )
-  if (editing) {
-    downloaders.value = downloaders.value.map((item) =>
-      item.id === downloader.id ? downloader : item
-    )
-  } else {
-    downloaders.value.push(downloader)
-  }
+  await loadDownloaders()
   downloaderDialog.value = false
   notify('下载器已保存')
 }
@@ -6358,7 +6357,15 @@ onUnmounted(() => {
     <v-dialog v-model="downloaderDialog" max-width="560">
       <v-card :title="editingDownloaderId ? '编辑下载器' : '新增下载器'">
         <v-card-text class="dialog-stack">
-          <v-select v-model="downloaderForm.type" :items="['qbittorrent']" label="类型" />
+          <v-select
+            v-model="downloaderForm.type"
+            :items="[
+              { title: 'qBittorrent', value: 'qbittorrent' },
+              { title: 'Transmission', value: 'transmission' }
+            ]"
+            label="类型"
+            @update:model-value="selectDownloaderType"
+          />
           <v-text-field v-model="downloaderForm.name" label="名称" />
           <v-text-field v-model="downloaderForm.base_url" label="地址" />
           <v-text-field v-model="downloaderForm.username" label="用户名" />
@@ -6382,10 +6389,12 @@ onUnmounted(() => {
           />
           <v-select
             v-model="downloaderForm.listen_mode"
-            :items="[
-              { title: '轮询', value: 'polling' },
-              { title: 'qB 回调（预留）', value: 'qb_callback' }
-            ]"
+            :items="downloaderForm.type === 'qbittorrent'
+              ? [
+                  { title: '轮询', value: 'polling' },
+                  { title: 'qB 回调（预留）', value: 'qb_callback' }
+                ]
+              : [{ title: '轮询', value: 'polling' }]"
             label="监听模式"
           />
           <v-switch v-model="downloaderForm.is_default" color="primary" label="设为默认" hide-details />

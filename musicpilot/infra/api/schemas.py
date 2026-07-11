@@ -412,9 +412,9 @@ class SitePriorityUpdateRequest(BaseModel):
 class DownloaderCreateRequest(BaseModel):
     id: str | None = None
     name: str = Field(default="qBittorrent", min_length=1, max_length=128)
-    type: str = Field(default="qbittorrent", pattern="^qbittorrent$")
+    type: str = Field(default="qbittorrent", pattern="^(qbittorrent|transmission)$")
     base_url: str = Field(min_length=1)
-    username: str = Field(min_length=1)
+    username: str = ""
     password: str = ""
     download_path: str = Field(min_length=1)
     local_path: str = Field(min_length=1)

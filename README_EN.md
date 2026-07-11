@@ -28,6 +28,7 @@ Media library support:
 Downloader support:
 
 - [x] qBittorrent
+- [x] Transmission
 
 Site support:
 

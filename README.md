@@ -28,6 +28,7 @@ MusicPilot 是一个面向自托管用户的音乐库自动化工具，用来把
 下载器支持：
 
 - [x] qBittorrent
+- [x] Transmission
 
 站点支持：
 
