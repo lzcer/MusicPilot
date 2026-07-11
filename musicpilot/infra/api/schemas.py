@@ -653,6 +653,7 @@ class ScrapingSettings(BaseModel):
 
 class SearchSettings(BaseModel):
     exclude_keywords: str = DEFAULT_SEARCH_EXCLUDE_KEYWORDS
+    minimum_seeders: int = Field(default=1, ge=0)
     metadata_concurrency: int = Field(default=3, ge=1, le=20)
 
 

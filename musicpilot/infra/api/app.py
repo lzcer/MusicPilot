@@ -795,6 +795,7 @@ class AppState:
     ) -> list[SearchResult]:
         keywords = _metadata_search_keywords(media)
         exclude = await _get_exclude_keywords(self)
+        minimum_seeders = await _get_minimum_seeders(self)
         results: list[SearchResult] = []
         indexer: object
         for indexer in self.indexers:
@@ -805,7 +806,9 @@ class AppState:
                     self.add_log("search", f"Telegram torrent search failed: {exc}", "WARNING")
                     continue
                 results.extend(found)
-        merged = _filter_by_exclude_keywords(_dedupe_results(results), exclude)
+        merged = _filter_by_minimum_seeders(
+            _filter_by_exclude_keywords(_dedupe_results(results), exclude), minimum_seeders
+        )
         filtered = await _filter_by_artist_with_aliases(self, merged, media.artist)
         ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)
         self.add_log(
@@ -1262,7 +1265,10 @@ def create_app() -> FastAPI:
         state.add_log("search", f"Search started: {payload.query}")
         results = await state.pipeline.search(SearchEvent(payload.query, limit=payload.limit))
         exclude = await _get_exclude_keywords(state)
-        results = _filter_by_exclude_keywords(results, exclude)
+        minimum_seeders = await _get_minimum_seeders(state)
+        results = _filter_by_minimum_seeders(
+            _filter_by_exclude_keywords(results, exclude), minimum_seeders
+        )
         state.add_log("search", f"Search completed: {payload.query}, {len(results)} result(s)")
         return SearchResponse(
             query=payload.query,
@@ -1317,6 +1323,7 @@ def create_app() -> FastAPI:
         ]
         keywords = _metadata_search_keywords(payload.media)
         exclude = await _get_exclude_keywords(state)
+        minimum_seeders = await _get_minimum_seeders(state)
         for indexer in indexers:
             raw_results: list[SearchResult] = []
             for keyword in keywords:
@@ -1326,7 +1333,10 @@ def create_app() -> FastAPI:
                     state.add_log("search", f"Metadata site search failed: {exc}", "ERROR")
                     continue
                 raw_results.extend(results)
-            merged = _filter_by_exclude_keywords(_dedupe_results(raw_results), exclude)
+            merged = _filter_by_minimum_seeders(
+                _filter_by_exclude_keywords(_dedupe_results(raw_results), exclude),
+                minimum_seeders,
+            )
             filtered = await _filter_by_artist_with_aliases(state, merged, payload.media.artist)
             if filtered:
                 ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[
@@ -3777,6 +3787,7 @@ async def _iter_metadata_download_results_by_site(
     if not keywords:
         return
     exclude = await _get_exclude_keywords(state)
+    minimum_seeders = await _get_minimum_seeders(state)
     for indexer in state.indexers:
         site_name = str(getattr(indexer, "name", "unknown"))
         try:
@@ -3788,7 +3799,9 @@ async def _iter_metadata_download_results_by_site(
                 "playlist", f"Playlist track search failed: {site_name}: {exc}", "WARNING"
             )
             continue
-        deduped = _filter_by_exclude_keywords(_dedupe_results(results), exclude)
+        deduped = _filter_by_minimum_seeders(
+            _filter_by_exclude_keywords(_dedupe_results(results), exclude), minimum_seeders
+        )
         filtered = await _filter_by_artist_with_aliases(state, deduped, media.artist)
         ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)
         state.add_log(
@@ -5348,6 +5361,7 @@ async def _run_metadata_site_search_for_indexer(
 ) -> None:
     site_name = str(getattr(indexer, "name", "unknown"))
     try:
+        minimum_seeders = await _get_minimum_seeders(state)
         keywords = task.keywords
         if not keywords:
             await task.site_done(
@@ -5365,7 +5379,7 @@ async def _run_metadata_site_search_for_indexer(
         errors: list[str] = []
 
         async def publish_site_progress() -> None:
-            merged = _dedupe_results(raw_results)
+            merged = _filter_by_minimum_seeders(_dedupe_results(raw_results), minimum_seeders)
             filtered = await _filter_by_artist_with_aliases(state, merged, task.media.artist)
             ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[:limit]
             await task.site_progress(
@@ -5392,7 +5406,7 @@ async def _run_metadata_site_search_for_indexer(
                         await task.keyword_finished(keyword)
 
         await asyncio.gather(*(search_keyword(keyword) for keyword in keywords))
-        merged = _dedupe_results(raw_results)
+        merged = _filter_by_minimum_seeders(_dedupe_results(raw_results), minimum_seeders)
         filtered = await _filter_by_artist_with_aliases(state, merged, task.media.artist)
         ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[:limit]
         await task.site_done(
@@ -5724,10 +5738,23 @@ def _filter_by_exclude_keywords(
     ]
 
 
+def _filter_by_minimum_seeders(
+    results: list[SearchResult] | tuple[SearchResult, ...],
+    minimum_seeders: int,
+) -> list[SearchResult]:
+    return [result for result in results if result.seeders >= minimum_seeders]
+
+
 async def _get_exclude_keywords(state: AppState) -> str:
     settings = await state.repository.get_system_settings()
     search_settings = settings.get("search") or {}
     return str(search_settings.get("exclude_keywords") or "")
+
+
+async def _get_minimum_seeders(state: AppState) -> int:
+    settings = await state.repository.get_system_settings()
+    search_settings = settings.get("search") or {}
+    return max(0, _optional_int(search_settings.get("minimum_seeders")) or 0)
 
 
 def _metadata_search_keywords(media: MediaCandidateResponse) -> list[str]:

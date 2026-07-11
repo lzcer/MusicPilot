@@ -155,6 +155,7 @@ Duplicate handling behavior:
 | Field | Description |
 | --- | --- |
 | Exclude keywords | Separate multiple keywords with `|`. Site search results whose titles match any keyword will be filtered out. |
+| Minimum seeders | Shows only torrents with at least this many seeders. Defaults to `1` to avoid dead torrents; set to `0` to disable this filter. |
 | Metadata search concurrency | Limits how many metadata source search tasks can run at the same time. The default is `3`; reduce it to `1` or `2` if rate limits occur. |
 
 ## 2.2. Site Configuration

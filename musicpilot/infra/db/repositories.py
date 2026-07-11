@@ -41,6 +41,7 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "proxy": {},
     "search": {
         "exclude_keywords": DEFAULT_SEARCH_EXCLUDE_KEYWORDS,
+        "minimum_seeders": 1,
         "metadata_concurrency": 3,
     },
 }

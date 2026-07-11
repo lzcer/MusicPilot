@@ -483,6 +483,7 @@ type SystemSettings = {
   }
   search: {
     exclude_keywords: string
+    minimum_seeders: number
     metadata_concurrency: number
   }
 }
@@ -845,6 +846,7 @@ const systemForm = ref<SystemSettings>({
   },
   search: {
     exclude_keywords: '整轨|整軌|WAV|wav',
+    minimum_seeders: 1,
     metadata_concurrency: 3
   }
 })
@@ -3613,6 +3615,12 @@ async function saveSystemSettings() {
       20,
       3
     )
+    systemForm.value.search.minimum_seeders = clampInteger(
+      systemForm.value.search.minimum_seeders,
+      0,
+      Number.MAX_SAFE_INTEGER,
+      1
+    )
     systemForm.value = await api<SystemSettings>('/api/settings/system', {
       method: 'POST',
       body: JSON.stringify(systemForm.value)
@@ -5698,6 +5706,14 @@ onUnmounted(() => {
                         persistent-hint
                         auto-grow
                         rows="2"
+                      />
+                      <v-text-field
+                        v-model.number="systemForm.search.minimum_seeders"
+                        label="最少做种人数"
+                        type="number"
+                        min="0"
+                        hint="仅显示做种人数不少于此值的种子。设为 0 可关闭筛选；默认 1。"
+                        persistent-hint
                       />
                       <v-text-field
                         v-model.number="systemForm.search.metadata_concurrency"
