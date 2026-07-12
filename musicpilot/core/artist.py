@@ -23,13 +23,6 @@ logger = logging.getLogger(__name__)
 _t2s = OpenCC("t2s")  # Traditional -> Simplified
 _s2t = OpenCC("s2t")  # Simplified -> Traditional
 
-_KNOWN_ARTIST_ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
-    ("JJ Lin", "林俊杰", "林俊傑", "Lin Jun Jie"),
-    ("Aska Yang", "杨宗纬", "楊宗緯"),
-    ("Hu Xia", "胡夏"),
-)
-
-
 @dataclass(frozen=True, slots=True)
 class ArtistInfo:
     id: int
@@ -94,16 +87,6 @@ def split_artist_credit(value: str | None) -> list[str]:
     return names
 
 
-def _known_artist_aliases(name: str | None) -> tuple[str, ...]:
-    normalized = normalize_artist_name(name)
-    if not normalized:
-        return ()
-    for group in _KNOWN_ARTIST_ALIAS_GROUPS:
-        if any(normalize_artist_name(alias) == normalized for alias in group):
-            return group
-    return ()
-
-
 def _unique_artist_names(values: tuple[str, ...]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -120,8 +103,16 @@ def _unique_artist_names(values: tuple[str, ...]) -> list[str]:
 class ArtistService:
     """Service for managing artist names, aliases, and canonical names."""
 
-    def __init__(self, repository: Any) -> None:
+    def __init__(
+        self,
+        repository: Any,
+        musicbrainz_user_agent: str = "MusicPilot/0.1.0",
+    ) -> None:
         self._repo = repository
+        self._musicbrainz_user_agent = musicbrainz_user_agent
+        self._musicbrainz_enriched_artist_ids: set[int] = set()
+        self._musicbrainz_enrichment_lock = asyncio.Lock()
+        self._last_musicbrainz_enrichment_at = 0.0
 
     # -- Public API --
 
@@ -141,16 +132,16 @@ class ArtistService:
         artist_id = await self._repo.find_artist_id_by_alias(name)
         if artist_id is not None:
             aliases = await self._repo.list_artist_aliases(artist_id)
-            return await self._aliases_with_known_names(artist_id, name, aliases)
+            return _unique_artist_names(tuple(aliases))
 
         # Try normalized lookup
         normalized = normalize_artist_name(name)
         artist = await self._repo.find_artist_by_normalized(normalized)
         if artist is not None:
             aliases = await self._repo.list_artist_aliases(artist.id)
-            return await self._aliases_with_known_names(artist.id, name, aliases)
+            return _unique_artist_names(tuple(aliases))
 
-        return _unique_artist_names((name, *_known_artist_aliases(name)))
+        return _unique_artist_names((name,))
 
     async def get_canonical_name(self, name: str | None) -> str | None:
         """Resolve an artist name to its canonical (authoritative) name.
@@ -197,8 +188,9 @@ class ArtistService:
     ) -> ArtistInfo:
         """Ensure an artist exists in the database.
 
-        If the artist (or an alias matching it) already exists, returns the
-        existing ArtistInfo. Otherwise, creates a new artist entry.
+        If the artist (or an alias matching it) already exists, returns that
+        entry without an external lookup. Otherwise, creates a new artist
+        entry and enriches its aliases from MusicBrainz.
 
         If the name contains separators (feat., &, /, etc.), each part is
         handled independently and only the first part is returned as primary.
@@ -224,10 +216,6 @@ class ArtistService:
         # Check existing
         artist_id = await self._repo.find_artist_id_by_alias(name)
         if artist_id is not None:
-            await self._repo.add_aliases(
-                artist_id,
-                tuple((alias, "builtin") for alias in _known_artist_aliases(name)),
-            )
             return await self._get_artist_info(artist_id)
 
         normalized = normalize_artist_name(name)
@@ -235,10 +223,6 @@ class ArtistService:
         if artist is not None:
             # Add this name as an alias
             await self._repo.add_alias(artist.id, name, source)
-            await self._repo.add_aliases(
-                artist.id,
-                tuple((alias, "builtin") for alias in _known_artist_aliases(name)),
-            )
             return await self._get_artist_info(artist.id)
 
         # Create new artist
@@ -249,16 +233,9 @@ class ArtistService:
         )
         # Add itself as a default alias
         await self._repo.add_alias(artist.id, name, "primary")
-        await self._repo.add_aliases(
-            artist.id,
-            tuple((alias, "builtin") for alias in _known_artist_aliases(name)),
-        )
-
-        return ArtistInfo(
-            id=artist.id,
-            name=artist.name,
-            normalized_name=artist.normalized_name,
-            aliases=(name,),
+        return await self._enrich_artist_from_musicbrainz(
+            await self._get_artist_info(artist.id),
+            lookup_name=name,
         )
 
     async def merge_artists(self, target_id: int, source_id: int) -> ArtistInfo:
@@ -320,7 +297,7 @@ class ArtistService:
 
     async def build_library_from_media_files(
         self,
-        user_agent: str = "MusicPilot/0.1.0",
+        user_agent: str | None = None,
     ) -> int:
         """Auto-populate artist database from existing MediaFile records.
 
@@ -391,9 +368,11 @@ class ArtistService:
                         await asyncio.sleep(1)
                     search_name = max(names, key=len)
                     mb_aliases = await _fetch_musicbrainz_aliases(
-                        client, search_name, user_agent, seen_mb_artists,
+                        client,
+                        search_name,
+                        user_agent or self._musicbrainz_user_agent,
+                        seen_mb_artists,
                     )
-                    mb_aliases.update(_known_artist_aliases(search_name))
                     await self._repo.add_aliases(
                         existing_artist.id,
                         tuple(
@@ -410,9 +389,11 @@ class ArtistService:
                     await asyncio.sleep(1)
                 search_name = max(names, key=len)
                 mb_aliases = await _fetch_musicbrainz_aliases(
-                    client, search_name, user_agent, seen_mb_artists,
+                    client,
+                    search_name,
+                    user_agent or self._musicbrainz_user_agent,
+                    seen_mb_artists,
                 )
-                mb_aliases.update(_known_artist_aliases(search_name))
 
                 # Pick canonical name (longest is usually most descriptive)
                 canonical = max(names, key=len)
@@ -448,7 +429,6 @@ class ArtistService:
         result = []
         for artist in artists:
             aliases = await self._repo.list_artist_aliases(artist.id)
-            aliases = await self._aliases_with_known_names(artist.id, artist.name, aliases)
             result.append(
                 ArtistInfo(
                     id=artist.id,
@@ -494,19 +474,48 @@ class ArtistService:
             aliases=tuple(a for a in aliases if a != artist.name),
         )
 
-    async def _aliases_with_known_names(
+    async def _enrich_artist_from_musicbrainz(
         self,
-        artist_id: int,
-        name: str,
-        aliases: list[str],
-    ) -> list[str]:
-        known_aliases = _known_artist_aliases(name)
-        if known_aliases:
+        artist: ArtistInfo,
+        *,
+        lookup_name: str,
+    ) -> ArtistInfo:
+        if artist.id in self._musicbrainz_enriched_artist_ids:
+            return artist
+        async with self._musicbrainz_enrichment_lock:
+            if artist.id in self._musicbrainz_enriched_artist_ids:
+                return await self._get_artist_info(artist.id)
+            loop = asyncio.get_running_loop()
+            delay = 1.0 - (loop.time() - self._last_musicbrainz_enrichment_at)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(10.0, connect=5.0)
+                ) as client:
+                    aliases = await asyncio.wait_for(
+                        _fetch_musicbrainz_aliases(
+                            client,
+                            lookup_name,
+                            self._musicbrainz_user_agent,
+                            set(),
+                        ),
+                        timeout=15,
+                    )
+            except TimeoutError:
+                logger.debug("MusicBrainz enrichment timed out for %r", lookup_name)
+                aliases = set()
+            self._last_musicbrainz_enrichment_at = loop.time()
             await self._repo.add_aliases(
-                artist_id,
-                tuple((alias, "builtin") for alias in known_aliases),
+                artist.id,
+                tuple(
+                    (alias, "musicbrainz")
+                    for alias in aliases
+                    if alias != artist.name
+                ),
             )
-        return _unique_artist_names((*aliases, *known_aliases))
+            self._musicbrainz_enriched_artist_ids.add(artist.id)
+            return await self._get_artist_info(artist.id)
 
 
 async def _fetch_musicbrainz_aliases(

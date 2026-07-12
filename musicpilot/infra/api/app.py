@@ -668,7 +668,10 @@ class AppState:
         )
         self.indexers = ()
         self.repository = SqlAlchemyMediaRepository(self.database)
-        self.artist_service = ArtistService(repository=self.repository)
+        self.artist_service = ArtistService(
+            repository=self.repository,
+            musicbrainz_user_agent=settings.musicbrainz_user_agent,
+        )
         self.task_executors = TaskExecutorRegistry()
         self.task_manager = TaskManager(
             repository=self.repository,
