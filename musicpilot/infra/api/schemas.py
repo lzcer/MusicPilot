@@ -210,12 +210,22 @@ class DashboardTaskSummaryResponse(BaseModel):
     slow: int
 
 
+class DashboardStorageSummaryResponse(BaseModel):
+    status: Literal["ready", "waiting", "error"]
+    source_size_bytes: int | None = None
+    expansion_size_bytes: int | None = None
+    total_size_bytes: int | None = None
+    calculated_at: datetime | None = None
+    error: str | None = None
+
+
 class DashboardResponse(BaseModel):
     library: DashboardLibrarySummaryResponse
     playlists: DashboardPlaylistSummaryResponse
     downloads: DashboardDownloadSummaryResponse
     media: DashboardMediaSummaryResponse
     tasks: DashboardTaskSummaryResponse
+    storage: DashboardStorageSummaryResponse
 
 
 class SystemTaskResponse(BaseModel):

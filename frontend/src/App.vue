@@ -280,6 +280,14 @@ type DashboardSummary = {
     failed: number
     slow: number
   }
+  storage: {
+    status: 'ready' | 'waiting' | 'error'
+    source_size_bytes?: number | null
+    expansion_size_bytes?: number | null
+    total_size_bytes?: number | null
+    calculated_at?: string | null
+    error?: string | null
+  }
 }
 
 type SystemTaskStatus = 'RUNNING' | 'WAIT' | 'FAILED' | 'SLOW'
@@ -310,10 +318,13 @@ type SystemTaskInterruptResponse = {
 
 type DashboardMetric = {
   title: string
-  value: number
+  value: number | string
   subtitle: string
+  subtitleLines?: string[]
   icon: string
   color: string
+  help?: string
+  error?: string
 }
 
 type Site = {
@@ -1000,6 +1011,22 @@ const mediaServerUserAccounts = computed(() =>
 const dashboardMetricCards = computed<DashboardMetric[]>(() => {
   const data = dashboard.value
   if (!data) return []
+  const storage = data.storage
+  const hasStorageResult = storage.total_size_bytes != null
+  const storageDetails = hasStorageResult
+    ? [
+        `源文件 ${formatSize(storage.source_size_bytes)}`,
+        `膨胀 ${formatSize(storage.expansion_size_bytes)}`
+      ]
+    : []
+  const storageSubtitle =
+    storage.status === 'waiting'
+      ? '等待后台统计'
+      : storage.status === 'error'
+        ? hasStorageResult
+          ? ''
+          : '统计失败'
+        : ''
   return [
     {
       title: '歌曲库',
@@ -1007,6 +1034,18 @@ const dashboardMetricCards = computed<DashboardMetric[]>(() => {
       subtitle: `专辑 ${data.library.albums} / 歌手 ${data.library.artists}`,
       icon: 'mdi-music-circle-outline',
       color: 'primary'
+    },
+    {
+      title: '音乐库总体积',
+      value: hasStorageResult ? formatSize(storage.total_size_bytes) : '--',
+      subtitle: storageSubtitle,
+      subtitleLines: storageDetails,
+      icon: 'mdi-database-outline',
+      color: 'primary',
+      help:
+        '膨胀大小是映射目录中复制文件新增的空间，硬链接不会重复计算。使用源文件刮削时为 0。',
+      error:
+        storage.status === 'error' ? storage.error || '音乐库体积统计失败' : undefined
     },
     {
       title: '近 7 天新增',
@@ -3788,7 +3827,7 @@ function progressPercent(value: number) {
 }
 
 function formatSize(value?: number | null) {
-  if (!value) return '-'
+  if (value == null) return '-'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let size = value
   let unitIndex = 0
@@ -4222,10 +4261,45 @@ onUnmounted(() => {
                     <v-icon :icon="metric.icon" size="30" />
                   </div>
                   <div>
-                    <div class="dashboard-metric-title">{{ metric.title }}</div>
+                    <div class="dashboard-metric-title">
+                      <span>{{ metric.title }}</span>
+                      <v-tooltip
+                        v-if="metric.help"
+                        location="top"
+                        max-width="320"
+                        open-on-click
+                      >
+                        <template #activator="{ props }">
+                          <v-icon
+                            v-bind="props"
+                            class="dashboard-metric-help"
+                            icon="mdi-information-outline"
+                            size="16"
+                            tabindex="0"
+                          />
+                        </template>
+                        {{ metric.help }}
+                      </v-tooltip>
+                    </div>
                     <div class="dashboard-metric-value">{{ metric.value }}</div>
-                    <div class="dashboard-metric-subtitle">{{ metric.subtitle }}</div>
+                    <div v-if="metric.subtitleLines?.length" class="dashboard-metric-subtitle">
+                      <div v-for="line in metric.subtitleLines" :key="line">{{ line }}</div>
+                    </div>
+                    <div v-else class="dashboard-metric-subtitle">{{ metric.subtitle }}</div>
                   </div>
+                  <v-tooltip v-if="metric.error" location="top">
+                    <template #activator="{ props }">
+                      <v-icon
+                        v-bind="props"
+                        class="dashboard-metric-error"
+                        color="error"
+                        icon="mdi-alert-circle"
+                        size="18"
+                        tabindex="0"
+                      />
+                    </template>
+                    {{ metric.error }}
+                  </v-tooltip>
                 </v-card>
               </div>
 
@@ -7240,6 +7314,13 @@ onUnmounted(() => {
   gap: 14px;
   min-height: 118px;
   padding: 18px;
+  position: relative;
+}
+
+.dashboard-metric-error {
+  position: absolute;
+  right: 12px;
+  top: 12px;
 }
 
 .dashboard-metric-icon {
@@ -7254,9 +7335,16 @@ onUnmounted(() => {
 }
 
 .dashboard-metric-title {
+  align-items: center;
   color: rgba(var(--v-theme-on-surface), 0.68);
+  display: flex;
   font-size: 13px;
+  gap: 4px;
   line-height: 18px;
+}
+
+.dashboard-metric-help {
+  color: rgba(var(--v-theme-on-surface), 0.54);
 }
 
 .dashboard-metric-value {

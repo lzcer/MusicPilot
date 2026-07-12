@@ -46,6 +46,7 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
         "metadata_concurrency": 3,
     },
 }
+LIBRARY_STORAGE_SNAPSHOT_KEY = "library_storage_snapshot"
 
 logger = logging.getLogger(__name__)
 SLOW_DB_OPERATION_SECONDS = float(os.getenv("MP_SLOW_DB_OPERATION_SECONDS", "0.5"))
@@ -386,6 +387,27 @@ class SqlAlchemyMediaRepository:
             await session.commit()
             await session.refresh(row)
             return _merge_system_settings_defaults(row.value)
+
+    async def get_library_storage_snapshot(self) -> dict[str, Any] | None:
+        async with self.database.session() as session:
+            row = await session.get(SystemSetting, LIBRARY_STORAGE_SNAPSHOT_KEY)
+            if row is None:
+                return None
+            return dict(row.value or {})
+
+    async def update_library_storage_snapshot(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        async with self.database.session() as session:
+            row = await session.get(SystemSetting, LIBRARY_STORAGE_SNAPSHOT_KEY)
+            if row is None:
+                row = SystemSetting(key=LIBRARY_STORAGE_SNAPSHOT_KEY, value={})
+                session.add(row)
+            row.value = dict(payload)
+            await session.commit()
+            await session.refresh(row)
+            return dict(row.value or {})
 
     async def create_system_task(
         self,

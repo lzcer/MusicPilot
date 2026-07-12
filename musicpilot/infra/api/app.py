@@ -86,6 +86,7 @@ from musicpilot.core.scraping import (
     normalize_metadata_match_text,
     scraping_config_from_payload,
 )
+from musicpilot.core.storage import calculate_library_storage_usage, normalize_storage_path
 from musicpilot.core.task_queue import (
     TaskCreate,
     TaskExecutionResult,
@@ -108,6 +109,7 @@ from musicpilot.infra.api.schemas import (
     DashboardMediaSummaryResponse,
     DashboardPlaylistSummaryResponse,
     DashboardResponse,
+    DashboardStorageSummaryResponse,
     DashboardTaskSummaryResponse,
     DownloadDeleteMode,
     DownloaderCreateRequest,
@@ -228,6 +230,7 @@ _TORRENT_AUDIO_EXTENSIONS = {
 }
 DOWNLOAD_POLL_INTERVAL_SECONDS = 5
 MUSIC_LIBRARY_SYNC_INTERVAL_SECONDS = 3600
+LIBRARY_STORAGE_REFRESH_INTERVAL_SECONDS = 30 * 60
 MUSIC_LIBRARY_SYNC_AFTER_REFRESH_DELAY_SECONDS = 5
 SLOW_API_OPERATION_SECONDS = float(os.getenv("MP_SLOW_API_OPERATION_SECONDS", "0.5"))
 PLAYLIST_TRACK_RETRYABLE_STATUSES = {
@@ -725,6 +728,7 @@ class AppState:
         self.artist_build_started_at: datetime | None = None
         self.artist_build_finished_at: datetime | None = None
         self.artist_build_last_error: str | None = None
+        self.library_storage_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._metadata_source_semaphores: dict[str, tuple[int, asyncio.Semaphore]] = {}
         self._metadata_source_semaphores_lock = asyncio.Lock()
@@ -759,6 +763,7 @@ class AppState:
         )
         self.download_polling_task: asyncio.Task[None] | None = None
         self.music_library_sync_task: asyncio.Task[None] | None = None
+        self.library_storage_task: asyncio.Task[None] | None = None
         self.metadata_site_search_task: MetadataSiteSearchTask | None = None
         self.metadata_site_search_worker: asyncio.Task[None] | None = None
 
@@ -1173,6 +1178,21 @@ class AppState:
         with contextlib.suppress(asyncio.CancelledError):
             await self.music_library_sync_task
 
+    def start_library_storage_refresh(self) -> None:
+        if self.library_storage_task is not None and not self.library_storage_task.done():
+            return
+        self.library_storage_task = asyncio.create_task(
+            _refresh_library_storage_periodically(self),
+            name="musicpilot-library-storage-refresh",
+        )
+
+    async def stop_library_storage_refresh(self) -> None:
+        if self.library_storage_task is None:
+            return
+        self.library_storage_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.library_storage_task
+
     async def run_metadata_source(
         self,
         source: str,
@@ -1294,6 +1314,7 @@ def create_app() -> FastAPI:
         state.task_manager.start()
         state.start_download_polling()
         state.start_music_library_sync()
+        state.start_library_storage_refresh()
         state.scheduler.start()
         await state.start_bots()
         yield
@@ -1301,6 +1322,7 @@ def create_app() -> FastAPI:
         root_logger.removeHandler(state.log_handler)
         await state.stop_download_polling()
         await state.stop_music_library_sync()
+        await state.stop_library_storage_refresh()
         await state.task_manager.stop()
         if state.metadata_site_search_worker is not None:
             state.metadata_site_search_worker.cancel()
@@ -1355,8 +1377,13 @@ def create_app() -> FastAPI:
 
     @app.get("/api/dashboard", response_model=DashboardResponse)
     async def dashboard() -> DashboardResponse:
-        summary = await state.repository.dashboard_summary()
-        return _dashboard_response(summary)
+        summary, settings_payload, storage_snapshot = await asyncio.gather(
+            state.repository.dashboard_summary(),
+            state.repository.get_system_settings(),
+            state.repository.get_library_storage_snapshot(),
+        )
+        storage = _dashboard_storage_response(settings_payload, storage_snapshot)
+        return _dashboard_response(summary, storage)
 
     @app.get("/api/system-tasks", response_model=list[SystemTaskResponse])
     async def system_tasks(
@@ -5984,7 +6011,10 @@ def _notifier_response(item: NotifierChannel) -> NotifierResponse:
     )
 
 
-def _dashboard_response(summary: dict[str, Any]) -> DashboardResponse:
+def _dashboard_response(
+    summary: dict[str, Any],
+    storage: DashboardStorageSummaryResponse,
+) -> DashboardResponse:
     library = summary["library"]
     playlists = summary["playlists"]
     downloads = summary["downloads"]
@@ -6029,6 +6059,35 @@ def _dashboard_response(summary: dict[str, Any]) -> DashboardResponse:
             ],
         ),
         tasks=DashboardTaskSummaryResponse(**tasks),
+        storage=storage,
+    )
+
+
+def _dashboard_storage_response(
+    settings_payload: dict[str, Any],
+    snapshot: dict[str, Any] | None,
+) -> DashboardStorageSummaryResponse:
+    config = scraping_config_from_payload(settings_payload)
+    mapped_directory = config.mapped_directory if config.mode in {"mapped", "copy"} else None
+    source_path = normalize_storage_path(config.source_directory)
+    mapped_path = normalize_storage_path(mapped_directory)
+    if (
+        snapshot is None
+        or snapshot.get("source_path") != source_path
+        or snapshot.get("mapped_path") != mapped_path
+    ):
+        return DashboardStorageSummaryResponse(status="waiting")
+
+    status = snapshot.get("status")
+    if status not in {"ready", "error"}:
+        return DashboardStorageSummaryResponse(status="waiting")
+    return DashboardStorageSummaryResponse(
+        status=status,
+        source_size_bytes=_optional_int(snapshot.get("source_size_bytes")),
+        expansion_size_bytes=_optional_int(snapshot.get("expansion_size_bytes")),
+        total_size_bytes=_optional_int(snapshot.get("total_size_bytes")),
+        calculated_at=_optional_datetime(snapshot.get("calculated_at")),
+        error=_optional_string(snapshot.get("error")),
     )
 
 
@@ -6114,6 +6173,18 @@ def _optional_int(value: object) -> int | None:
     try:
         return int(value)
     except (TypeError, ValueError):
+        return None
+
+
+def _optional_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    text = _optional_string(value)
+    if text is None:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
         return None
 
 
@@ -6353,6 +6424,100 @@ async def _sync_music_library_periodically(state: AppState) -> None:
         except Exception as exc:  # noqa: BLE001
             state.add_log("library", f"Music library sync failed: {exc}", "ERROR")
         await asyncio.sleep(MUSIC_LIBRARY_SYNC_INTERVAL_SECONDS)
+
+
+async def _refresh_library_storage_periodically(state: AppState) -> None:
+    while True:
+        try:
+            await _refresh_library_storage(state)
+        except Exception as exc:  # noqa: BLE001
+            state.add_log("library", f"Library storage refresh failed: {exc}", "ERROR")
+        await asyncio.sleep(LIBRARY_STORAGE_REFRESH_INTERVAL_SECONDS)
+
+
+async def _refresh_library_storage(state: AppState) -> None:
+    async with state.library_storage_lock:
+        settings_payload = await state.repository.get_system_settings()
+        config = scraping_config_from_payload(settings_payload)
+        source_directory = config.source_directory
+        mapped_directory = (
+            config.mapped_directory if config.mode in {"mapped", "copy"} else None
+        )
+        source_path = normalize_storage_path(source_directory)
+        mapped_path = normalize_storage_path(mapped_directory)
+        previous = await state.repository.get_library_storage_snapshot()
+        try:
+            if source_directory is None:
+                raise RuntimeError("Source directory is not configured.")
+            usage = await asyncio.to_thread(
+                calculate_library_storage_usage,
+                source_directory,
+                mapped_directory,
+            )
+        except Exception as exc:  # noqa: BLE001
+            snapshot = _library_storage_error_snapshot(
+                previous,
+                source_path=source_path,
+                mapped_path=mapped_path,
+                error=str(exc),
+            )
+            await state.repository.update_library_storage_snapshot(snapshot)
+            raise
+
+        calculated_at = datetime.now(UTC).isoformat()
+        await state.repository.update_library_storage_snapshot(
+            {
+                "status": "ready",
+                "source_path": source_path,
+                "mapped_path": mapped_path,
+                "source_size_bytes": usage.source_size_bytes,
+                "expansion_size_bytes": usage.expansion_size_bytes,
+                "total_size_bytes": usage.total_size_bytes,
+                "calculated_at": calculated_at,
+                "error": None,
+            }
+        )
+        state.add_log(
+            "library",
+            "Library storage refreshed: "
+            f"source={usage.source_size_bytes}, expansion={usage.expansion_size_bytes}, "
+            f"total={usage.total_size_bytes}",
+        )
+
+
+def _library_storage_error_snapshot(
+    previous: dict[str, Any] | None,
+    *,
+    source_path: str,
+    mapped_path: str,
+    error: str,
+) -> dict[str, Any]:
+    same_paths = bool(
+        previous
+        and previous.get("source_path") == source_path
+        and previous.get("mapped_path") == mapped_path
+    )
+    previous_result = (
+        previous if same_paths and previous and previous.get("calculated_at") else None
+    )
+    return {
+        "status": "error",
+        "source_path": source_path,
+        "mapped_path": mapped_path,
+        "source_size_bytes": (
+            previous_result.get("source_size_bytes") if previous_result is not None else None
+        ),
+        "expansion_size_bytes": (
+            previous_result.get("expansion_size_bytes") if previous_result is not None else None
+        ),
+        "total_size_bytes": (
+            previous_result.get("total_size_bytes") if previous_result is not None else None
+        ),
+        "calculated_at": (
+            previous_result.get("calculated_at") if previous_result is not None else None
+        ),
+        "error": error,
+    }
 
 
 async def _sync_music_library_after_refresh(state: AppState) -> None:
