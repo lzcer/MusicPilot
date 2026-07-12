@@ -6,7 +6,7 @@ import re
 import time
 import unicodedata
 from collections.abc import Iterable
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -50,6 +50,13 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
 logger = logging.getLogger(__name__)
 SLOW_DB_OPERATION_SECONDS = float(os.getenv("MP_SLOW_DB_OPERATION_SECONDS", "0.5"))
 SLOW_SYSTEM_TASK_SECONDS = int(os.getenv("MP_SLOW_SYSTEM_TASK_SECONDS", "300"))
+
+
+@dataclass(frozen=True, slots=True)
+class MusicLibrarySyncResult:
+    total: int
+    changed_track_ids: tuple[int, ...]
+    deleted_track_ids: tuple[int, ...]
 
 
 def _elapsed_ms(started_at: float) -> float:
@@ -1935,9 +1942,13 @@ class SqlAlchemyMediaRepository:
                 int(artist_result.scalar_one()),
             )
 
-    async def sync_music_library_tracks(self, tracks: list[dict[str, Any]]) -> int:
+    async def sync_music_library_tracks(
+        self,
+        tracks: list[dict[str, Any]],
+    ) -> MusicLibrarySyncResult:
         synced_at = datetime.now(UTC)
         seen_ids: set[str] = set()
+        changed_rows: list[MusicLibraryTrack] = []
         async with self.database.session() as session:
             result = await session.execute(select(MusicLibraryTrack))
             existing = {item.navidrome_id: item for item in result.scalars().all()}
@@ -1950,8 +1961,12 @@ class SqlAlchemyMediaRepository:
                 if row is None:
                     row = MusicLibraryTrack(navidrome_id=navidrome_id, title="")
                     session.add(row)
-                row.title = str(payload.get("title") or payload.get("name") or "-")
-                row.artist = _optional_string(payload.get("artist"))
+                title = str(payload.get("title") or payload.get("name") or "-")
+                artist = _optional_string(payload.get("artist"))
+                if row.id is None or row.title != title or row.artist != artist:
+                    changed_rows.append(row)
+                row.title = title
+                row.artist = artist
                 row.album = _optional_string(payload.get("album"))
                 row.duration = _optional_int(payload.get("duration"))
                 row.size = _optional_int(payload.get("size"))
@@ -1964,11 +1979,20 @@ class SqlAlchemyMediaRepository:
                 raw_payload = payload.get("raw_payload")
                 row.raw_payload = raw_payload if isinstance(raw_payload, dict) else payload
                 row.last_synced_at = synced_at
+            deleted_track_ids = tuple(
+                row.id for navidrome_id, row in existing.items() if navidrome_id not in seen_ids
+            )
             for navidrome_id, row in existing.items():
                 if navidrome_id not in seen_ids:
                     await session.delete(row)
+            await session.flush()
+            changed_track_ids = tuple(row.id for row in changed_rows)
             await session.commit()
-        return len(seen_ids)
+        return MusicLibrarySyncResult(
+            total=len(seen_ids),
+            changed_track_ids=changed_track_ids,
+            deleted_track_ids=deleted_track_ids,
+        )
 
     async def create_subscription(
         self,

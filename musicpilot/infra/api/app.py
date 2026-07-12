@@ -2311,18 +2311,43 @@ def create_app() -> FastAPI:
         title = payload.title.strip()
         if not title:
             raise HTTPException(status_code=422, detail="歌名不能为空。")
+        artist = _optional_string(payload.artist)
+        try:
+            library_tracks = await state.repository.list_music_library_tracks()
+            normalized_title = normalize_metadata_match_text(title)
+            candidates = [
+                item
+                for item in library_tracks
+                if normalize_metadata_match_text(item.title) == normalized_title
+            ]
+            match = await _match_library_track(state, title, artist, candidates)
+        except Exception as exc:  # noqa: BLE001
+            state.add_log(
+                "playlist",
+                f"Playlist track rematch failed after edit: track_id={track_id}, error={exc}",
+                "WARNING",
+            )
+            match = None
+        exists_in_library = match is not None
+        download_status = (
+            "existing"
+            if exists_in_library
+            else ("pending" if track.download_status == "existing" else track.download_status)
+        )
         updated = await state.repository.update_playlist_track(
             track_id,
             title=title,
-            artist=_optional_string(payload.artist),
+            artist=artist,
             album=_optional_string(payload.album),
+            exists_in_library=exists_in_library,
+            matched_library_track_id=match.id if match is not None else None,
+            download_status=download_status,
+            last_checked_at=datetime.now(UTC),
             last_error=None,
         )
         if updated is None:
             raise HTTPException(status_code=404, detail="Playlist track not found.")
-        await _refresh_playlist_library_matches(state, playlist_id)
-        refreshed = await state.repository.get_playlist_track(track_id)
-        return _playlist_track_response(refreshed or updated)
+        return _playlist_track_response(updated)
 
     @app.delete("/api/playlists/{playlist_id}", status_code=204)
     async def delete_playlist(playlist_id: int) -> None:
@@ -2880,7 +2905,10 @@ def create_app() -> FastAPI:
         q: str | None = Query(default=None),
     ) -> MusicLibraryTrackPageResponse:
         try:
-            await _sync_music_library_from_media_server(state)
+            await _sync_music_library_from_media_server(
+                state,
+                refresh_all_playlist_matches=True,
+            )
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"媒体服务器音乐库同步失败：{exc}") from exc
         rows, total, albums, artists = await state.repository.list_music_library_tracks_page(
@@ -3459,35 +3487,104 @@ async def _refresh_playlist_library_matches(
         if playlist_id is not None
         else await state.repository.list_all_playlist_tracks()
     )
-    checked_at = datetime.now(UTC)
+    library_tracks_by_title = _music_library_tracks_by_normalized_title(library_tracks)
     artist_values_cache: dict[str, set[str]] = {}
     updated = 0
     for track in playlist_tracks:
-        match = await _match_library_track(
+        normalized_title = normalize_metadata_match_text(track.title)
+        refreshed = await _apply_playlist_track_library_match(
             state,
-            track.title,
-            track.artist,
-            library_tracks,
+            track,
+            library_tracks_by_title.get(normalized_title, ()),
             artist_values_cache=artist_values_cache,
         )
-        exists = match is not None
-        matched_library_track_id = match.id if match is not None else None
-        status = "existing" if exists else track.download_status
-        if (
-            track.exists_in_library == exists
-            and track.matched_library_track_id == matched_library_track_id
-            and track.download_status == status
-        ):
-            continue
-        await state.repository.update_playlist_track(
-            track.id,
-            exists_in_library=exists,
-            matched_library_track_id=matched_library_track_id,
-            download_status=status,
-            last_checked_at=checked_at,
-        )
-        updated += 1
+        updated += int(refreshed is not None)
     return updated
+
+
+async def _refresh_playlist_matches_for_library_changes(
+    state: AppState,
+    *,
+    changed_track_ids: Iterable[int],
+    deleted_track_ids: Iterable[int],
+) -> int:
+    changed_ids = set(changed_track_ids)
+    deleted_ids = set(deleted_track_ids)
+    if not changed_ids and not deleted_ids:
+        return 0
+    library_tracks = await state.repository.list_music_library_tracks()
+    library_tracks_by_title = _music_library_tracks_by_normalized_title(library_tracks)
+    changed_title_values = {
+        normalize_metadata_match_text(track.title)
+        for track in library_tracks
+        if track.id in changed_ids
+    }
+    playlist_tracks = await state.repository.list_all_playlist_tracks()
+    affected_tracks = {
+        track.id: track
+        for track in playlist_tracks
+        if track.matched_library_track_id in changed_ids | deleted_ids
+        or normalize_metadata_match_text(track.title) in changed_title_values
+    }
+    artist_values_cache: dict[str, set[str]] = {}
+    updated = 0
+    for track in affected_tracks.values():
+        normalized_title = normalize_metadata_match_text(track.title)
+        refreshed = await _apply_playlist_track_library_match(
+            state,
+            track,
+            library_tracks_by_title.get(normalized_title, ()),
+            artist_values_cache=artist_values_cache,
+        )
+        updated += int(refreshed is not None)
+    return updated
+
+
+def _music_library_tracks_by_normalized_title(
+    library_tracks: Iterable[MusicLibraryTrack],
+) -> dict[str, tuple[MusicLibraryTrack, ...]]:
+    grouped: dict[str, list[MusicLibraryTrack]] = {}
+    for track in library_tracks:
+        normalized_title = normalize_metadata_match_text(track.title)
+        if normalized_title:
+            grouped.setdefault(normalized_title, []).append(track)
+    return {title: tuple(tracks) for title, tracks in grouped.items()}
+
+
+async def _apply_playlist_track_library_match(
+    state: AppState,
+    track: PlaylistTrack,
+    library_tracks: Iterable[MusicLibraryTrack],
+    *,
+    artist_values_cache: dict[str, set[str]] | None = None,
+) -> PlaylistTrack | None:
+    match = await _match_library_track(
+        state,
+        track.title,
+        track.artist,
+        list(library_tracks),
+        artist_values_cache=artist_values_cache,
+    )
+    exists = match is not None
+    matched_library_track_id = match.id if match is not None else None
+    status = (
+        "existing"
+        if exists
+        else ("pending" if track.download_status == "existing" else track.download_status)
+    )
+    if (
+        track.exists_in_library == exists
+        and track.matched_library_track_id == matched_library_track_id
+        and track.download_status == status
+    ):
+        return None
+    return await state.repository.update_playlist_track(
+        track.id,
+        exists_in_library=exists,
+        matched_library_track_id=matched_library_track_id,
+        download_status=status,
+        last_checked_at=datetime.now(UTC),
+    )
 
 
 async def _restore_playlist_download_tasks(state: AppState) -> None:
@@ -6248,9 +6345,14 @@ async def _poll_download_tasks(state: AppState) -> None:
 
 
 async def _sync_music_library_periodically(state: AppState) -> None:
+    refresh_all_playlist_matches = True
     while True:
         try:
-            await _sync_music_library_from_media_server(state)
+            await _sync_music_library_from_media_server(
+                state,
+                refresh_all_playlist_matches=refresh_all_playlist_matches,
+            )
+            refresh_all_playlist_matches = False
         except Exception as exc:  # noqa: BLE001
             state.add_log("library", f"Music library sync failed: {exc}", "ERROR")
         await asyncio.sleep(MUSIC_LIBRARY_SYNC_INTERVAL_SECONDS)
@@ -6264,7 +6366,7 @@ async def _sync_music_library_after_refresh(state: AppState) -> None:
         state.add_log("library", f"Music library sync after refresh failed: {exc}", "ERROR")
 
 
-async def _refresh_music_library_after_manual_reorganize(
+async def _refresh_music_library_after_manual_organize(
     state: AppState,
     task_name: str,
 ) -> None:
@@ -6272,7 +6374,7 @@ async def _refresh_music_library_after_manual_reorganize(
     if server is None:
         state.add_log(
             "library",
-            f"Music library refresh after manual reorganization skipped: "
+            f"Music library refresh after manual organization skipped: "
             f"no media server, task={task_name}",
             "WARNING",
         )
@@ -6283,36 +6385,52 @@ async def _refresh_music_library_after_manual_reorganize(
     except Exception as exc:  # noqa: BLE001
         state.add_log(
             "library",
-            f"Music library refresh after manual reorganization failed: "
+            f"Music library refresh after manual organization failed: "
             f"task={task_name}, error={exc}",
             "ERROR",
         )
         return
     state.add_log(
         "library",
-        f"Media library refresh requested after manual reorganization: {task_name}",
+        f"Media library refresh requested after manual organization: {task_name}",
     )
     sync_task = asyncio.create_task(
         _sync_music_library_after_refresh(state),
-        name="musicpilot-music-library-sync-after-manual-reorganization",
+        name="musicpilot-music-library-sync-after-manual-organization",
     )
     state._background_tasks.add(sync_task)
     sync_task.add_done_callback(state._background_tasks.discard)
 
 
-async def _sync_music_library_from_media_server(state: AppState) -> int:
+async def _sync_music_library_from_media_server(
+    state: AppState,
+    *,
+    refresh_all_playlist_matches: bool = False,
+) -> int:
     server = await state.repository.default_media_server()
     if server is None:
         state.add_log("library", "Music library sync skipped: no media server", "WARNING")
         return 0
     client = build_media_server_client(server)
     tracks = await client.list_tracks()
-    count = await state.repository.sync_music_library_tracks(
+    result = await state.repository.sync_music_library_tracks(
         [_media_server_track_payload(track) for track in tracks]
     )
-    await _refresh_playlist_library_matches(state)
-    state.add_log("library", f"Music library synced: {count} track(s)")
-    return count
+    if refresh_all_playlist_matches:
+        matched = await _refresh_playlist_library_matches(state)
+    else:
+        matched = await _refresh_playlist_matches_for_library_changes(
+            state,
+            changed_track_ids=result.changed_track_ids,
+            deleted_track_ids=result.deleted_track_ids,
+        )
+    state.add_log(
+        "library",
+        f"Music library synced: {result.total} track(s), "
+        f"changed={len(result.changed_track_ids)}, deleted={len(result.deleted_track_ids)}, "
+        f"playlist_matches={matched}",
+    )
+    return result.total
 
 
 def _media_server_track_payload(track: object) -> dict[str, Any]:
@@ -6982,8 +7100,8 @@ async def _scrape_manual_source_files(
         f"failed={summary.failed_files}, "
         f"skipped={sum(1 for item in summary.results if item.status == 'skipped')}",
     )
-    if exclude_library_paths and any(item.status == "success" for item in summary.results):
-        await _refresh_music_library_after_manual_reorganize(state, task_name)
+    if any(item.status == "success" for item in summary.results):
+        await _refresh_music_library_after_manual_organize(state, task_name)
     return summary
 
 
