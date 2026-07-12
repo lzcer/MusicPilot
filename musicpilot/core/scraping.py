@@ -2551,7 +2551,7 @@ def _metadata_has_value(metadata: TrackMetadata, field: RequiredMetadata) -> boo
     normalized = unicodedata.normalize("NFKC", value).casefold()
     if "\ufffd" in normalized or "锟斤拷" in normalized:
         return False
-    key = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", normalized)
+    key = re.sub(r"\W+", "", normalized)
     return bool(key) and key not in _INVALID_METADATA_TEXT_KEYS
 
 
