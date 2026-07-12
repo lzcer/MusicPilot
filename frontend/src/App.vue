@@ -3882,6 +3882,10 @@ function playlistStatusColor(status: string) {
 function downloadStatusText(status: string) {
   return {
     queued: '队列中',
+    pre_scraping: '预刮削中',
+    candidate_matched: '已匹配，准备提交',
+    candidate_cleaning: '未匹配，清理中',
+    candidate_cleanup_failed: '候选清理失败',
     submitted: '已提交',
     downloading: '下载中',
     completed: '下载完成',
@@ -3897,6 +3901,10 @@ function downloadStatusText(status: string) {
 function downloadStatusColor(status: string) {
   return {
     queued: 'warning',
+    pre_scraping: 'info',
+    candidate_matched: 'primary',
+    candidate_cleaning: 'warning',
+    candidate_cleanup_failed: 'error',
     submitted: 'primary',
     downloading: 'info',
     completed: 'success',
@@ -3937,6 +3945,7 @@ function systemTaskTypeText(type: string) {
     DOWNLOAD_ITEM_SCRAPE: '下载明细匹配',
     FILE_ORGANIZE: '文件整理',
     DOWNLOAD_REFRESH_LIBRARY: '曲库刷新',
+    DOWNLOAD_FINALIZE_LIBRARY: '曲库收尾',
     SEARCH_SITE: '站点搜索',
     SEARCH_MEDIA: '媒体搜索',
     SEARCH_SITE_CANDIDATES: '候选站点搜索'

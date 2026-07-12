@@ -17,7 +17,7 @@ import unicodedata
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from html import escape
 from pathlib import Path
 from secrets import compare_digest, token_urlsafe
@@ -255,6 +255,9 @@ DOWNLOAD_ITEM_ORGANIZE_TERMINAL_STATUSES = {
 }
 DOWNLOAD_ITEM_TASK_PRIORITY = 50
 DOWNLOAD_REFRESH_TASK_PRIORITY = 40
+PLAYLIST_CANDIDATE_CLEANUP_INTERVAL_SECONDS = 300
+PLAYLIST_CANDIDATE_STALE_SECONDS = 1800
+PLAYLIST_CANDIDATE_CLEANUP_RETRY_DELAYS = (0.0, 0.25, 1.0)
 logger = logging.getLogger(__name__)
 
 
@@ -599,6 +602,25 @@ class DownloadRefreshLibraryExecutor:
         )
 
 
+class DownloadFinalizeLibraryExecutor:
+    def __init__(self, state: AppState) -> None:
+        self.state = state
+
+    async def execute(self, task: object) -> TaskExecutionResult:
+        payload = getattr(task, "payload", {}) or {}
+        task_id = _optional_int(payload.get("torrent_record_id"))
+        if task_id is None:
+            raise ValueError("Download finalize task payload is incomplete.")
+        await _finalize_download_refresh_if_ready_direct(self.state, task_id)
+        latest = await self.state.repository.get_download_task(task_id)
+        return TaskExecutionResult(
+            result={
+                "torrent_record_id": task_id,
+                "status": latest.status if latest is not None else "missing",
+            }
+        )
+
+
 class ManualScrapeExecutor:
     def __init__(self, state: AppState) -> None:
         self.state = state
@@ -672,6 +694,10 @@ class AppState:
             "DOWNLOAD_REFRESH_LIBRARY",
             DownloadRefreshLibraryExecutor(self),
         )
+        self.task_executors.register(
+            "DOWNLOAD_FINALIZE_LIBRARY",
+            DownloadFinalizeLibraryExecutor(self),
+        )
         self.task_executors.register("MANUAL_SCRAPE", ManualScrapeExecutor(self))
         self.scheduler = SubscriptionScheduler(
             repository=self.repository,
@@ -697,6 +723,10 @@ class AppState:
         self.artist_build_finished_at: datetime | None = None
         self.artist_build_last_error: str | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._metadata_source_semaphores: dict[str, tuple[int, asyncio.Semaphore]] = {}
+        self._metadata_source_semaphores_lock = asyncio.Lock()
+        self._active_playlist_candidate_ids: set[int] = set()
+        self._playlist_candidate_cleanup_tasks: dict[int, asyncio.Task[None]] = {}
         self.scraping_metadata = MetadataCascade(
             [MultiSourceMusicProvider(source_gate=self.run_metadata_source)]
         )
@@ -1145,13 +1175,21 @@ class AppState:
         source: str,
         runner: Callable[[], Awaitable[Any]],
     ) -> Any:
-        return await self.task_manager.run_exclusive(
-            task_type="METADATA_SOURCE",
-            resource_keys=[await _metadata_source_resource_key(self, source)],
-            payload={"source": source},
-            runner=runner,
-            wait_log_message=f"Metadata source waiting for resources: source={source}",
-        )
+        concurrency = await _metadata_concurrency(self)
+        source_key = _compact_search_text(normalize_search_text(source)) or "unknown"
+        async with self._metadata_source_semaphores_lock:
+            configured = self._metadata_source_semaphores.get(source_key)
+            if configured is None or configured[0] != concurrency:
+                configured = (concurrency, asyncio.Semaphore(concurrency))
+                self._metadata_source_semaphores[source_key] = configured
+            semaphore = configured[1]
+        if semaphore.locked():
+            self.add_log(
+                "task",
+                f"Metadata source waiting for resources: source={source}",
+            )
+        async with semaphore:
+            return await runner()
 
     def add_log(self, category: str, message: str, level: str = "INFO") -> None:
         self.logs.appendleft(
@@ -1242,6 +1280,13 @@ def create_app() -> FastAPI:
         await state.reload_notifiers()
         await _restore_playlist_download_tasks(state)
         await _restore_pending_download_item_scrapes(state)
+        await _cleanup_stale_playlist_candidates(state)
+        candidate_cleanup_task = asyncio.create_task(
+            _cleanup_playlist_candidates_periodically(state),
+            name="musicpilot-playlist-candidate-cleanup",
+        )
+        state._background_tasks.add(candidate_cleanup_task)
+        candidate_cleanup_task.add_done_callback(state._background_tasks.discard)
         state.pipeline.start()
         state.task_manager.start()
         state.start_download_polling()
@@ -3713,7 +3758,7 @@ async def _media_search_resource_key(state: AppState) -> str:
     return f"pool:{concurrency}:media-search"
 
 
-async def _metadata_source_resource_key(state: AppState, source: str) -> str:
+async def _metadata_concurrency(state: AppState) -> int:
     settings = await state.repository.get_system_settings()
     search_settings = settings.get("search") if isinstance(settings, dict) else {}
     concurrency = (
@@ -3724,9 +3769,7 @@ async def _metadata_source_resource_key(state: AppState, source: str) -> str:
         )
         or 3
     )
-    concurrency = min(max(concurrency, 1), 20)
-    source_key = _compact_search_text(normalize_search_text(source)) or "unknown"
-    return f"pool:{concurrency}:metadata-source:{source_key}"
+    return min(max(concurrency, 1), 20)
 
 
 async def _playlist_has_active_downloads(state: AppState, playlist_id: int) -> bool:
@@ -3957,7 +4000,14 @@ async def _try_playlist_candidate_download(
         media_metadata=media.model_dump(),
         selected_site_ids=[],
         category="MusicPilot",
+        status="pre_scraping",
+        payload={
+            "purpose": "playlist_candidate",
+            "playlist_track_id": track.id,
+        },
     )
+    state._active_playlist_candidate_ids.add(task.id)
+    submitted = False
     try:
         torrent_data = await _download_playlist_candidate_torrent_file(state, resource)
         state.add_log(
@@ -3983,9 +4033,8 @@ async def _try_playlist_candidate_download(
                 f"Playlist candidate has no audio items: task={task.id}, title={task.name}",
                 "WARNING",
             )
-            await state.repository.delete_download_task(task.id)
             return None
-        submitted = await _scrape_playlist_candidate_items(
+        submitted_task = await _scrape_playlist_candidate_items(
             state,
             task,
             track,
@@ -3993,16 +4042,151 @@ async def _try_playlist_candidate_download(
             torrent_data,
             item_ids,
         )
-        if submitted is None:
+        submitted = submitted_task is not None
+        if submitted_task is None:
             state.add_log(
                 "playlist",
                 f"Playlist candidate rejected: task={task.id}, track={track.title}",
             )
-            await state.repository.delete_download_task(task.id)
-        return submitted
-    except Exception:
-        await state.repository.delete_download_task(task.id)
-        raise
+        return submitted_task
+    finally:
+        state._active_playlist_candidate_ids.discard(task.id)
+        if not submitted:
+            cleanup_task = _schedule_playlist_candidate_cleanup(
+                state,
+                task.id,
+                reason="Playlist candidate was not submitted.",
+            )
+            await asyncio.shield(cleanup_task)
+
+
+def _schedule_playlist_candidate_cleanup(
+    state: AppState,
+    task_id: int,
+    *,
+    reason: str,
+) -> asyncio.Task[None]:
+    existing = state._playlist_candidate_cleanup_tasks.get(task_id)
+    if existing is not None and not existing.done():
+        return existing
+    cleanup_task = asyncio.create_task(
+        _cleanup_playlist_candidate(state, task_id, reason=reason),
+        name=f"musicpilot-playlist-candidate-cleanup-{task_id}",
+    )
+    state._playlist_candidate_cleanup_tasks[task_id] = cleanup_task
+    state._background_tasks.add(cleanup_task)
+
+    def cleanup_done(completed: asyncio.Task[None]) -> None:
+        state._background_tasks.discard(completed)
+        if state._playlist_candidate_cleanup_tasks.get(task_id) is completed:
+            state._playlist_candidate_cleanup_tasks.pop(task_id, None)
+
+    cleanup_task.add_done_callback(cleanup_done)
+    return cleanup_task
+
+
+async def _cleanup_playlist_candidate(
+    state: AppState,
+    task_id: int,
+    *,
+    reason: str,
+) -> None:
+    last_error = ""
+    for attempt, delay in enumerate(PLAYLIST_CANDIDATE_CLEANUP_RETRY_DELAYS, start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            task = await state.repository.get_download_task(task_id)
+            if task is None:
+                return
+            if task.submitted_at is not None or not _is_pending_hash(task.torrent_hash):
+                return
+            await state.repository.update_download_task(
+                task_id,
+                status="candidate_cleaning",
+                last_error=None,
+            )
+            await state.repository.delete_download_task(task_id)
+            state.add_log(
+                "playlist",
+                f"Playlist candidate cleaned: task={task_id}, reason={reason}",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc) or exc.__class__.__name__
+            state.add_log(
+                "playlist",
+                "Playlist candidate cleanup failed: "
+                f"task={task_id}, attempt={attempt}/"
+                f"{len(PLAYLIST_CANDIDATE_CLEANUP_RETRY_DELAYS)}, error={last_error}",
+                "WARNING",
+            )
+    try:
+        await state.repository.update_download_task(
+            task_id,
+            status="candidate_cleanup_failed",
+            last_error=last_error or reason,
+        )
+    except Exception as exc:  # noqa: BLE001
+        state.add_log(
+            "playlist",
+            f"Playlist candidate cleanup status update failed: task={task_id}, error={exc}",
+            "ERROR",
+        )
+
+
+async def _cleanup_stale_playlist_candidates(state: AppState) -> None:
+    cutoff = datetime.now(UTC) - timedelta(seconds=PLAYLIST_CANDIDATE_STALE_SECONDS)
+    cleanup_tasks: list[asyncio.Task[None]] = []
+    for task in await state.repository.list_download_tasks():
+        if task.id in state._active_playlist_candidate_ids:
+            continue
+        active_cleanup = state._playlist_candidate_cleanup_tasks.get(task.id)
+        if active_cleanup is not None and not active_cleanup.done():
+            continue
+        if task.submitted_at is not None or not _is_pending_hash(task.torrent_hash):
+            continue
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        is_candidate = payload.get("purpose") == "playlist_candidate"
+        updated_at = task.updated_at
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=UTC)
+        else:
+            updated_at = updated_at.astimezone(UTC)
+        stale = updated_at <= cutoff
+        should_cleanup = is_candidate and (
+            task.status == "candidate_cleanup_failed"
+            or (stale and task.status in {"pre_scraping", "candidate_cleaning"})
+        )
+        if not should_cleanup and stale and task.status == "queued":
+            items = await state.repository.list_download_task_items(task.id)
+            should_cleanup = bool(items) and all(
+                item.status in DOWNLOAD_ITEM_SCRAPE_DONE_STATUSES for item in items
+            )
+        if not should_cleanup:
+            continue
+        cleanup_tasks.append(
+            _schedule_playlist_candidate_cleanup(
+                state,
+                task.id,
+                reason="Stale playlist candidate reconciliation.",
+            )
+        )
+    if cleanup_tasks:
+        await asyncio.gather(*cleanup_tasks)
+
+
+async def _cleanup_playlist_candidates_periodically(state: AppState) -> None:
+    while True:
+        await asyncio.sleep(PLAYLIST_CANDIDATE_CLEANUP_INTERVAL_SECONDS)
+        try:
+            await _cleanup_stale_playlist_candidates(state)
+        except Exception as exc:  # noqa: BLE001
+            state.add_log(
+                "playlist",
+                f"Playlist candidate reconciliation failed: {exc}",
+                "ERROR",
+            )
 
 
 async def _download_playlist_candidate_torrent_file(
@@ -4105,6 +4289,13 @@ async def _submit_playlist_candidate_to_downloader(
     if state.downloader is None:
         raise RuntimeError("No downloader is configured.")
     category = str((task.payload or {}).get("category") or "MusicPilot")
+    matched = await state.repository.update_download_task(
+        task.id,
+        status="candidate_matched",
+        last_error=None,
+    )
+    if matched is not None:
+        task = matched
     state.add_log(
         "playlist",
         "Playlist candidate submitting to downloader: "
@@ -7199,11 +7390,29 @@ async def _scraping_library_snapshots(
 
 
 async def _finalize_download_refresh_if_ready(state: AppState, task_id: int) -> None:
-    await state.task_manager.run_exclusive(
-        task_type="DOWNLOAD_FINALIZE_LIBRARY",
-        resource_keys=[f"download-finalize:{task_id}"],
-        payload={"torrent_record_id": task_id},
-        runner=lambda: _finalize_download_refresh_if_ready_direct(state, task_id),
+    task = await state.repository.get_download_task(task_id)
+    if task is None or task.status == "library_refreshed":
+        return
+    items = await state.repository.list_download_task_items(task_id)
+    payload = task.payload if isinstance(task.payload, dict) else {}
+    organize_item_ids = {
+        int(item) for item in payload.get("organize_item_ids", []) if isinstance(item, int)
+    }
+    if organize_item_ids:
+        items = [item for item in items if item.id in organize_item_ids]
+    if not items or any(
+        item.status not in DOWNLOAD_ITEM_ORGANIZE_TERMINAL_STATUSES for item in items
+    ):
+        return
+    await state.task_manager.enqueue(
+        TaskCreate(
+            task_type="DOWNLOAD_FINALIZE_LIBRARY",
+            payload={"torrent_record_id": task_id},
+            resource_keys=[f"download-finalize:{task_id}"],
+            priority=DOWNLOAD_REFRESH_TASK_PRIORITY,
+            max_attempts=3,
+            idempotency_key=f"download-finalize-library:{task_id}",
+        )
     )
 
 

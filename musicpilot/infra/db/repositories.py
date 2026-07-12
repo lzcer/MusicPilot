@@ -976,19 +976,24 @@ class SqlAlchemyMediaRepository:
         media_metadata: dict[str, Any],
         selected_site_ids: list[str],
         category: str,
+        status: str = "queued",
+        payload: dict[str, Any] | None = None,
     ) -> TorrentRecord:
         async with self.database.session() as session:
+            record_payload = {"category": category}
+            if payload:
+                record_payload.update(payload)
             record = TorrentRecord(
                 torrent_hash=f"pending:{uuid4().hex[:24]}",
                 name=str(resource.get("title") or "MusicPilot download"),
                 source=str(resource.get("source") or ""),
                 download_url=str(resource.get("download_url") or ""),
-                status="queued",
+                status=status,
                 progress=0.0,
                 resource_payload=resource,
                 media_metadata=media_metadata,
                 selected_site_ids=selected_site_ids,
-                payload={"category": category},
+                payload=record_payload,
             )
             session.add(record)
             await session.commit()
