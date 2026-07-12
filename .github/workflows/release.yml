@@ -332,11 +332,11 @@ jobs:
             fi
 
             # Append truncated notes to message
-            message+="\n\n${notes}"
+            message+=$'\n\n'"${notes}"
           fi
 
           # Footer: release link + Docker image
-          message+="\n\n<a href=\"${RELEASE_URL}\">查看 GitHub Release</a>\nDocker 镜像：<code>${RELEASE_IMAGE}:${RELEASE_TAG}</code>"
+          message+=$'\n\n'"<a href=\"${RELEASE_URL}\">查看 GitHub Release</a>"$'\n'"Docker 镜像：<code>${RELEASE_IMAGE}:${RELEASE_TAG}</code>"
 
           curl --fail --silent --show-error --retry 3 --connect-timeout 10 --max-time 30 \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
