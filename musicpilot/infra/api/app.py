@@ -2905,10 +2905,7 @@ def create_app() -> FastAPI:
         q: str | None = Query(default=None),
     ) -> MusicLibraryTrackPageResponse:
         try:
-            await _sync_music_library_from_media_server(
-                state,
-                refresh_all_playlist_matches=True,
-            )
+            await _sync_music_library_from_media_server(state)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"媒体服务器音乐库同步失败：{exc}") from exc
         rows, total, albums, artists = await state.repository.list_music_library_tracks_page(
@@ -6407,15 +6404,21 @@ async def _sync_music_library_from_media_server(
     *,
     refresh_all_playlist_matches: bool = False,
 ) -> int:
+    sync_started_at = time.perf_counter()
     server = await state.repository.default_media_server()
     if server is None:
         state.add_log("library", "Music library sync skipped: no media server", "WARNING")
         return 0
     client = build_media_server_client(server)
+    fetch_started_at = time.perf_counter()
     tracks = await client.list_tracks()
+    fetch_ms = _elapsed_ms(fetch_started_at)
+    database_started_at = time.perf_counter()
     result = await state.repository.sync_music_library_tracks(
         [_media_server_track_payload(track) for track in tracks]
     )
+    database_ms = _elapsed_ms(database_started_at)
+    matching_started_at = time.perf_counter()
     if refresh_all_playlist_matches:
         matched = await _refresh_playlist_library_matches(state)
     else:
@@ -6424,11 +6427,15 @@ async def _sync_music_library_from_media_server(
             changed_track_ids=result.changed_track_ids,
             deleted_track_ids=result.deleted_track_ids,
         )
+    matching_ms = _elapsed_ms(matching_started_at)
     state.add_log(
         "library",
         f"Music library synced: {result.total} track(s), "
+        f"written={result.written}, unchanged={result.unchanged}, "
         f"changed={len(result.changed_track_ids)}, deleted={len(result.deleted_track_ids)}, "
-        f"playlist_matches={matched}",
+        f"playlist_matches={matched}, fetch_ms={fetch_ms:.1f}, "
+        f"database_ms={database_ms:.1f}, matching_ms={matching_ms:.1f}, "
+        f"total_ms={_elapsed_ms(sync_started_at):.1f}",
     )
     return result.total
 

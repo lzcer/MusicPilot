@@ -55,6 +55,8 @@ SLOW_SYSTEM_TASK_SECONDS = int(os.getenv("MP_SLOW_SYSTEM_TASK_SECONDS", "300"))
 @dataclass(frozen=True, slots=True)
 class MusicLibrarySyncResult:
     total: int
+    written: int
+    unchanged: int
     changed_track_ids: tuple[int, ...]
     deleted_track_ids: tuple[int, ...]
 
@@ -1949,47 +1951,67 @@ class SqlAlchemyMediaRepository:
         synced_at = datetime.now(UTC)
         seen_ids: set[str] = set()
         changed_rows: list[MusicLibraryTrack] = []
+        written = 0
+        unchanged = 0
         async with self.database.session() as session:
             result = await session.execute(select(MusicLibraryTrack))
             existing = {item.navidrome_id: item for item in result.scalars().all()}
             for payload in tracks:
                 navidrome_id = str(payload.get("id") or "").strip()
-                if not navidrome_id:
+                if not navidrome_id or navidrome_id in seen_ids:
                     continue
                 seen_ids.add(navidrome_id)
                 row = existing.get(navidrome_id)
+                title = str(payload.get("title") or payload.get("name") or "-")
+                artist = _optional_string(payload.get("artist"))
+                raw_payload = payload.get("raw_payload")
+                values: dict[str, Any] = {
+                    "title": title,
+                    "artist": artist,
+                    "album": _optional_string(payload.get("album")),
+                    "duration": _optional_int(payload.get("duration")),
+                    "size": _optional_int(payload.get("size")),
+                    "year": _optional_int(payload.get("year")),
+                    "suffix": _optional_string(payload.get("suffix")),
+                    "path": _optional_string(payload.get("path")),
+                    "content_type": _optional_string(
+                        payload.get("contentType") or payload.get("content_type")
+                    ),
+                    "raw_payload": raw_payload if isinstance(raw_payload, dict) else payload,
+                }
+                match_fields_changed = (
+                    row is None or row.title != title or row.artist != artist
+                )
+                if row is not None and all(
+                    getattr(row, field) == value for field, value in values.items()
+                ):
+                    unchanged += 1
+                    continue
                 if row is None:
                     row = MusicLibraryTrack(navidrome_id=navidrome_id, title="")
                     session.add(row)
-                title = str(payload.get("title") or payload.get("name") or "-")
-                artist = _optional_string(payload.get("artist"))
-                if row.id is None or row.title != title or row.artist != artist:
+                if match_fields_changed:
                     changed_rows.append(row)
-                row.title = title
-                row.artist = artist
-                row.album = _optional_string(payload.get("album"))
-                row.duration = _optional_int(payload.get("duration"))
-                row.size = _optional_int(payload.get("size"))
-                row.year = _optional_int(payload.get("year"))
-                row.suffix = _optional_string(payload.get("suffix"))
-                row.path = _optional_string(payload.get("path"))
-                row.content_type = _optional_string(
-                    payload.get("contentType") or payload.get("content_type")
-                )
-                raw_payload = payload.get("raw_payload")
-                row.raw_payload = raw_payload if isinstance(raw_payload, dict) else payload
+                for field, value in values.items():
+                    setattr(row, field, value)
                 row.last_synced_at = synced_at
+                written += 1
             deleted_track_ids = tuple(
                 row.id for navidrome_id, row in existing.items() if navidrome_id not in seen_ids
             )
             for navidrome_id, row in existing.items():
                 if navidrome_id not in seen_ids:
                     await session.delete(row)
-            await session.flush()
-            changed_track_ids = tuple(row.id for row in changed_rows)
-            await session.commit()
+            if written or deleted_track_ids:
+                await session.flush()
+                changed_track_ids = tuple(row.id for row in changed_rows)
+                await session.commit()
+            else:
+                changed_track_ids = ()
         return MusicLibrarySyncResult(
             total=len(seen_ids),
+            written=written,
+            unchanged=unchanged,
             changed_track_ids=changed_track_ids,
             deleted_track_ids=deleted_track_ids,
         )
