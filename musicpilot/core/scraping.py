@@ -856,6 +856,8 @@ class LocalMusicScraper:
                 0,
             )
 
+        writes_tags = should_write_tags or bool(metadata_gain)
+
         # Resolve artist to canonical name
         if self.artist_service is not None:
             canonical = await self.artist_service.get_canonical_name(metadata.artist)
@@ -964,7 +966,7 @@ class LocalMusicScraper:
                 _copy_to_mapping,
                 source_file,
                 config,
-                hardlink=not metadata_gain,
+                hardlink=not writes_tags,
                 overwrite=not _will_classify_or_rename(config),
             )
             working_file = mapped_result.path
@@ -974,6 +976,7 @@ class LocalMusicScraper:
                 configured_mode=config.mode,
                 path_result=mapped_result,
                 metadata_gain=metadata_gain,
+                writes_tags=writes_tags,
             )
             overwritten_existing_target = mapped_result.overwritten_existing
             mapped_files += 1
@@ -992,6 +995,7 @@ class LocalMusicScraper:
                 configured_mode=config.mode,
                 path_result=mapped_result,
                 metadata_gain=metadata_gain,
+                writes_tags=writes_tags,
             )
             overwritten_existing_target = mapped_result.overwritten_existing
             mapped_files += 1
@@ -1671,6 +1675,7 @@ def _completed_operation_reason(
     configured_mode: ScrapingMode,
     path_result: _PathOperationResult,
     metadata_gain: tuple[RequiredMetadata, ...],
+    writes_tags: bool,
 ) -> str:
     if path_result.cause == "already_mapped":
         return f"{configured_reason}；目标文件已映射，无需重复处理"
@@ -1678,9 +1683,11 @@ def _completed_operation_reason(
         return f"{configured_reason}；已成功创建硬链接"
     if path_result.cause == "hardlink_failed":
         return f"{configured_reason}；硬链接创建失败，自动改用复制"
-    if configured_mode == "mapped" and metadata_gain:
-        fields = "、".join(_metadata_field_text(field) for field in metadata_gain)
-        return f"{configured_reason}；需要写入{fields}，自动改用复制"
+    if configured_mode == "mapped" and writes_tags:
+        if metadata_gain:
+            fields = "、".join(_metadata_field_text(field) for field in metadata_gain)
+            return f"{configured_reason}；需要写入{fields}，自动改用复制"
+        return f"{configured_reason}；需要写入标签，自动改用复制"
     return configured_reason
 
 
@@ -1710,7 +1717,7 @@ def _copy_to_mapping(
     target = config.mapped_directory / relative
     if not overwrite:
         target = _unique_path(target)
-    elif _same_existing_file(source_file, target):
+    elif hardlink and _same_existing_file(source_file, target):
         return _PathOperationResult(
             target,
             operation_type="mapped",
