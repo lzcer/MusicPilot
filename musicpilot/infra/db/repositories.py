@@ -517,6 +517,23 @@ class SqlAlchemyMediaRepository:
             )
             return list(result.scalars().all())
 
+    async def list_active_system_tasks_by_types(
+        self,
+        task_types: set[str],
+    ) -> list[SystemTask]:
+        if not task_types:
+            return []
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(SystemTask)
+                .where(
+                    SystemTask.status.in_({"WAIT", "RUNNING"}),
+                    SystemTask.task_type.in_(task_types),
+                )
+                .order_by(SystemTask.created_at, SystemTask.id)
+            )
+            return list(result.scalars().all())
+
     async def list_slow_running_system_tasks(
         self,
         *,
@@ -2235,6 +2252,53 @@ class SqlAlchemyMediaRepository:
                 select(Artist).where(Artist.normalized_name == normalized).limit(1)
             )
             return result.scalars().first()
+
+    async def list_artists_by_identity_candidates(
+        self,
+        *,
+        aliases: tuple[str, ...],
+        normalized_names: tuple[str, ...],
+    ) -> list[Artist]:
+        alias_names = tuple(dict.fromkeys(alias for alias in aliases if alias))
+        normalized_values = tuple(
+            dict.fromkeys(value for value in normalized_names if value)
+        )
+        conditions = []
+        if alias_names:
+            alias_artist_ids = select(ArtistAlias.artist_id).where(
+                ArtistAlias.alias.in_(alias_names)
+            )
+            conditions.append(Artist.id.in_(alias_artist_ids))
+        if normalized_values:
+            conditions.append(Artist.normalized_name.in_(normalized_values))
+        if not conditions:
+            return []
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(Artist).where(or_(*conditions)).order_by(Artist.id)
+            )
+            return list(result.scalars().all())
+
+    async def list_artist_alias_owners(
+        self,
+        aliases: tuple[str, ...],
+    ) -> dict[str, tuple[int, ...]]:
+        alias_names = tuple(dict.fromkeys(alias for alias in aliases if alias))
+        if not alias_names:
+            return {}
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(ArtistAlias.alias, ArtistAlias.artist_id).where(
+                    ArtistAlias.alias.in_(alias_names)
+                )
+            )
+            owners: dict[str, list[int]] = {}
+            for alias, artist_id in result.all():
+                owners.setdefault(alias, []).append(artist_id)
+            return {
+                alias: tuple(dict.fromkeys(artist_ids))
+                for alias, artist_ids in owners.items()
+            }
 
     async def get_artist(self, artist_id: int) -> Artist | None:
         async with self.database.session() as session:

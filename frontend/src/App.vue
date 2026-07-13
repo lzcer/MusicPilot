@@ -212,6 +212,12 @@ type FileOrganizeResponse = {
   skipped_files: number
 }
 
+type FileOrganizeEnqueueResponse = {
+  source_files: number
+  created_tasks: number
+  existing_tasks: number
+}
+
 type MediaBulkDeleteResponse = {
   deleted_ids: number[]
   not_found_ids: number[]
@@ -618,7 +624,6 @@ const musicLibraryLoading = ref(false)
 let logTimer: number | undefined
 let downloadTimer: number | undefined
 let artistBuildTimer: number | undefined
-let mediaRefreshTimer: number | undefined
 let systemTaskTimer: number | undefined
 let systemTaskRefreshPending = false
 let metadataSearchStream: EventSource | undefined
@@ -2438,9 +2443,8 @@ async function confirmFileOrganize() {
     return
   }
   fileOrganizing.value = true
-  startMediaRefreshPolling()
   try {
-    const summary = await api<FileOrganizeResponse>('/api/files/organize', {
+    const result = await api<FileOrganizeEnqueueResponse>('/api/files/organize', {
       method: 'POST',
       body: JSON.stringify({ paths })
     })
@@ -2450,30 +2454,16 @@ async function confirmFileOrganize() {
     pendingFileOrganizeLabel.value = ''
     pendingFileOrganizeHasDirectory.value = false
     selectedFilePaths.value = selectedFilePaths.value.filter((item) => !paths.includes(item))
-    await Promise.all([loadFiles(filePath.value), loadMedia()])
-    notify(
-      `整理完成：文件 ${summary.source_files}，成功 ${summary.source_files - summary.failed_files - summary.skipped_files}，失败 ${summary.failed_files}，跳过 ${summary.skipped_files}`
-    )
+    const existingText = result.existing_tasks
+      ? `，${result.existing_tasks} 条已有任务正在处理`
+      : ''
+    notify(`已创建 ${result.created_tasks} 条刮削任务${existingText}`)
+    void loadDashboard(true)
   } catch (error) {
-    notify(error instanceof Error ? error.message : '整理失败', 'error')
+    notify(error instanceof Error ? error.message : '创建刮削任务失败', 'error')
   } finally {
     fileOrganizing.value = false
-    stopMediaRefreshPolling()
   }
-}
-
-function startMediaRefreshPolling() {
-  if (mediaRefreshTimer !== undefined) return
-  void loadMedia()
-  mediaRefreshTimer = window.setInterval(() => {
-    void loadMedia()
-  }, 2000)
-}
-
-function stopMediaRefreshPolling() {
-  if (mediaRefreshTimer === undefined) return
-  window.clearInterval(mediaRefreshTimer)
-  mediaRefreshTimer = undefined
 }
 
 function changeFileRootType(value: unknown) {
@@ -4114,6 +4104,7 @@ function systemTaskTypeText(type: string) {
   return {
     PLAYLIST_TRACK_DOWNLOAD: '歌单单曲下载',
     DOWNLOAD_ITEM_SCRAPE: '下载明细匹配',
+    MANUAL_FILE_SCRAPE: '文件元数据刮削',
     FILE_ORGANIZE: '文件整理',
     DOWNLOAD_REFRESH_LIBRARY: '曲库刷新',
     DOWNLOAD_FINALIZE_LIBRARY: '曲库收尾',
@@ -4299,7 +4290,6 @@ onUnmounted(() => {
   window.clearInterval(downloadTimer)
   window.clearInterval(artistBuildTimer)
   stopSystemTaskPolling()
-  stopMediaRefreshPolling()
   metadataSearchStream?.close()
 })
 </script>

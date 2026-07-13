@@ -129,6 +129,7 @@ from musicpilot.infra.api.schemas import (
     FileEntryResponse,
     FileListResponse,
     FileManualOrganizeRequest,
+    FileOrganizeEnqueueResponse,
     FileOrganizeRequest,
     FileOrganizeResponse,
     HealthResponse,
@@ -595,15 +596,88 @@ class DownloadItemScrapeExecutor:
         )
 
 
+class ManualFileScrapeExecutor:
+    def __init__(self, state: AppState) -> None:
+        self.state = state
+
+    async def execute(self, task: object) -> TaskExecutionResult:
+        payload = getattr(task, "payload", {}) or {}
+        source_path = _optional_string(payload.get("source_file"))
+        if source_path is None:
+            raise ValueError("Manual file scrape task payload is incomplete.")
+        settings_payload = await self.state.repository.get_system_settings()
+        config = scraping_config_from_payload(settings_payload)
+        if not config.enabled:
+            raise RuntimeError("Scraping is disabled.")
+        source_file = await asyncio.to_thread(
+            _manual_source_file_for_task,
+            config,
+            source_path,
+        )
+        inferred_metadata = _track_metadata_from_payload(payload.get("inferred_metadata"))
+        candidates = await self.state.scraper.preload_selected_metadata_for_file(
+            source_file,
+            config,
+            inferred_metadata=inferred_metadata,
+        )
+        task_name = str(payload.get("task_name") or source_file.name)
+        batch_id = _optional_string(payload.get("batch_id"))
+        candidate_payloads = [_track_metadata_payload(item) for item in candidates]
+        self.state.add_log(
+            "metadata",
+            "Manual file metadata scraping completed: "
+            f"file={source_file}, candidates={len(candidates)}, batch={batch_id or '-'}",
+        )
+        return TaskExecutionResult(
+            result={
+                "source_file": str(source_file),
+                "candidate_count": len(candidates),
+                "batch_id": batch_id,
+            },
+            next_tasks=[
+                TaskCreate(
+                    task_type="FILE_ORGANIZE",
+                    payload={
+                        "mode": "manual_file",
+                        "source_file": str(source_file),
+                        "task_name": task_name,
+                        "batch_id": batch_id,
+                        "metadata_candidates": candidate_payloads,
+                        "metadata_lookup_completed": True,
+                        "inferred_metadata": (
+                            _track_metadata_payload(inferred_metadata)
+                            if inferred_metadata is not None
+                            else None
+                        ),
+                    },
+                    resource_keys=[_scraping_file_resource_key(source_file)],
+                    max_attempts=3,
+                    idempotency_key=_optional_string(payload.get("organize_idempotency_key")),
+                )
+            ],
+        )
+
+
 class FileOrganizeExecutor:
     def __init__(self, state: AppState) -> None:
         self.state = state
 
     async def execute(self, task: object) -> TaskExecutionResult:
         payload = getattr(task, "payload", {}) or {}
+        source_file = _optional_string(payload.get("source_file"))
+        if payload.get("mode") == "manual_file":
+            if source_file is None or payload.get("metadata_lookup_completed") is not True:
+                raise ValueError("Manual file organize task payload is incomplete.")
+            summary = await _organize_manual_source_file(
+                self.state,
+                Path(source_file),
+                str(payload.get("task_name") or Path(source_file).name),
+                _metadata_candidates_from_payload(payload.get("metadata_candidates")),
+                inferred_metadata=_track_metadata_from_payload(payload.get("inferred_metadata")),
+            )
+            return TaskExecutionResult(result=_scraping_summary_result(summary))
         task_id = _optional_int(payload.get("torrent_record_id"))
         item_id = _optional_int(payload.get("item_id"))
-        source_file = _optional_string(payload.get("source_file"))
         task_name = str(payload.get("task_name") or "download")
         if task_id is None or item_id is None or not source_file:
             raise ValueError("File organize task payload is incomplete.")
@@ -744,6 +818,10 @@ class AppState:
         self.task_executors.register(
             "DOWNLOAD_ITEM_SCRAPE",
             DownloadItemScrapeExecutor(self),
+        )
+        self.task_executors.register(
+            "MANUAL_FILE_SCRAPE",
+            ManualFileScrapeExecutor(self),
         )
         self.task_executors.register("FILE_ORGANIZE", FileOrganizeExecutor(self))
         self.task_executors.register(
@@ -2714,8 +2792,14 @@ def create_app() -> FastAPI:
             failures=failures,
         )
 
-    @app.post("/api/files/organize", response_model=FileOrganizeResponse, status_code=202)
-    async def organize_source_file(payload: FileOrganizeRequest) -> FileOrganizeResponse:
+    @app.post(
+        "/api/files/organize",
+        response_model=FileOrganizeEnqueueResponse,
+        status_code=202,
+    )
+    async def organize_source_file(
+        payload: FileOrganizeRequest,
+    ) -> FileOrganizeEnqueueResponse:
         settings_payload = await state.repository.get_system_settings()
         config = scraping_config_from_payload(settings_payload)
         if not config.enabled:
@@ -2729,28 +2813,46 @@ def create_app() -> FastAPI:
         source_files = await asyncio.to_thread(_source_audio_files_for_targets, root, targets)
         if not source_files:
             raise HTTPException(status_code=422, detail="目标中没有可整理的音频文件。")
-        if len(targets) == 1:
-            task_name = targets[0].name or "manual"
-        else:
-            task_name = "manual batch"
+        inferred_metadata = await asyncio.to_thread(
+            infer_metadata_from_paths,
+            list(source_files),
+        )
+        batch_id = token_urlsafe(12)
+        active_sources = await _active_manual_file_task_sources(state)
+        created_tasks = 0
+        existing_tasks = 0
         try:
-            task_id = await state.task_manager.enqueue(
-                TaskCreate(
-                    task_type="MANUAL_SCRAPE",
-                    payload={
-                        "task_name": task_name,
-                        "source_files": [str(item) for item in source_files],
-                    },
-                    resource_keys=[_scraping_batch_resource_key("manual-scrape", source_files)],
+            for source_file in source_files:
+                task_id = await _enqueue_manual_file_scrape(
+                    state,
+                    source_file,
+                    batch_id=batch_id,
+                    inferred_metadata=inferred_metadata.get(source_file),
+                    active_sources=active_sources,
                 )
-            )
-            task = await state.task_manager.wait_for_task(task_id)
-            if task.status != "SUCCEEDED":
-                raise RuntimeError(task.error_message or f"Manual scrape failed: {task_name}")
+                if task_id is None:
+                    existing_tasks += 1
+                    continue
+                created_tasks += 1
+                active_sources.add(str(source_file))
         except Exception as exc:  # noqa: BLE001
-            state.add_log("metadata", f"Manual scraping failed for {task_name}: {exc}", "ERROR")
-            raise HTTPException(status_code=502, detail=f"整理失败：{exc}") from exc
-        return _file_organize_response_from_task_result(task.result or {})
+            state.add_log(
+                "metadata",
+                f"Manual file scraping enqueue failed: batch={batch_id}, error={exc}",
+                "ERROR",
+            )
+            raise HTTPException(status_code=502, detail=f"创建刮削任务失败：{exc}") from exc
+        state.add_log(
+            "metadata",
+            "Manual file scraping tasks enqueued: "
+            f"batch={batch_id}, files={len(source_files)}, created={created_tasks}, "
+            f"existing={existing_tasks}",
+        )
+        return FileOrganizeEnqueueResponse(
+            source_files=len(source_files),
+            created_tasks=created_tasks,
+            existing_tasks=existing_tasks,
+        )
 
     @app.post("/api/files/manual-organize", response_model=FileOrganizeResponse)
     async def manual_organize_source_file(
@@ -5520,6 +5622,82 @@ def _file_identity_digest(path: Path) -> str:
     return hashlib.sha1(identity.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
+def _manual_file_generation_digest(path: Path) -> str:
+    resolved = path.expanduser().resolve(strict=False)
+    stat = resolved.stat()
+    identity = "|".join((str(resolved), str(stat.st_size), str(stat.st_mtime_ns)))
+    return hashlib.sha1(identity.encode("utf-8", errors="ignore")).hexdigest()[:20]
+
+
+async def _active_manual_file_task_sources(state: AppState) -> set[str]:
+    tasks = await state.repository.list_active_system_tasks_by_types(
+        {"MANUAL_SCRAPE", "MANUAL_FILE_SCRAPE", "FILE_ORGANIZE"}
+    )
+    sources: set[str] = set()
+    for task in tasks:
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        if task.task_type == "MANUAL_SCRAPE":
+            source_files = payload.get("source_files")
+            if not isinstance(source_files, list):
+                continue
+            for source_file in source_files:
+                if not isinstance(source_file, str):
+                    continue
+                source_key = _path_match_key(source_file)
+                if source_key is not None:
+                    sources.add(source_key)
+            continue
+        if task.task_type == "FILE_ORGANIZE" and payload.get("mode") != "manual_file":
+            continue
+        source_file = _optional_string(payload.get("source_file"))
+        if source_file is None:
+            continue
+        source_key = _path_match_key(source_file)
+        if source_key is not None:
+            sources.add(source_key)
+    return sources
+
+
+async def _enqueue_manual_file_scrape(
+    state: AppState,
+    source_file: Path,
+    *,
+    batch_id: str,
+    inferred_metadata: TrackMetadata | None,
+    active_sources: set[str],
+) -> int | None:
+    source_key = _path_match_key(source_file)
+    if source_key is None or source_key in active_sources:
+        return None
+    generation = await asyncio.to_thread(_manual_file_generation_digest, source_file)
+    scrape_base_key = f"manual-file-scrape:{generation}"
+    organize_base_key = f"manual-file-organize:{generation}"
+    existing_scrape = await state.repository.get_system_task_by_idempotency_key(scrape_base_key)
+    existing_organize = await state.repository.get_system_task_by_idempotency_key(organize_base_key)
+    retry_suffix = (
+        f":retry:{batch_id}" if existing_scrape is not None or existing_organize is not None else ""
+    )
+    return await state.task_manager.enqueue(
+        TaskCreate(
+            task_type="MANUAL_FILE_SCRAPE",
+            payload={
+                "source_file": str(source_file),
+                "task_name": source_file.name,
+                "batch_id": batch_id,
+                "inferred_metadata": (
+                    _track_metadata_payload(inferred_metadata)
+                    if inferred_metadata is not None
+                    else None
+                ),
+                "organize_idempotency_key": f"{organize_base_key}{retry_suffix}",
+            },
+            resource_keys=[_scraping_file_resource_key(source_file)],
+            max_attempts=3,
+            idempotency_key=f"{scrape_base_key}{retry_suffix}",
+        )
+    )
+
+
 def _download_item_scrape_idempotency_key(item: TorrentRecordItem) -> str:
     raw_payload = item.raw_payload if isinstance(item.raw_payload, dict) else {}
     identity = "|".join(
@@ -5645,6 +5823,19 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> TorrentRe
 
 def _track_metadata_payload(metadata: TrackMetadata) -> dict[str, object]:
     return dataclasses.asdict(metadata)
+
+
+def _metadata_candidates_from_payload(payload: object) -> tuple[TrackMetadata, ...]:
+    if not isinstance(payload, list):
+        return ()
+    candidates: list[TrackMetadata] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        metadata = _track_metadata_from_payload(item)
+        if metadata is not None:
+            candidates.append(metadata)
+    return tuple(candidates)
 
 
 def _track_metadata_response(metadata: TrackMetadata) -> TrackMetadataResponse:
@@ -6279,6 +6470,10 @@ def _dashboard_storage_response(
 
 
 def _system_task_response(item: SystemTask) -> SystemTaskResponse:
+    payload = dict(item.payload or {})
+    metadata_candidates = payload.pop("metadata_candidates", None)
+    if isinstance(metadata_candidates, list):
+        payload["metadata_candidate_count"] = len(metadata_candidates)
     return SystemTaskResponse(
         id=item.id,
         task_type=item.task_type,
@@ -6286,7 +6481,7 @@ def _system_task_response(item: SystemTask) -> SystemTaskResponse:
         chain_id=item.chain_id,
         parent_task_id=item.parent_task_id,
         priority=item.priority,
-        payload=item.payload or {},
+        payload=payload,
         error_message=item.error_message,
         attempts=item.attempts,
         max_attempts=item.max_attempts,
@@ -7190,6 +7385,19 @@ def _file_size_or_none(path: str | None) -> int | None:
 
 def _scraping_source_root_or_409(config: ScrapingConfig) -> Path:
     return _scraping_file_root_or_409(config, "source")
+
+
+def _manual_source_file_for_task(config: ScrapingConfig, source_path: str) -> Path:
+    configured_root = config.source_directory
+    if configured_root is None:
+        raise RuntimeError("Scraping source directory is not configured.")
+    root = configured_root.expanduser().resolve(strict=False)
+    source_file = Path(source_path).expanduser().resolve(strict=False)
+    if not source_file.is_relative_to(root):
+        raise RuntimeError("Source file is outside the configured scraping directory.")
+    if not source_file.is_file() or not _is_audio_file(source_file):
+        raise RuntimeError("Source audio file is missing.")
+    return source_file
 
 
 def _scraping_file_root_or_409(config: ScrapingConfig, root_type: str) -> Path:
@@ -8205,6 +8413,78 @@ async def _scrape_download_for_task(
         f"failed={summary.failed_files}, "
         f"skipped={sum(1 for item in summary.results if item.status == 'skipped')}",
     )
+    return summary
+
+
+async def _organize_manual_source_file(
+    state: AppState,
+    source_path: Path,
+    task_name: str,
+    candidates: tuple[TrackMetadata, ...],
+    *,
+    inferred_metadata: TrackMetadata | None,
+) -> ScrapingSummary:
+    settings_payload = await state.repository.get_system_settings()
+    config = scraping_config_from_payload(settings_payload)
+    if not config.enabled:
+        raise RuntimeError("Scraping is disabled.")
+    source_file = await asyncio.to_thread(
+        _manual_source_file_for_task,
+        config,
+        str(source_path),
+    )
+    library_tracks, media_history = await _scraping_library_snapshots(state)
+
+    async def record_file_result(result: ScrapingFileResult) -> None:
+        if result.status in {"success", "skipped"}:
+            await _ensure_artist_from_metadata(
+                state,
+                result.metadata,
+                context=f"manual file organize {task_name}",
+            )
+        await state.repository.record_scraping_result(
+            torrent_hash=None,
+            source_path=result.source_path,
+            library_path=result.library_path,
+            operation_type=result.operation_type,
+            operation_reason=result.operation_reason,
+            metadata=result.metadata,
+            status=result.status,
+            error_message=result.error_message,
+        )
+        state.add_log(
+            "metadata",
+            _scraping_file_log_message(task_name, result),
+            "WARNING" if result.status == "failed" else "INFO",
+        )
+
+    summary = await state.scraper.process_download(
+        task_name=task_name,
+        save_path=None,
+        config=config,
+        source_files=(source_file,),
+        library_tracks=library_tracks,
+        media_history=media_history,
+        cached_metadata={source_file: candidates} if candidates else {},
+        on_file_result=record_file_result,
+        preload_metadata=False,
+        metadata_lookup_completed_files={source_file},
+        inferred_metadata=(
+            {source_file: inferred_metadata} if inferred_metadata is not None else None
+        ),
+        use_directory_album_context=True,
+    )
+    state.add_log(
+        "metadata",
+        "Manual file organization completed: "
+        f"file={source_file}, candidates={len(candidates)}, "
+        f"failed={summary.failed_files}",
+    )
+    if any(item.status == "success" for item in summary.results):
+        await _refresh_music_library_after_change(
+            state,
+            f"manual file organization, task={task_name}",
+        )
     return summary
 
 

@@ -303,6 +303,12 @@ class FileOrganizeRequest(BaseModel):
     paths: list[str] = Field(default_factory=list)
 
 
+class FileOrganizeEnqueueResponse(BaseModel):
+    source_files: int
+    created_tasks: int
+    existing_tasks: int
+
+
 class FileManualOrganizeRequest(BaseModel):
     path: str = Field(min_length=1)
     title: str = Field(min_length=1)
