@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import dataclasses
 import hashlib
@@ -14,7 +15,7 @@ import tempfile
 import time
 import tomllib
 import unicodedata
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -84,6 +85,7 @@ from musicpilot.core.scraping import (
     infer_album_context_metadata,
     infer_metadata_from_paths,
     normalize_metadata_match_text,
+    read_track_metadata,
     scraping_config_from_payload,
 )
 from musicpilot.core.storage import calculate_library_storage_usage, normalize_storage_path
@@ -118,6 +120,8 @@ from musicpilot.infra.api.schemas import (
     DownloadResponse,
     DownloadTaskItemResponse,
     DownloadTaskResponse,
+    FileAudioCoverResponse,
+    FileAudioDetailResponse,
     FileBulkDeleteFailure,
     FileBulkDeleteRequest,
     FileBulkDeleteResponse,
@@ -228,6 +232,9 @@ _TORRENT_AUDIO_EXTENSIONS = {
     ".wav",
     ".wma",
 }
+_AUDIO_DETAIL_MAX_COVER_BYTES = 10 * 1024 * 1024
+_AUDIO_DETAIL_CACHE_MAX_ENTRIES = 64
+_AUDIO_DETAIL_CACHE_MAX_BYTES = 64 * 1024 * 1024
 DOWNLOAD_POLL_INTERVAL_SECONDS = 5
 TAGGED_DOWNLOAD_MONITOR_INTERVAL_SECONDS = 30
 MUSIC_LIBRARY_SYNC_INTERVAL_SECONDS = 3600
@@ -263,6 +270,48 @@ PLAYLIST_CANDIDATE_CLEANUP_INTERVAL_SECONDS = 300
 PLAYLIST_CANDIDATE_STALE_SECONDS = 1800
 PLAYLIST_CANDIDATE_CLEANUP_RETRY_DELAYS = (0.0, 0.25, 1.0)
 logger = logging.getLogger(__name__)
+
+
+AudioDetailCacheKey = tuple[str, str, int, int]
+
+
+class AudioDetailCache:
+    def __init__(self, *, max_entries: int, max_bytes: int) -> None:
+        self.max_entries = max_entries
+        self.max_bytes = max_bytes
+        self._entries: OrderedDict[
+            AudioDetailCacheKey,
+            tuple[FileAudioDetailResponse, int],
+        ] = OrderedDict()
+        self._size_bytes = 0
+
+    def get(self, key: AudioDetailCacheKey) -> FileAudioDetailResponse | None:
+        cached = self._entries.get(key)
+        if cached is None:
+            return None
+        self._entries.move_to_end(key)
+        return cached[0]
+
+    def put(self, key: AudioDetailCacheKey, detail: FileAudioDetailResponse) -> None:
+        weight = _audio_detail_cache_weight(detail)
+        if weight > self.max_bytes:
+            return
+        path_key = key[:2]
+        stale_keys = [item for item in self._entries if item[:2] == path_key]
+        for stale_key in stale_keys:
+            _, stale_weight = self._entries.pop(stale_key)
+            self._size_bytes -= stale_weight
+        self._entries[key] = (detail, weight)
+        self._size_bytes += weight
+        while len(self._entries) > self.max_entries or self._size_bytes > self.max_bytes:
+            _, (_, removed_weight) = self._entries.popitem(last=False)
+            self._size_bytes -= removed_weight
+
+
+def _audio_detail_cache_weight(detail: FileAudioDetailResponse) -> int:
+    cover_size = len(detail.cover.data) if detail.cover is not None else 0
+    lyrics_size = len(detail.lyrics.encode("utf-8")) if detail.lyrics else 0
+    return 2048 + cover_size + lyrics_size
 
 
 def _elapsed_ms(started_at: float) -> float:
@@ -730,6 +779,11 @@ class AppState:
         self.artist_build_finished_at: datetime | None = None
         self.artist_build_last_error: str | None = None
         self.library_storage_lock = asyncio.Lock()
+        self.audio_detail_cache = AudioDetailCache(
+            max_entries=_AUDIO_DETAIL_CACHE_MAX_ENTRIES,
+            max_bytes=_AUDIO_DETAIL_CACHE_MAX_BYTES,
+        )
+        self.audio_detail_cache_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._metadata_source_semaphores: dict[str, tuple[int, asyncio.Semaphore]] = {}
         self._metadata_source_semaphores_lock = asyncio.Lock()
@@ -2588,6 +2642,48 @@ def create_app() -> FastAPI:
             parent=_source_parent_path(root, target),
             entries=entries,
         )
+
+    @app.get("/api/files/detail", response_model=FileAudioDetailResponse)
+    async def source_file_detail(
+        path: str = Query(min_length=1),
+        root_type: str = Query(default="source", pattern="^(source|mapped)$"),
+    ) -> FileAudioDetailResponse:
+        settings_payload = await state.repository.get_system_settings()
+        config = scraping_config_from_payload(settings_payload)
+        root = _scraping_file_root_or_409(config, root_type)
+        target = _resolve_source_relative_path(root, path)
+        try:
+            stat_result = await asyncio.to_thread(target.stat)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="音频文件不存在。") from exc
+        except OSError as exc:
+            raise HTTPException(status_code=422, detail=f"无法读取音频文件：{exc}") from exc
+        is_audio_file = await asyncio.to_thread(target.is_file)
+        if not is_audio_file or not _is_audio_file(target):
+            raise HTTPException(status_code=422, detail="目标不是受支持的音频文件。")
+        cache_key = (
+            root_type,
+            os.path.normcase(str(target)),
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+        )
+        async with state.audio_detail_cache_lock:
+            cached = state.audio_detail_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            detail = await asyncio.to_thread(
+                _source_audio_detail_response,
+                root,
+                target,
+                stat_result,
+            )
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc).strip() or type(exc).__name__
+            raise HTTPException(status_code=422, detail=f"音频详情读取失败：{message}") from exc
+        async with state.audio_detail_cache_lock:
+            state.audio_detail_cache.put(cache_key, detail)
+        return detail
 
     @app.delete("/api/files", response_model=FileBulkDeleteResponse)
     async def delete_source_files(payload: FileBulkDeleteRequest) -> FileBulkDeleteResponse:
@@ -7109,6 +7205,238 @@ def _source_entry_response(root: Path, path: Path) -> FileEntryResponse | None:
         size=size,
         modified_at=datetime.fromtimestamp(stat.st_mtime, UTC),
     )
+
+
+def _source_audio_detail_response(
+    root: Path,
+    path: Path,
+    stat_result: os.stat_result,
+) -> FileAudioDetailResponse:
+    from mutagen import File as MutagenFile
+
+    metadata = read_track_metadata(path)
+    audio = MutagenFile(path)
+    if audio is None:
+        raise ValueError("无法识别音频格式。")
+    try:
+        info = getattr(audio, "info", None)
+        duration = _positive_float_attribute(info, "length")
+        bitrate = _positive_int_attribute(info, "bitrate")
+        sample_rate = _positive_int_attribute(info, "sample_rate")
+        channels = _positive_int_attribute(info, "channels")
+        lyrics = _audio_embedded_lyrics(audio)
+        return FileAudioDetailResponse(
+            name=path.name,
+            path=_source_relative_path(root, path),
+            extension=path.suffix.casefold(),
+            format=path.suffix.removeprefix(".").upper(),
+            size=stat_result.st_size,
+            modified_at=datetime.fromtimestamp(stat_result.st_mtime, UTC),
+            title=metadata.title,
+            artist=metadata.artist,
+            album=metadata.album,
+            album_artist=metadata.album_artist,
+            year=metadata.year,
+            track_number=metadata.track_number,
+            lyrics=lyrics,
+            duration=round(duration, 3) if duration is not None else None,
+            bitrate=bitrate,
+            sample_rate=sample_rate,
+            channels=channels,
+            cover=_audio_embedded_cover(audio),
+        )
+    finally:
+        close = getattr(audio, "close", None)
+        if callable(close):
+            close()
+
+
+def _positive_float_attribute(value: object, name: str) -> float | None:
+    raw = getattr(value, name, None)
+    if not isinstance(raw, int | float) or raw <= 0:
+        return None
+    return float(raw)
+
+
+def _positive_int_attribute(value: object, name: str) -> int | None:
+    raw = getattr(value, name, None)
+    if not isinstance(raw, int | float) or raw <= 0:
+        return None
+    return int(raw)
+
+
+def _audio_embedded_lyrics(audio: object) -> str | None:
+    from mutagen.aiff import AIFF
+    from mutagen.flac import FLAC
+    from mutagen.mp3 import MP3
+    from mutagen.mp4 import MP4
+    from mutagen.oggopus import OggOpus
+    from mutagen.oggvorbis import OggVorbis
+    from mutagen.wave import WAVE
+
+    if isinstance(audio, MP3 | AIFF | WAVE):
+        return _id3_embedded_lyrics(audio)
+    if isinstance(audio, FLAC):
+        return _flac_embedded_lyrics(audio)
+    if isinstance(audio, OggVorbis | OggOpus):
+        return _ogg_embedded_lyrics(audio)
+    if isinstance(audio, MP4):
+        return _mp4_embedded_lyrics(audio)
+    return None
+
+
+def _id3_embedded_lyrics(audio: object) -> str | None:
+    tags = getattr(audio, "tags", None)
+    if tags is None:
+        return None
+    getall = getattr(tags, "getall", None)
+    if not callable(getall):
+        return None
+    for frame in getall("USLT"):
+        text = getattr(frame, "text", None)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return None
+
+
+def _flac_embedded_lyrics(audio: object) -> str | None:
+    tags = getattr(audio, "tags", None)
+    return _audio_tag_text(tags.get("LYRICS")) if tags is not None else None
+
+
+def _ogg_embedded_lyrics(audio: object) -> str | None:
+    tags = getattr(audio, "tags", None)
+    return _audio_tag_text(tags.get("LYRICS")) if tags is not None else None
+
+
+def _mp4_embedded_lyrics(audio: object) -> str | None:
+    tags = getattr(audio, "tags", None)
+    return _audio_tag_text(tags.get("\xa9lyr")) if tags is not None else None
+
+
+def _audio_tag_text(value: object) -> str | None:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, list | tuple):
+        for item in value:
+            text = _audio_tag_text(item)
+            if text:
+                return text
+    return None
+
+
+def _audio_embedded_cover(audio: object) -> FileAudioCoverResponse | None:
+    from mutagen.aiff import AIFF
+    from mutagen.flac import FLAC
+    from mutagen.mp3 import MP3
+    from mutagen.mp4 import MP4
+    from mutagen.oggopus import OggOpus
+    from mutagen.oggvorbis import OggVorbis
+    from mutagen.wave import WAVE
+
+    if isinstance(audio, MP3 | AIFF | WAVE):
+        return _id3_embedded_cover(audio)
+    if isinstance(audio, FLAC):
+        return _flac_embedded_cover(audio)
+    if isinstance(audio, OggVorbis | OggOpus):
+        return _ogg_embedded_cover(audio)
+    if isinstance(audio, MP4):
+        return _mp4_embedded_cover(audio)
+    return None
+
+
+def _id3_embedded_cover(audio: object) -> FileAudioCoverResponse | None:
+    tags = getattr(audio, "tags", None)
+    if tags is None:
+        return None
+    getall = getattr(tags, "getall", None)
+    if not callable(getall):
+        return None
+    frames = getall("APIC")
+    preferred = next((frame for frame in frames if getattr(frame, "type", None) == 3), None)
+    frame = preferred or (frames[0] if frames else None)
+    if frame is None:
+        return None
+    return _audio_cover_response(
+        getattr(frame, "data", None),
+        getattr(frame, "mime", None),
+    )
+
+
+def _flac_embedded_cover(audio: object) -> FileAudioCoverResponse | None:
+    pictures = getattr(audio, "pictures", None)
+    if not isinstance(pictures, list) or not pictures:
+        return None
+    preferred = next(
+        (picture for picture in pictures if getattr(picture, "type", None) == 3),
+        pictures[0],
+    )
+    return _audio_cover_response(
+        getattr(preferred, "data", None),
+        getattr(preferred, "mime", None),
+    )
+
+
+def _ogg_embedded_cover(audio: object) -> FileAudioCoverResponse | None:
+    from mutagen.flac import Picture
+
+    tags = getattr(audio, "tags", None)
+    encoded_pictures = tags.get("METADATA_BLOCK_PICTURE") if tags is not None else None
+    if not isinstance(encoded_pictures, list | tuple):
+        return None
+    for encoded_picture in encoded_pictures:
+        if not isinstance(encoded_picture, str):
+            continue
+        try:
+            picture = Picture(base64.b64decode(encoded_picture))
+        except Exception:  # noqa: BLE001
+            continue
+        cover = _audio_cover_response(picture.data, picture.mime)
+        if cover is not None:
+            return cover
+    return None
+
+
+def _mp4_embedded_cover(audio: object) -> FileAudioCoverResponse | None:
+    tags = getattr(audio, "tags", None)
+    covers = tags.get("covr") if tags is not None else None
+    if isinstance(covers, list) and covers:
+        return _audio_cover_response(covers[0], None)
+    return None
+
+
+def _audio_cover_response(data: object, mime_type: object) -> FileAudioCoverResponse | None:
+    if not isinstance(data, bytes | bytearray):
+        return None
+    cover_data = bytes(data)
+    if not cover_data or len(cover_data) > _AUDIO_DETAIL_MAX_COVER_BYTES:
+        return None
+    detected_mime = _audio_cover_mime_type(cover_data, mime_type)
+    if detected_mime is None:
+        return None
+    return FileAudioCoverResponse(
+        mime_type=detected_mime,
+        data=base64.b64encode(cover_data).decode("ascii"),
+    )
+
+
+def _audio_cover_mime_type(data: bytes, declared: object) -> str | None:
+    if data.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    if isinstance(declared, str) and declared.casefold() in {
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+    }:
+        return declared.casefold()
+    return None
 
 
 def _path_lexists(path: Path) -> bool:

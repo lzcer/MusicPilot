@@ -176,6 +176,32 @@ type FileListResponse = {
   entries: FileEntry[]
 }
 
+type FileAudioCover = {
+  mime_type: string
+  data: string
+}
+
+type FileAudioDetail = {
+  name: string
+  path: string
+  extension: string
+  format: string
+  size: number
+  modified_at: string
+  title: string
+  artist?: string | null
+  album?: string | null
+  album_artist?: string | null
+  year?: number | null
+  track_number?: number | null
+  lyrics?: string | null
+  duration?: number | null
+  bitrate?: number | null
+  sample_rate?: number | null
+  channels?: number | null
+  cover?: FileAudioCover | null
+}
+
 type FileOrganizeResponse = {
   source_files: number
   mapped_files: number
@@ -658,6 +684,22 @@ const fileRoot = ref('')
 const fileLoading = ref(false)
 const fileError = ref('')
 const fileSearchQuery = ref('')
+const fileDetailDialog = ref(false)
+const fileDetailLoading = ref(false)
+const fileDetailError = ref('')
+const fileDetail = ref<FileAudioDetail | null>(null)
+let fileDetailRequestId = 0
+const fileDetailCoverSource = computed(() => {
+  const cover = fileDetail.value?.cover
+  return cover ? `data:${cover.mime_type};base64,${cover.data}` : ''
+})
+watch(fileDetailDialog, (open) => {
+  if (open) return
+  fileDetailRequestId += 1
+  fileDetailLoading.value = false
+  fileDetailError.value = ''
+  fileDetail.value = null
+})
 const musicLibraryTracks = ref<MusicLibraryTrack[]>([])
 const sites = ref<Site[]>([])
 const downloaders = ref<DownloaderConfig[]>([])
@@ -918,6 +960,20 @@ const metadataSourceOptions = [
 function metadataSourceLabel(source?: string | null) {
   return metadataSourceOptions.find((option) => option.value === source)?.title || source || 'QQ音乐'
 }
+
+const AUDIO_FILE_EXTENSIONS = new Set([
+  '.aac',
+  '.aiff',
+  '.alac',
+  '.ape',
+  '.flac',
+  '.m4a',
+  '.mp3',
+  '.ogg',
+  '.opus',
+  '.wav',
+  '.wma'
+])
 
 function downloadCreationTypeText(value: string) {
   return value === 'monitor_created' ? '监听创建' : '任务创建'
@@ -2234,6 +2290,40 @@ async function loadFiles(path = filePath.value) {
 function openFileEntry(entry: FileEntry) {
   if (entry.type !== 'directory') return
   void loadFiles(entry.path)
+}
+
+function isAudioFile(entry: FileEntry) {
+  if (entry.type !== 'file') return false
+  const extensionIndex = entry.name.lastIndexOf('.')
+  if (extensionIndex < 0) return false
+  return AUDIO_FILE_EXTENSIONS.has(entry.name.slice(extensionIndex).toLowerCase())
+}
+
+async function openFileDetail(entry: FileEntry) {
+  if (!isAudioFile(entry)) return
+  const requestId = ++fileDetailRequestId
+  fileDetail.value = null
+  fileDetailError.value = ''
+  fileDetailLoading.value = true
+  fileDetailDialog.value = true
+  const params = new URLSearchParams({
+    path: entry.path,
+    root_type: fileRootType.value
+  })
+  try {
+    const detail = await api<FileAudioDetail>(`/api/files/detail?${params.toString()}`)
+    if (requestId !== fileDetailRequestId) return
+    fileDetail.value = detail
+  } catch (error) {
+    if (requestId !== fileDetailRequestId) return
+    const message = error instanceof Error ? error.message : '音频详情加载失败'
+    fileDetailError.value = message
+    notify(message, 'error')
+  } finally {
+    if (requestId === fileDetailRequestId) {
+      fileDetailLoading.value = false
+    }
+  }
 }
 
 function runFileSearch() {
@@ -3854,6 +3944,27 @@ function formatDuration(value?: number | null) {
   return `${minutes}:${seconds.toString().padStart(2, '0')}`
 }
 
+function formatAudioDuration(value?: number | null) {
+  return formatDuration(value ? Math.round(value) : value)
+}
+
+function formatAudioBitrate(value?: number | null) {
+  return value ? `${Math.round(value / 1000)} kbps` : '-'
+}
+
+function formatAudioSampleRate(value?: number | null) {
+  if (!value) return '-'
+  const kilohertz = value / 1000
+  return `${Number.isInteger(kilohertz) ? kilohertz : kilohertz.toFixed(1)} kHz`
+}
+
+function formatAudioChannels(value?: number | null) {
+  if (!value) return '-'
+  if (value === 1) return '1（单声道）'
+  if (value === 2) return '2（立体声）'
+  return `${value}`
+}
+
 function formatTime(value: string) {
   return new Date(value).toLocaleString()
 }
@@ -5031,6 +5142,15 @@ onUnmounted(() => {
                     <td>{{ entry.type === 'directory' ? '-' : formatSize(entry.size) }}</td>
                     <td>{{ entry.modified_at ? formatTime(entry.modified_at) : '-' }}</td>
                     <td>
+                      <v-btn
+                        v-if="isAudioFile(entry)"
+                        icon="mdi-eye-outline"
+                        color="primary"
+                        variant="text"
+                        size="small"
+                        title="查看"
+                        @click.stop="openFileDetail(entry)"
+                      />
                       <v-btn
                         icon="mdi-playlist-check"
                         color="primary"
@@ -7052,6 +7172,83 @@ onUnmounted(() => {
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="fileDetailDialog" max-width="900" scrollable>
+      <v-card :title="fileDetail?.name || '音频详情'">
+        <v-progress-linear v-if="fileDetailLoading" indeterminate color="primary" />
+        <v-card-text class="file-detail-body">
+          <div v-if="fileDetailLoading" class="file-detail-loading">正在读取音频详情...</div>
+          <v-alert v-else-if="fileDetailError" type="error" variant="tonal">
+            {{ fileDetailError }}
+          </v-alert>
+          <div v-else-if="fileDetail" class="file-detail-content">
+            <div class="file-detail-cover-panel">
+              <img
+                v-if="fileDetailCoverSource"
+                class="file-detail-cover"
+                :src="fileDetailCoverSource"
+                :alt="`${fileDetail.title} 封面`"
+              />
+              <div v-else class="file-detail-cover-empty">
+                <v-icon icon="mdi-album" size="64" />
+                <span>无内嵌封面</span>
+              </div>
+            </div>
+
+            <div class="file-detail-sections">
+              <section class="file-detail-section">
+                <h3>基本信息</h3>
+                <dl class="file-detail-list">
+                  <div><dt>文件名</dt><dd>{{ fileDetail.name }}</dd></div>
+                  <div><dt>相对路径</dt><dd>{{ fileDetail.path }}</dd></div>
+                  <div>
+                    <dt>格式</dt>
+                    <dd>{{ fileDetail.format }}（{{ fileDetail.extension }}）</dd>
+                  </div>
+                  <div><dt>大小</dt><dd>{{ formatSize(fileDetail.size) }}</dd></div>
+                  <div><dt>修改时间</dt><dd>{{ formatTime(fileDetail.modified_at) }}</dd></div>
+                </dl>
+              </section>
+
+              <section class="file-detail-section">
+                <h3>元数据</h3>
+                <dl class="file-detail-list">
+                  <div><dt>标题</dt><dd>{{ fileDetail.title || '-' }}</dd></div>
+                  <div><dt>歌手</dt><dd>{{ fileDetail.artist || '-' }}</dd></div>
+                  <div><dt>专辑</dt><dd>{{ fileDetail.album || '-' }}</dd></div>
+                  <div><dt>专辑歌手</dt><dd>{{ fileDetail.album_artist || '-' }}</dd></div>
+                  <div><dt>年份</dt><dd>{{ fileDetail.year ?? '-' }}</dd></div>
+                  <div><dt>音轨</dt><dd>{{ fileDetail.track_number ?? '-' }}</dd></div>
+                </dl>
+              </section>
+
+              <section class="file-detail-section">
+                <h3>音频参数</h3>
+                <dl class="file-detail-list">
+                  <div><dt>时长</dt><dd>{{ formatAudioDuration(fileDetail.duration) }}</dd></div>
+                  <div><dt>码率</dt><dd>{{ formatAudioBitrate(fileDetail.bitrate) }}</dd></div>
+                  <div>
+                    <dt>采样率</dt>
+                    <dd>{{ formatAudioSampleRate(fileDetail.sample_rate) }}</dd>
+                  </div>
+                  <div><dt>声道</dt><dd>{{ formatAudioChannels(fileDetail.channels) }}</dd></div>
+                </dl>
+              </section>
+
+              <section class="file-detail-section file-detail-lyrics-section">
+                <h3>歌词</h3>
+                <pre v-if="fileDetail.lyrics" class="file-detail-lyrics">{{ fileDetail.lyrics }}</pre>
+                <div v-else class="file-detail-empty-value">-</div>
+              </section>
+            </div>
+          </div>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="fileDetailDialog = false">关闭</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="fileOrganizeDialog" max-width="460">
       <v-card title="确认整理">
         <v-card-text>
@@ -8247,6 +8444,116 @@ button.dashboard-health-card:hover {
   color: rgb(var(--v-theme-error));
   font-weight: 700;
   line-height: 22px;
+}
+
+.file-detail-body {
+  min-height: 240px;
+}
+
+.file-detail-loading {
+  align-items: center;
+  color: rgba(var(--v-theme-on-surface), 0.66);
+  display: flex;
+  justify-content: center;
+  min-height: 200px;
+}
+
+.file-detail-content {
+  display: grid;
+  gap: 24px;
+  grid-template-columns: minmax(180px, 240px) minmax(0, 1fr);
+}
+
+.file-detail-cover-panel {
+  align-items: center;
+  align-self: start;
+  aspect-ratio: 1;
+  background: rgba(var(--v-theme-on-surface), 0.05);
+  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  border-radius: 10px;
+  display: flex;
+  justify-content: center;
+  overflow: hidden;
+  width: 100%;
+}
+
+.file-detail-cover {
+  height: 100%;
+  object-fit: contain;
+  width: 100%;
+}
+
+.file-detail-cover-empty {
+  align-items: center;
+  color: rgba(var(--v-theme-on-surface), 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.file-detail-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+
+.file-detail-section h3 {
+  font-size: 15px;
+  margin: 0 0 10px;
+}
+
+.file-detail-list {
+  display: grid;
+  gap: 8px 20px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+
+.file-detail-list > div {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 72px minmax(0, 1fr);
+}
+
+.file-detail-list dt {
+  color: rgba(var(--v-theme-on-surface), 0.58);
+}
+
+.file-detail-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.file-detail-lyrics {
+  background: rgba(var(--v-theme-on-surface), 0.04);
+  border-radius: 8px;
+  font-family: inherit;
+  line-height: 1.7;
+  margin: 0;
+  max-height: 280px;
+  overflow: auto;
+  padding: 12px;
+  white-space: pre-wrap;
+}
+
+.file-detail-empty-value {
+  color: rgba(var(--v-theme-on-surface), 0.58);
+}
+
+@media (max-width: 700px) {
+  .file-detail-content {
+    grid-template-columns: 1fr;
+  }
+
+  .file-detail-cover-panel {
+    justify-self: center;
+    max-width: 240px;
+  }
+
+  .file-detail-list {
+    grid-template-columns: 1fr;
+  }
 }
 
 .compact-switch {

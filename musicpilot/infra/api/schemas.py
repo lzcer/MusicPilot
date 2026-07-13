@@ -272,6 +272,32 @@ class FileListResponse(BaseModel):
     entries: list[FileEntryResponse] = Field(default_factory=list)
 
 
+class FileAudioCoverResponse(BaseModel):
+    mime_type: str
+    data: str
+
+
+class FileAudioDetailResponse(BaseModel):
+    name: str
+    path: str
+    extension: str
+    format: str
+    size: int
+    modified_at: datetime
+    title: str
+    artist: str | None = None
+    album: str | None = None
+    album_artist: str | None = None
+    year: int | None = None
+    track_number: int | None = None
+    lyrics: str | None = None
+    duration: float | None = None
+    bitrate: int | None = None
+    sample_rate: int | None = None
+    channels: int | None = None
+    cover: FileAudioCoverResponse | None = None
+
+
 class FileOrganizeRequest(BaseModel):
     path: str = ""
     paths: list[str] = Field(default_factory=list)

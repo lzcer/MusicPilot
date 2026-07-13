@@ -104,6 +104,12 @@ The file management page is used to browse source files or target music library 
 
 ![MusicPilot media files](docs/assets/screenshots/media-files.png)
 
+#### 5.4.1. Metadata Viewer
+
+Audio files in File Management support on-demand metadata viewing. The detail dialog brings together the embedded cover, file information, title, artist, album, year, track number, duration, bitrate, sample rate, channels, and lyrics so the file can be checked before organization.
+
+![MusicPilot metadata viewer](docs/assets/screenshots/media_info.png)
+
 ### 5.5. Playlist Management
 
 The playlists page shows the local state of imported external playlists, including source platform, track count, existing tracks, pending tracks, submitted tasks, failures, and sync status. Public playlists from QQ Music, NetEase Cloud Music, Kuwo Music, Kugou Music, Spotify, and Apple Music can be imported from shared links. The action area provides entry points for details, match refresh, download submission, sync, and deletion.
