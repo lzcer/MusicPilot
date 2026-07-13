@@ -21,6 +21,8 @@ class DownloadStatus:
     progress: float
     save_path: Path | None = None
     content_path: Path | None = None
+    tags: tuple[str, ...] = ()
+    size_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +52,11 @@ class Downloader(Protocol):
 
     async def delete_torrent(self, torrent_hash: str, *, delete_files: bool) -> None: ...
 
-    async def list_statuses(self) -> tuple[DownloadStatus, ...]: ...
+    async def list_statuses(
+        self,
+        torrent_hashes: tuple[str, ...] = (),
+    ) -> tuple[DownloadStatus, ...]: ...
+
+    async def list_downloading_by_tag(self, tag: str) -> tuple[DownloadStatus, ...]: ...
 
     async def close(self) -> None: ...

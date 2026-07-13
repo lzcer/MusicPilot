@@ -252,6 +252,7 @@ class SqlAlchemyMediaRepository:
                     "download_path",
                     "local_path",
                     "listen_mode",
+                    "monitor_tag",
                     "is_default",
                     "enabled",
                 ),
@@ -1032,10 +1033,69 @@ class SqlAlchemyMediaRepository:
             await session.refresh(record)
             return record
 
+    async def create_monitored_download_task(
+        self,
+        *,
+        torrent_hash: str,
+        name: str,
+        progress: float,
+        save_path: str | None,
+        size_bytes: int | None,
+        downloader_id: str | None,
+    ) -> tuple[TorrentRecord, bool]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(TorrentRecord).where(TorrentRecord.torrent_hash == torrent_hash)
+            )
+            existing = result.scalar_one_or_none()
+            if existing is not None:
+                return existing, False
+            resource_payload = {"size_bytes": size_bytes} if size_bytes is not None else {}
+            record = TorrentRecord(
+                torrent_hash=torrent_hash,
+                name=name,
+                source="qBittorrent",
+                download_url="",
+                creation_type="monitor_created",
+                status="downloading",
+                save_path=save_path,
+                progress=progress,
+                downloader_id=downloader_id,
+                resource_payload=resource_payload,
+                download_started_at=datetime.now(UTC),
+                payload={"category": "MusicPilot"},
+            )
+            session.add(record)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                result = await session.execute(
+                    select(TorrentRecord).where(TorrentRecord.torrent_hash == torrent_hash)
+                )
+                existing = result.scalar_one()
+                return existing, False
+            await session.refresh(record)
+            return record, True
+
     async def list_download_tasks(self) -> list[TorrentRecord]:
         async with self.database.session() as session:
             result = await session.execute(select(TorrentRecord).order_by(TorrentRecord.id.desc()))
             return list(result.scalars().all())
+
+    async def existing_download_task_hashes(
+        self,
+        torrent_hashes: set[str],
+    ) -> set[str]:
+        if not torrent_hashes:
+            return set()
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(TorrentRecord.torrent_hash).where(
+                    TorrentRecord.torrent_hash.in_(torrent_hashes)
+                )
+            )
+            return {item for item in result.scalars().all() if item}
 
     async def get_download_task(self, task_id: int) -> TorrentRecord | None:
         async with self.database.session() as session:

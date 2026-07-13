@@ -67,6 +67,7 @@ class Database:
                 "torrent_records",
                 {
                     "downloader_id": "VARCHAR(32)",
+                    "creation_type": "VARCHAR(32) NOT NULL DEFAULT 'task_created'",
                     "media_metadata": "JSON NOT NULL DEFAULT '{}'",
                     "resource_payload": "JSON NOT NULL DEFAULT '{}'",
                     "selected_site_ids": "JSON NOT NULL DEFAULT '[]'",
@@ -82,6 +83,7 @@ class Database:
                 "downloaders",
                 {
                     "local_path": "TEXT NOT NULL DEFAULT ''",
+                    "monitor_tag": "VARCHAR(128) NOT NULL DEFAULT 'MusicPilot'",
                 },
             )
             await _add_sqlite_columns(

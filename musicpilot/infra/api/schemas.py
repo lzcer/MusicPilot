@@ -125,6 +125,7 @@ class DownloadTaskResponse(BaseModel):
     id: int | None = None
     torrent_hash: str | None = None
     name: str
+    creation_type: str = "task_created"
     size_bytes: int | None = None
     state: str
     progress: float
@@ -433,6 +434,7 @@ class DownloaderCreateRequest(BaseModel):
     download_path: str = Field(min_length=1)
     local_path: str = Field(min_length=1)
     listen_mode: str = Field(default="polling", pattern="^(polling|qb_callback)$")
+    monitor_tag: str = Field(default="MusicPilot", max_length=128)
     is_default: bool = True
     enabled: bool = True
 
@@ -446,6 +448,7 @@ class DownloaderResponse(BaseModel):
     download_path: str = ""
     local_path: str = ""
     listen_mode: str = "polling"
+    monitor_tag: str = "MusicPilot"
     is_default: bool
     enabled: bool = True
 

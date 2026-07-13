@@ -211,7 +211,7 @@ from musicpilot.infra.db.models import (
     TorrentRecordItem,
 )
 from musicpilot.infra.scheduler import SubscriptionScheduler
-from musicpilot.ports.downloader import Downloader, DownloadStatus
+from musicpilot.ports.downloader import Downloader, DownloadState, DownloadStatus
 from musicpilot.ports.metadata import MediaCandidate, TrackMetadata
 
 _OPENCC_T2S = OpenCC("t2s")
@@ -229,6 +229,7 @@ _TORRENT_AUDIO_EXTENSIONS = {
     ".wma",
 }
 DOWNLOAD_POLL_INTERVAL_SECONDS = 5
+TAGGED_DOWNLOAD_MONITOR_INTERVAL_SECONDS = 30
 MUSIC_LIBRARY_SYNC_INTERVAL_SECONDS = 3600
 LIBRARY_STORAGE_REFRESH_INTERVAL_SECONDS = 30 * 60
 MUSIC_LIBRARY_SYNC_AFTER_REFRESH_DELAY_SECONDS = 5
@@ -762,6 +763,7 @@ class AppState:
             search_runner=self.search_indexer,
         )
         self.download_polling_task: asyncio.Task[None] | None = None
+        self.tagged_download_monitor_task: asyncio.Task[None] | None = None
         self.music_library_sync_task: asyncio.Task[None] | None = None
         self.library_storage_task: asyncio.Task[None] | None = None
         self.metadata_site_search_task: MetadataSiteSearchTask | None = None
@@ -1163,6 +1165,24 @@ class AppState:
         with contextlib.suppress(asyncio.CancelledError):
             await self.download_polling_task
 
+    def start_tagged_download_monitor(self) -> None:
+        if (
+            self.tagged_download_monitor_task is not None
+            and not self.tagged_download_monitor_task.done()
+        ):
+            return
+        self.tagged_download_monitor_task = asyncio.create_task(
+            _monitor_tagged_downloads(self),
+            name="musicpilot-tagged-download-monitor",
+        )
+
+    async def stop_tagged_download_monitor(self) -> None:
+        if self.tagged_download_monitor_task is None:
+            return
+        self.tagged_download_monitor_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.tagged_download_monitor_task
+
     def start_music_library_sync(self) -> None:
         if self.music_library_sync_task is not None and not self.music_library_sync_task.done():
             return
@@ -1313,6 +1333,7 @@ def create_app() -> FastAPI:
         state.pipeline.start()
         state.task_manager.start()
         state.start_download_polling()
+        state.start_tagged_download_monitor()
         state.start_music_library_sync()
         state.start_library_storage_refresh()
         state.scheduler.start()
@@ -1321,6 +1342,7 @@ def create_app() -> FastAPI:
         state.add_log("system", "MusicPilot stopping")
         root_logger.removeHandler(state.log_handler)
         await state.stop_download_polling()
+        await state.stop_tagged_download_monitor()
         await state.stop_music_library_sync()
         await state.stop_library_storage_refresh()
         await state.task_manager.stop()
@@ -5963,6 +5985,7 @@ def _downloader_response(item: DownloaderConfig) -> DownloaderResponse:
         download_path=item.download_path,
         local_path=item.local_path,
         listen_mode=item.listen_mode,
+        monitor_tag=item.monitor_tag,
         is_default=item.is_default,
         enabled=item.enabled,
     )
@@ -5986,6 +6009,7 @@ def _downloader_payload(payload: DownloaderCreateRequest) -> dict[str, object]:
     data = payload.model_dump()
     data["download_path"] = payload.download_path.strip()
     data["local_path"] = payload.local_path.strip()
+    data["monitor_tag"] = payload.monitor_tag.strip()
     return data
 
 
@@ -6122,6 +6146,7 @@ def _download_task_response(item: TorrentRecord) -> DownloadTaskResponse:
         id=item.id,
         torrent_hash=torrent_hash,
         name=item.name,
+        creation_type=item.creation_type,
         size_bytes=_optional_int((item.resource_payload or {}).get("size_bytes")),
         state=item.status,
         progress=item.progress,
@@ -6415,6 +6440,68 @@ async def _poll_download_tasks(state: AppState) -> None:
         except Exception as exc:  # noqa: BLE001
             state.add_log("download", f"Download polling failed: {exc}", "ERROR")
         await asyncio.sleep(DOWNLOAD_POLL_INTERVAL_SECONDS)
+
+
+async def _monitor_tagged_downloads(state: AppState) -> None:
+    while True:
+        try:
+            await _monitor_tagged_downloads_once(state)
+        except Exception as exc:  # noqa: BLE001
+            state.add_log("download", f"Tagged download monitoring failed: {exc}", "ERROR")
+        await asyncio.sleep(TAGGED_DOWNLOAD_MONITOR_INTERVAL_SECONDS)
+
+
+async def _monitor_tagged_downloads_once(state: AppState) -> None:
+    default = await state.repository.default_downloader()
+    if default is None or not default.enabled or default.type != "qbittorrent":
+        return
+    monitor_tag = default.monitor_tag.strip()
+    if not monitor_tag:
+        return
+    if state.downloader is None:
+        await state.reload_downloader()
+    if state.downloader is None:
+        return
+    statuses = await state.downloader.list_downloading_by_tag(monitor_tag)
+    monitored_hashes = {
+        status.torrent_hash.strip().casefold()
+        for status in statuses
+        if status.torrent_hash.strip()
+    }
+    existing_hashes = await state.repository.existing_download_task_hashes(monitored_hashes)
+    for status in statuses:
+        torrent_hash = status.torrent_hash.strip().casefold()
+        if (
+            not torrent_hash
+            or torrent_hash in existing_hashes
+            or status.state != DownloadState.DOWNLOADING
+        ):
+            continue
+        try:
+            _, created = await state.repository.create_monitored_download_task(
+                torrent_hash=torrent_hash,
+                name=status.name or "MusicPilot monitored download",
+                progress=status.progress,
+                save_path=str(status.save_path) if status.save_path is not None else None,
+                size_bytes=(
+                    status.size_bytes if status.size_bytes and status.size_bytes > 0 else None
+                ),
+                downloader_id=default.id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            state.add_log(
+                "download",
+                "Tagged download record creation failed: "
+                f"name={status.name}, hash={torrent_hash[:8]}..., error={exc}",
+                "ERROR",
+            )
+            continue
+        existing_hashes.add(torrent_hash)
+        if created:
+            state.add_log(
+                "download",
+                f"Tagged download discovered: name={status.name}, hash={torrent_hash[:8]}...",
+            )
 
 
 async def _sync_music_library_periodically(state: AppState) -> None:
@@ -7306,7 +7393,18 @@ async def _poll_download_tasks_once(state: AppState) -> None:
     if state.downloader is None:
         return
 
-    statuses = await state.downloader.list_statuses()
+    real_hashes = tuple(
+        task.torrent_hash or ""
+        for task in active_tasks
+        if not _is_pending_hash(task.torrent_hash)
+    )
+    statuses = await state.downloader.list_statuses(real_hashes) if real_hashes else ()
+    if any(_is_pending_hash(task.torrent_hash) for task in active_tasks):
+        pending_candidates = await state.downloader.list_downloading_by_tag("MusicPilot")
+        status_hashes = {item.torrent_hash for item in statuses}
+        statuses = statuses + tuple(
+            item for item in pending_candidates if item.torrent_hash not in status_hashes
+        )
     by_hash = {item.torrent_hash: item for item in statuses if item.torrent_hash}
     for task in active_tasks:
         has_real_hash = not _is_pending_hash(task.torrent_hash)
@@ -8374,6 +8472,7 @@ def _legacy_downloader_payload(item: dict[str, object]) -> dict[str, object]:
         "download_path": str(item.get("download_path") or ""),
         "local_path": str(item.get("local_path") or ""),
         "listen_mode": str(item.get("listen_mode") or "polling"),
+        "monitor_tag": str(item["monitor_tag"]) if "monitor_tag" in item else "MusicPilot",
         "is_default": bool(item.get("is_default", True)),
         "enabled": bool(item.get("enabled", True)),
     }

@@ -80,6 +80,7 @@ type DownloadTask = {
   id?: number | null
   torrent_hash?: string | null
   name: string
+  creation_type: string
   size_bytes?: number | null
   state: string
   progress: number
@@ -349,6 +350,7 @@ type DownloaderConfig = {
   download_path: string
   local_path: string
   listen_mode: string
+  monitor_tag: string
   is_default: boolean
   enabled: boolean
 }
@@ -796,6 +798,7 @@ const downloaderForm = ref({
   download_path: '',
   local_path: '',
   listen_mode: 'polling',
+  monitor_tag: 'MusicPilot',
   is_default: true,
   enabled: true
 })
@@ -914,6 +917,10 @@ const metadataSourceOptions = [
 
 function metadataSourceLabel(source?: string | null) {
   return metadataSourceOptions.find((option) => option.value === source)?.title || source || 'QQ音乐'
+}
+
+function downloadCreationTypeText(value: string) {
+  return value === 'monitor_created' ? '监听创建' : '任务创建'
 }
 
 const playlistTrackDownloadStatusOptions = [
@@ -3232,6 +3239,7 @@ function openNewDownloaderDialog() {
     download_path: '',
     local_path: '',
     listen_mode: 'polling',
+    monitor_tag: 'MusicPilot',
     is_default: true,
     enabled: true
   }
@@ -3255,6 +3263,7 @@ function editDownloader(downloader: DownloaderConfig) {
     download_path: downloader.download_path ?? '',
     local_path: downloader.local_path ?? '',
     listen_mode: downloader.listen_mode ?? 'polling',
+    monitor_tag: downloader.monitor_tag ?? 'MusicPilot',
     is_default: downloader.is_default,
     enabled: downloader.enabled
   }
@@ -4637,6 +4646,7 @@ onUnmounted(() => {
                       />
                     </th>
                     <th class="download-name-cell">名称</th>
+                    <th class="download-type-cell">下载类型</th>
                     <th class="download-size-cell">大小</th>
                     <th class="download-status-cell">状态</th>
                     <th class="download-progress-cell">进度</th>
@@ -4645,7 +4655,7 @@ onUnmounted(() => {
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-if="!filteredDownloads.length"><td colspan="7" class="empty-cell">{{ downloadEmptyText }}</td></tr>
+                  <tr v-if="!filteredDownloads.length"><td colspan="8" class="empty-cell">{{ downloadEmptyText }}</td></tr>
                   <tr v-for="row in filteredDownloads" :key="row.id || row.torrent_hash || row.name">
                     <td class="select-cell">
                       <v-checkbox
@@ -4659,6 +4669,7 @@ onUnmounted(() => {
                     <td class="download-name-cell">
                       <span :title="row.name">{{ row.name }}</span>
                     </td>
+                    <td class="download-type-cell">{{ downloadCreationTypeText(row.creation_type) }}</td>
                     <td class="download-size-cell">{{ formatSize(row.size_bytes) }}</td>
                     <td class="download-status-cell">
                       <v-chip
@@ -6501,6 +6512,16 @@ onUnmounted(() => {
                 ]
               : [{ title: '轮询', value: 'polling' }]"
             label="监听模式"
+            hint="用于监听下载进度"
+            persistent-hint
+          />
+          <v-text-field
+            v-if="downloaderForm.type === 'qbittorrent'"
+            v-model="downloaderForm.monitor_tag"
+            label="监听标签"
+            placeholder="MusicPilot"
+            hint="留空则关闭标签监听"
+            persistent-hint
           />
           <v-switch v-model="downloaderForm.is_default" color="primary" label="设为默认" hide-details />
           <v-switch v-model="downloaderForm.enabled" color="primary" label="启用" hide-details />

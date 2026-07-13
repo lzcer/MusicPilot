@@ -165,8 +165,20 @@ class QBittorrentClient:
             content_path=Path(str(content_path)) if content_path else None,
         )
 
-    async def list_statuses(self) -> tuple[DownloadStatus, ...]:
-        return tuple(_status_from_item(item) for item in await self._list_info())
+    async def list_statuses(
+        self,
+        torrent_hashes: tuple[str, ...] = (),
+    ) -> tuple[DownloadStatus, ...]:
+        params = {"hashes": "|".join(torrent_hashes)} if torrent_hashes else None
+        return tuple(_status_from_item(item) for item in await self._list_info(params=params))
+
+    async def list_downloading_by_tag(self, tag: str) -> tuple[DownloadStatus, ...]:
+        return tuple(
+            _status_from_item(item)
+            for item in await self._list_info(
+                params={"filter": "downloading", "tag": tag},
+            )
+        )
 
     async def list_files(self, torrent_hash: str) -> tuple[TorrentFile, ...]:
         response = await self._request(
@@ -188,8 +200,12 @@ class QBittorrentClient:
         )
         response.raise_for_status()
 
-    async def _list_info(self) -> list[dict[str, object]]:
-        response = await self._request("GET", "/api/v2/torrents/info")
+    async def _list_info(
+        self,
+        *,
+        params: dict[str, str] | None = None,
+    ) -> list[dict[str, object]]:
+        response = await self._request("GET", "/api/v2/torrents/info", params=params)
         response.raise_for_status()
         return list(response.json())
 
@@ -207,6 +223,8 @@ def _status_from_item(item: dict[str, object]) -> DownloadStatus:
         progress=progress,
         save_path=Path(str(save_path)) if save_path else None,
         content_path=Path(str(content_path)) if content_path else None,
+        tags=_tags_from_item(item.get("tags")),
+        size_bytes=_optional_int(item.get("total_size")),
     )
 
 
@@ -230,6 +248,10 @@ def _optional_float(value: object) -> float:
         return float(str(value))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _tags_from_item(value: object) -> tuple[str, ...]:
+    return tuple(tag.strip() for tag in str(value or "").split(",") if tag.strip())
 
 
 def _hashes_from_items(items: list[dict[str, object]]) -> set[str]:

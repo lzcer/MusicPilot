@@ -38,6 +38,7 @@ class TorrentRecord(TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(512))
     source: Mapped[str] = mapped_column(String(128), default="")
     download_url: Mapped[str] = mapped_column(Text)
+    creation_type: Mapped[str] = mapped_column(String(32), default="task_created")
     status: Mapped[str] = mapped_column(String(64), default="queued")
     save_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     progress: Mapped[float] = mapped_column(Float, default=0.0)
@@ -242,6 +243,7 @@ class DownloaderConfig(TimestampMixin, Base):
     download_path: Mapped[str] = mapped_column(Text, default="")
     local_path: Mapped[str] = mapped_column(Text, default="")
     listen_mode: Mapped[str] = mapped_column(String(64), default="polling")
+    monitor_tag: Mapped[str] = mapped_column(String(128), default="MusicPilot")
     is_default: Mapped[bool] = mapped_column(Boolean, default=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 

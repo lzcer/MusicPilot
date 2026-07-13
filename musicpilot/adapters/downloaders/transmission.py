@@ -71,8 +71,16 @@ class TransmissionClient:
             return DownloadStatus(torrent_hash, "", DownloadState.FAILED, 0.0)
         return _status_from_torrent(torrents[0])
 
-    async def list_statuses(self) -> tuple[DownloadStatus, ...]:
-        return tuple(_status_from_torrent(item) for item in await self._get_torrents())
+    async def list_statuses(
+        self,
+        torrent_hashes: tuple[str, ...] = (),
+    ) -> tuple[DownloadStatus, ...]:
+        ids = list(torrent_hashes) if torrent_hashes else None
+        return tuple(_status_from_torrent(item) for item in await self._get_torrents(ids))
+
+    async def list_downloading_by_tag(self, tag: str) -> tuple[DownloadStatus, ...]:
+        del tag
+        return ()
 
     async def list_files(self, torrent_hash: str) -> tuple[TorrentFile, ...]:
         result = await self._rpc(
@@ -116,6 +124,7 @@ class TransmissionClient:
                 "percentDone",
                 "downloadDir",
                 "error",
+                "totalSize",
             ]
         }
         if ids is not None:
@@ -186,6 +195,7 @@ def _status_from_torrent(item: dict[str, Any]) -> DownloadStatus:
         progress=progress,
         save_path=Path(download_dir) if download_dir else None,
         content_path=Path(download_dir) / name if download_dir and name else None,
+        size_bytes=_optional_int(item.get("totalSize")),
     )
 
 

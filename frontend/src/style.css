@@ -125,13 +125,18 @@ body {
 }
 
 .download-name-cell {
-  width: 38%;
+  width: 30%;
 }
 
 .download-name-cell > span {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.download-type-cell {
+  width: 8%;
+  white-space: nowrap;
 }
 
 .download-size-cell {
