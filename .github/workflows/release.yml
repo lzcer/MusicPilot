@@ -313,6 +313,9 @@ jobs:
             # Strip the "容器镜像" section (we include Docker info separately)
             notes="${notes%%## 2.*}"
 
+            # Keep the Telegram summary focused on release sections and commit subjects
+            notes="$(printf '%s\n' "${notes}" | sed -e '/^## 1\. 更新内容$/d' -e '/^[[:space:]][[:space:]]/d')"
+
             # Escape HTML special chars first so user content won't break tags
             notes="$(echo "${notes}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')"
 
