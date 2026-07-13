@@ -122,6 +122,10 @@ _ALBUM_TRAILING_NOISE_RE = re.compile(
 )
 
 
+class ArtistDirectoryResolutionError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class ScrapingConfig:
     enabled: bool = False
@@ -1091,6 +1095,18 @@ class LocalMusicScraper:
             elif config.duplicate_handling in {"overwrite", "keep_largest"}:
                 overwrite_duplicate = True
 
+        classification_artist = _classification_artist(metadata, config)
+        if classification_artist is not None and self.artist_service is not None:
+            try:
+                classification_artist = await self.artist_service.get_or_create_canonical_name(
+                    classification_artist,
+                    source="scraping",
+                )
+            except Exception as exc:
+                raise ArtistDirectoryResolutionError(
+                    f"歌手权威名查询或创建失败：{classification_artist}：{exc}"
+                ) from exc
+
         overwritten_existing_target = False
         operation_type = config.mode
         path_result: _PathOperationResult | None = None
@@ -1135,6 +1151,7 @@ class LocalMusicScraper:
             working_file,
             metadata,
             config,
+            classification_artist=classification_artist,
             overwrite=True,
         )
         final_file = final_result.path
@@ -1910,6 +1927,7 @@ def _classify_or_rename(
     metadata: TrackMetadata,
     config: ScrapingConfig,
     *,
+    classification_artist: str | None = None,
     overwrite: bool,
 ) -> _PathOperationResult:
     target_dir = path.parent
@@ -1918,12 +1936,16 @@ def _classify_or_rename(
         groups: tuple[str | None, ...]
         if config.classify_by == "artist_album":
             groups = (
-                metadata.album_artist or primary_artist,
+                classification_artist or metadata.album_artist or primary_artist,
                 metadata.album or "未知专辑",
             )
         else:
             groups = (
-                primary_artist if config.classify_by == "artist" else metadata.album,
+                (
+                    classification_artist or primary_artist
+                    if config.classify_by == "artist"
+                    else metadata.album
+                ),
             )
         if all(groups):
             classify_root = (
@@ -1955,6 +1977,19 @@ def _classify_or_rename(
         operation_type=config.mode,
         overwritten_existing=overwritten_existing,
     )
+
+
+def _classification_artist(
+    metadata: TrackMetadata,
+    config: ScrapingConfig,
+) -> str | None:
+    if not config.auto_classify:
+        return None
+    if config.classify_by == "artist":
+        return _primary_artist(metadata.artist)
+    if config.classify_by == "artist_album":
+        return _primary_artist(metadata.album_artist or metadata.artist)
+    return None
 
 
 def _remove_empty_parents(source_dir: Path, config: ScrapingConfig) -> None:

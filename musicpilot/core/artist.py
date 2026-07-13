@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 
 _t2s = OpenCC("t2s")  # Traditional -> Simplified
 _s2t = OpenCC("s2t")  # Simplified -> Traditional
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+_BRACKETED_ARTIST_RE = re.compile(
+    r"^\s*(?P<outer>.+?)\s*[（(]\s*(?P<inner>[^()（）]+)\s*[）)]\s*$"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ArtistInfo:
@@ -100,6 +106,110 @@ def _unique_artist_names(values: tuple[str, ...]) -> list[str]:
     return result
 
 
+def _unique_exact_artist_names(values: tuple[str, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        name = value.strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        result.append(name)
+    return tuple(result)
+
+
+def artist_identity_candidates(name: str | None) -> tuple[str, ...]:
+    if not name or not name.strip():
+        return ()
+    original = name.strip()
+    values: list[str] = []
+
+    def add_script_variants(value: str) -> None:
+        values.extend((value, _t2s.convert(value), _s2t.convert(value)))
+
+    add_script_variants(original)
+    match = _BRACKETED_ARTIST_RE.match(original)
+    if match is not None:
+        outer = match.group("outer").strip()
+        inner = match.group("inner").strip()
+        if bool(_CJK_RE.search(outer)) != bool(_CJK_RE.search(inner)):
+            add_script_variants(outer)
+            add_script_variants(inner)
+    return _unique_exact_artist_names(tuple(values))
+
+
+def _preferred_canonical_name(
+    candidates: tuple[str, ...],
+    *,
+    fallback: str,
+) -> str:
+    chinese_names: list[str] = []
+    for candidate in candidates:
+        if not _CJK_RE.search(candidate) or re.search(r"[()（）]", candidate):
+            continue
+        simplified = _t2s.convert(candidate).strip()
+        if simplified and simplified not in chinese_names:
+            chinese_names.append(simplified)
+    if chinese_names:
+        return next(
+            (name for name in chinese_names if not _LATIN_RE.search(name)),
+            chinese_names[0],
+        )
+    return fallback.strip()
+
+
+def _identity_candidates_for_names(names: tuple[str, ...]) -> tuple[str, ...]:
+    values: list[str] = []
+    for name in names:
+        values.extend(artist_identity_candidates(name))
+    return _unique_exact_artist_names(tuple(values))
+
+
+def _group_artist_identity_names(raw_names: list[str]) -> list[tuple[str, ...]]:
+    parts = _unique_exact_artist_names(
+        tuple(
+            part
+            for raw_name in raw_names
+            for part in split_artist_credit(raw_name)
+        )
+    )
+    parents = list(range(len(parts)))
+
+    def root(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = root(left)
+        right_root = root(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    identity_owner: dict[str, int] = {}
+    for index, part in enumerate(parts):
+        identity_keys = {
+            normalized
+            for candidate in artist_identity_candidates(part)
+            if (normalized := normalize_artist_name(candidate))
+        }
+        for identity_key in identity_keys:
+            owner = identity_owner.get(identity_key)
+            if owner is None:
+                identity_owner[identity_key] = index
+            else:
+                union(index, owner)
+
+    groups: dict[int, list[str]] = {}
+    for index, part in enumerate(parts):
+        groups.setdefault(root(index), []).append(part)
+    return [
+        tuple(sorted(names, key=lambda item: (len(item), item)))
+        for names in groups.values()
+    ]
+
+
 class ArtistService:
     """Service for managing artist names, aliases, and canonical names."""
 
@@ -110,6 +220,8 @@ class ArtistService:
     ) -> None:
         self._repo = repository
         self._musicbrainz_user_agent = musicbrainz_user_agent
+        self._local_artist_creation_lock = asyncio.Lock()
+        self._alias_write_lock = asyncio.Lock()
         self._musicbrainz_enriched_artist_ids: set[int] = set()
         self._musicbrainz_enrichment_lock = asyncio.Lock()
         self._last_musicbrainz_enrichment_at = 0.0
@@ -127,26 +239,22 @@ class ArtistService:
         name = name.strip()
         if not name:
             return []
-
-        # Direct alias lookup
-        artist_id = await self._repo.find_artist_id_by_alias(name)
-        if artist_id is not None:
-            aliases = await self._repo.list_artist_aliases(artist_id)
-            return _unique_artist_names(tuple(aliases))
-
-        # Try normalized lookup
-        normalized = normalize_artist_name(name)
-        artist = await self._repo.find_artist_by_normalized(normalized)
-        if artist is not None:
+        candidates = artist_identity_candidates(name)
+        artists = await self._find_identity_artists(candidates)
+        if artists:
+            artist = self._select_identity_artist(
+                artists,
+                candidates=candidates,
+                fallback=name,
+            )
             aliases = await self._repo.list_artist_aliases(artist.id)
             return _unique_artist_names(tuple(aliases))
-
-        return _unique_artist_names((name,))
+        return _unique_artist_names(candidates or (name,))
 
     async def get_canonical_name(self, name: str | None) -> str | None:
         """Resolve an artist name to its canonical (authoritative) name.
 
-        Returns None if the name is unknown or empty.
+        Returns the original name when it is unknown, or None when empty.
         """
         if not name:
             return None
@@ -154,17 +262,14 @@ class ArtistService:
         if not name:
             return None
 
-        artist_id = await self._repo.find_artist_id_by_alias(name)
-        if artist_id is not None:
-            artist = await self._repo.get_artist(artist_id)
-            if artist is not None:
-                return artist.name
-
-        normalized = normalize_artist_name(name)
-        artist = await self._repo.find_artist_by_normalized(normalized)
-        if artist is not None:
-            return artist.name
-
+        candidates = artist_identity_candidates(name)
+        artists = await self._find_identity_artists(candidates)
+        if artists:
+            return self._select_identity_artist(
+                artists,
+                candidates=candidates,
+                fallback=name,
+            ).name
         return name
 
     async def has_artist_name(self, name: str | None) -> bool:
@@ -173,11 +278,23 @@ class ArtistService:
         name = name.strip()
         if not name:
             return False
-        artist_id = await self._repo.find_artist_id_by_alias(name)
-        if artist_id is not None:
-            return True
-        normalized = normalize_artist_name(name)
-        return await self._repo.find_artist_by_normalized(normalized) is not None
+        candidates = artist_identity_candidates(name)
+        return bool(await self._find_identity_artists(candidates))
+
+    async def get_or_create_canonical_name(
+        self,
+        name: str,
+        *,
+        source: str = "scraping",
+    ) -> str:
+        names = split_artist_credit(name)
+        if not names:
+            raise ValueError("Artist name cannot be empty")
+        artist, _created = await self._ensure_artist_local(
+            names[0],
+            source=source,
+        )
+        return artist.name
 
     async def ensure_artist(
         self,
@@ -188,9 +305,9 @@ class ArtistService:
     ) -> ArtistInfo:
         """Ensure an artist exists in the database.
 
-        If the artist (or an alias matching it) already exists, returns that
-        entry without an external lookup. Otherwise, creates a new artist
-        entry and enriches its aliases from MusicBrainz.
+        Resolves structured identity candidates against the local library,
+        creates a local record when needed, then enriches safe aliases from
+        MusicBrainz without holding the local creation lock.
 
         If the name contains separators (feat., &, /, etc.), each part is
         handled independently and only the first part is returned as primary.
@@ -213,28 +330,13 @@ class ArtistService:
                 raise ValueError("Artist name cannot be empty")
             return primary
 
-        # Check existing
-        artist_id = await self._repo.find_artist_id_by_alias(name)
-        if artist_id is not None:
-            return await self._get_artist_info(artist_id)
-
-        normalized = normalize_artist_name(name)
-        artist = await self._repo.find_artist_by_normalized(normalized)
-        if artist is not None:
-            # Add this name as an alias
-            await self._repo.add_alias(artist.id, name, source)
-            return await self._get_artist_info(artist.id)
-
-        # Create new artist
-        artist = await self._repo.create_artist(
-            name=name,
-            normalized_name=normalized,
-            external_ids=external_ids or {},
+        artist, _created = await self._ensure_artist_local(
+            name,
+            source=source,
+            external_ids=external_ids,
         )
-        # Add itself as a default alias
-        await self._repo.add_alias(artist.id, name, "primary")
         return await self._enrich_artist_from_musicbrainz(
-            await self._get_artist_info(artist.id),
+            artist,
             lookup_name=name,
         )
 
@@ -255,42 +357,42 @@ class ArtistService:
         name: str,
         aliases: tuple[str, ...],
     ) -> ArtistInfo:
-        artist = await self._repo.get_artist(artist_id)
-        if artist is None:
-            raise ValueError("Artist not found")
         canonical_name = name.strip()
         if not canonical_name:
             raise ValueError("Artist name cannot be empty")
         normalized = normalize_artist_name(canonical_name)
-        existing = await self._repo.find_artist_by_normalized(normalized)
-        if existing is not None and existing.id != artist_id:
-            raise ValueError(f"Artist name already exists: {canonical_name}")
-        alias_owner = await self._repo.find_artist_id_by_alias(canonical_name)
-        if alias_owner is not None and alias_owner != artist_id:
-            raise ValueError(f"Artist name already exists as alias: {canonical_name}")
+        async with self._local_artist_creation_lock:
+            artist = await self._repo.get_artist(artist_id)
+            if artist is None:
+                raise ValueError("Artist not found")
+            canonical_matches = await self._find_identity_artists(
+                artist_identity_candidates(canonical_name)
+            )
+            if any(item.id != artist_id for item in canonical_matches):
+                raise ValueError(f"Artist name already exists: {canonical_name}")
 
-        clean_aliases: list[str] = []
-        for alias in _unique_artist_names(aliases):
-            alias_normalized = normalize_artist_name(alias)
-            if alias_normalized == normalized:
-                continue
-            alias_owner = await self._repo.find_artist_id_by_alias(alias)
-            if alias_owner is not None and alias_owner != artist_id:
-                raise ValueError(f"Artist alias already belongs to another artist: {alias}")
-            alias_artist = await self._repo.find_artist_by_normalized(alias_normalized)
-            if alias_artist is not None and alias_artist.id != artist_id:
-                raise ValueError(f"Artist alias conflicts with another artist: {alias}")
-            clean_aliases.append(alias)
+            clean_aliases: list[str] = []
+            for alias in _unique_exact_artist_names(aliases):
+                if normalize_artist_name(alias) == normalized:
+                    continue
+                alias_matches = await self._find_identity_artists(
+                    artist_identity_candidates(alias)
+                )
+                if any(item.id != artist_id for item in alias_matches):
+                    raise ValueError(
+                        f"Artist alias already belongs to another artist: {alias}"
+                    )
+                clean_aliases.append(alias)
 
-        updated = await self._repo.update_artist_profile(
-            artist_id,
-            name=canonical_name,
-            normalized_name=normalized,
-            aliases=(
-                (canonical_name, "primary"),
-                *((alias, "user") for alias in clean_aliases),
-            ),
-        )
+            updated = await self._repo.update_artist_profile(
+                artist_id,
+                name=canonical_name,
+                normalized_name=normalized,
+                aliases=(
+                    (canonical_name, "primary"),
+                    *((alias, "user") for alias in clean_aliases),
+                ),
+            )
         if updated is None:
             raise ValueError("Artist not found")
         return await self._get_artist_info(artist_id)
@@ -302,7 +404,7 @@ class ArtistService:
         """Auto-populate artist database from existing MediaFile records.
 
         Scans all distinct artist values from media_files, music_library_tracks,
-        and playlist_tracks, groups them by normalized name, then processes
+        and playlist_tracks, groups them by identity candidates, then processes
         each group incrementally:
 
         1. If the artist already exists in the DB -- add any new aliases, skip.
@@ -318,100 +420,46 @@ class ArtistService:
             logger.info("No existing artists found to build library from.")
             return 0
 
-        # Phase 1: Group raw names by normalization
-        norm_groups: dict[str, set[str]] = {}
+        identity_groups = _group_artist_identity_names(raw_names)
 
-        for raw in raw_names:
-            if not raw:
-                continue
-            parts = split_artist_credit(raw)
-            if not parts:
-                continue
-            for part in parts:
-                normalized = normalize_artist_name(part)
-                if normalized not in norm_groups:
-                    norm_groups[normalized] = set()
-                norm_groups[normalized].add(part)
-
-        # Phase 2: Process each group incrementally with immediate commit
         created = 0
         skipped = 0
-
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
             seen_mb_artists: set[str] = set()
-            group_count = len(norm_groups)
-
-            for i, (normalized, names) in enumerate(norm_groups.items()):
-
+            group_count = len(identity_groups)
+            for i, ordered_names in enumerate(identity_groups):
+                candidates = _identity_candidates_for_names(ordered_names)
+                canonical = _preferred_canonical_name(
+                    candidates,
+                    fallback=ordered_names[0],
+                )
                 logger.info(
                     "Artist build [%d/%d]: processing %s",
-                    i + 1, group_count, next(iter(names)),
+                    i + 1,
+                    group_count,
+                    canonical,
                 )
-
-                # Check if this group already exists in the database
-                existing_artist = await self._repo.find_artist_by_normalized(normalized)
-                if existing_artist is None:
-                    for name in names:
-                        artist_id = await self._repo.find_artist_id_by_alias(name)
-                        if artist_id is not None:
-                            existing_artist = await self._repo.get_artist(artist_id)
-                            break
-
-                if existing_artist is not None:
-                    aliases = tuple(
-                        (alias, "media_file")
-                        for alias in names
-                        if alias != existing_artist.name
-                    )
-                    await self._repo.add_aliases(existing_artist.id, aliases)
-                    if i > 0:
-                        await asyncio.sleep(1)
-                    search_name = max(names, key=len)
-                    mb_aliases = await _fetch_musicbrainz_aliases(
-                        client,
-                        search_name,
-                        user_agent or self._musicbrainz_user_agent,
-                        seen_mb_artists,
-                    )
-                    await self._repo.add_aliases(
-                        existing_artist.id,
-                        tuple(
-                            (mb_alias, "musicbrainz")
-                            for mb_alias in mb_aliases
-                            if mb_alias != existing_artist.name
-                        ),
-                    )
+                artist, was_created = await self._ensure_artist_local(
+                    canonical,
+                    source="media_file",
+                    identity_names=ordered_names,
+                )
+                if was_created:
+                    created += 1
+                else:
                     skipped += 1
-                    continue
-
-                # New artist -- rate-limit before MusicBrainz API calls
                 if i > 0:
                     await asyncio.sleep(1)
-                search_name = max(names, key=len)
                 mb_aliases = await _fetch_musicbrainz_aliases(
                     client,
-                    search_name,
+                    canonical,
                     user_agent or self._musicbrainz_user_agent,
                     seen_mb_artists,
                 )
-
-                # Pick canonical name (longest is usually most descriptive)
-                canonical = max(names, key=len)
-                artist = await self._repo.create_artist(
-                    name=canonical,
-                    normalized_name=normalized,
-                    external_ids={},
+                await self._add_aliases_safely(
+                    artist.id,
+                    tuple((alias, "musicbrainz") for alias in mb_aliases),
                 )
-                aliases = tuple(
-                    (alias, "primary" if alias == canonical else "media_file")
-                    for alias in names
-                ) + tuple(
-                    (mb_alias, "musicbrainz")
-                    for mb_alias in mb_aliases
-                    if mb_alias != canonical
-                )
-                await self._repo.add_aliases(artist.id, aliases)
-                created += 1
 
         logger.info(
             "Artist build done: %d created, %d skipped (from %d names, %d groups)",
@@ -421,7 +469,21 @@ class ArtistService:
 
     async def add_alias(self, artist_id: int, alias: str, source: str = "user") -> None:
         """Add an alias to an existing artist."""
-        await self._repo.add_alias(artist_id, alias, source)
+        alias_name = alias.strip()
+        if not alias_name:
+            raise ValueError("Artist alias cannot be empty")
+        async with self._local_artist_creation_lock:
+            artist = await self._repo.get_artist(artist_id)
+            if artist is None:
+                raise ValueError("Artist not found")
+            matches = await self._find_identity_artists(
+                artist_identity_candidates(alias_name)
+            )
+            if any(item.id != artist_id for item in matches):
+                raise ValueError(
+                    f"Artist alias already belongs to another artist: {alias_name}"
+                )
+            await self._repo.add_alias(artist_id, alias_name, source)
 
     async def list_artists(self) -> list[ArtistInfo]:
         """List all artists with their aliases."""
@@ -461,6 +523,159 @@ class ArtistService:
         )
 
     # -- Internal --
+
+    async def _find_identity_artists(self, candidates: tuple[str, ...]) -> list[Any]:
+        aliases = _unique_exact_artist_names(candidates)
+        normalized_names = tuple(
+            dict.fromkeys(
+                normalized
+                for candidate in aliases
+                if (normalized := normalize_artist_name(candidate))
+            )
+        )
+        return await self._repo.list_artists_by_identity_candidates(
+            aliases=aliases,
+            normalized_names=normalized_names,
+        )
+
+    def _select_identity_artist(
+        self,
+        artists: list[Any],
+        *,
+        candidates: tuple[str, ...],
+        fallback: str,
+    ) -> Any:
+        preferred = _preferred_canonical_name(candidates, fallback=fallback)
+        exact_matches = [artist for artist in artists if artist.name == preferred]
+        selected = min(exact_matches or artists, key=lambda artist: artist.id)
+        if len(artists) > 1:
+            logger.warning(
+                "Artist identity conflict: candidates=%s, matches=%s, selected_id=%s, "
+                "selected_name=%r",
+                candidates,
+                [(artist.id, artist.name) for artist in artists],
+                selected.id,
+                selected.name,
+            )
+        return selected
+
+    async def _ensure_artist_local(
+        self,
+        name: str,
+        *,
+        source: str,
+        external_ids: dict[str, str] | None = None,
+        identity_names: tuple[str, ...] | None = None,
+    ) -> tuple[ArtistInfo, bool]:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError("Artist name cannot be empty")
+        lookup_names = _unique_exact_artist_names(
+            (clean_name, *(identity_names or ()))
+        )
+        candidates = _identity_candidates_for_names(lookup_names)
+        if not candidates:
+            raise ValueError("Artist name cannot be empty")
+        canonical = _preferred_canonical_name(candidates, fallback=clean_name)
+
+        async with self._local_artist_creation_lock:
+            matches = await self._find_identity_artists(candidates)
+            if matches:
+                artist = self._select_identity_artist(
+                    matches,
+                    candidates=candidates,
+                    fallback=clean_name,
+                )
+                created = False
+            else:
+                artist = await self._repo.create_artist(
+                    name=canonical,
+                    normalized_name=normalize_artist_name(canonical),
+                    external_ids=external_ids or {},
+                )
+                created = True
+            alias_names = _unique_exact_artist_names((artist.name, *candidates))
+            await self._add_aliases_safely(
+                artist.id,
+                tuple(
+                    (
+                        alias,
+                        "primary" if alias == artist.name else source,
+                    )
+                    for alias in alias_names
+                ),
+            )
+            return await self._get_artist_info(artist.id), created
+
+    async def _add_aliases_safely(
+        self,
+        artist_id: int,
+        aliases: tuple[tuple[str, str], ...],
+    ) -> None:
+        async with self._alias_write_lock:
+            await self._add_aliases_safely_locked(artist_id, aliases)
+
+    async def _add_aliases_safely_locked(
+        self,
+        artist_id: int,
+        aliases: tuple[tuple[str, str], ...],
+    ) -> None:
+        alias_sources: dict[str, str] = {}
+        for alias, source in aliases:
+            alias_name = alias.strip()
+            if alias_name and alias_name not in alias_sources:
+                alias_sources[alias_name] = source
+        if not alias_sources:
+            return
+
+        current_aliases = set(await self._repo.list_artist_aliases(artist_id))
+        candidate_map = {
+            alias: artist_identity_candidates(alias)
+            for alias in alias_sources
+        }
+        lookup_aliases = _unique_exact_artist_names(
+            tuple(
+                candidate
+                for candidates in candidate_map.values()
+                for candidate in candidates
+            )
+        )
+        owners = await self._repo.list_artist_alias_owners(lookup_aliases)
+        matching_artists = await self._find_identity_artists(lookup_aliases)
+        safe_aliases: list[tuple[str, str]] = []
+        for alias, source in alias_sources.items():
+            if alias in current_aliases:
+                continue
+            candidates = candidate_map[alias]
+            normalized_candidates = {
+                normalized
+                for candidate in candidates
+                if (normalized := normalize_artist_name(candidate))
+            }
+            owner_ids = {
+                owner_id
+                for candidate in candidates
+                for owner_id in owners.get(candidate, ())
+            }
+            owner_ids.update(
+                artist.id
+                for artist in matching_artists
+                if artist.normalized_name in normalized_candidates
+            )
+            conflicting_ids = sorted(owner_ids - {artist_id})
+            if conflicting_ids:
+                logger.warning(
+                    "Artist alias conflict skipped: artist_id=%s, alias=%r, source=%s, "
+                    "owner_ids=%s",
+                    artist_id,
+                    alias,
+                    source,
+                    conflicting_ids,
+                )
+                continue
+            safe_aliases.append((alias, source))
+            current_aliases.add(alias)
+        await self._repo.add_aliases(artist_id, tuple(safe_aliases))
 
     async def _get_artist_info(self, artist_id: int) -> ArtistInfo:
         artist = await self._repo.get_artist(artist_id)
@@ -507,11 +722,11 @@ class ArtistService:
                 logger.debug("MusicBrainz enrichment timed out for %r", lookup_name)
                 aliases = set()
             self._last_musicbrainz_enrichment_at = loop.time()
-            await self._repo.add_aliases(
+            await self._add_aliases_safely(
                 artist.id,
                 tuple(
                     (alias, "musicbrainz")
-                    for alias in aliases
+                    for alias in sorted(aliases)
                     if alias != artist.name
                 ),
             )

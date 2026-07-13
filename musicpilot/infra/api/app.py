@@ -75,6 +75,7 @@ from musicpilot.core.metadata import MetadataCascade
 from musicpilot.core.pipeline import MusicPipeline
 from musicpilot.core.processor import MediaProcessor
 from musicpilot.core.scraping import (
+    ArtistDirectoryResolutionError,
     ContextualMetadata,
     LibraryTrackSnapshot,
     LocalMusicScraper,
@@ -675,6 +676,7 @@ class FileOrganizeExecutor:
                 _metadata_candidates_from_payload(payload.get("metadata_candidates")),
                 inferred_metadata=_track_metadata_from_payload(payload.get("inferred_metadata")),
             )
+            _raise_artist_directory_resolution_failure(summary)
             return TaskExecutionResult(result=_scraping_summary_result(summary))
         task_id = _optional_int(payload.get("torrent_record_id"))
         item_id = _optional_int(payload.get("item_id"))
@@ -5999,7 +6001,15 @@ async def _ensure_artist_from_metadata(
     *,
     context: str,
 ) -> None:
-    artists = split_artist_credit(metadata.artist)
+    artists: list[str] = []
+    seen: set[str] = set()
+    for credit in (metadata.artist, metadata.album_artist):
+        for artist in split_artist_credit(credit):
+            normalized = normalize_artist_name(artist)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            artists.append(artist)
     if not artists:
         return
     for artist in artists:
@@ -6282,6 +6292,22 @@ def _scraping_summary_result(summary: ScrapingSummary) -> dict[str, int]:
         "failed_files": summary.failed_files,
         "skipped_files": sum(1 for item in summary.results if item.status == "skipped"),
     }
+
+
+def _raise_artist_directory_resolution_failure(summary: ScrapingSummary) -> None:
+    failure = next(
+        (
+            item
+            for item in summary.results
+            if item.stage == ArtistDirectoryResolutionError.__name__
+        ),
+        None,
+    )
+    if failure is None:
+        return
+    raise ArtistDirectoryResolutionError(
+        failure.error_message or "歌手权威名查询或创建失败。"
+    )
 
 
 def _file_organize_response_from_task_result(
@@ -8583,7 +8609,7 @@ async def _organize_download_task_item(
         "skipped": "organize_skipped",
         "failed": "organize_failed",
     }.get(result.status, "organize_failed")
-    return await state.repository.update_download_task_item(
+    updated = await state.repository.update_download_task_item(
         item_id,
         status=status,
         metadata_title=result.metadata.title,
@@ -8592,6 +8618,11 @@ async def _organize_download_task_item(
         metadata_payload=_track_metadata_payload(result.metadata),
         last_error=result.error_message if result.status != "success" else None,
     )
+    if result.stage == ArtistDirectoryResolutionError.__name__:
+        raise ArtistDirectoryResolutionError(
+            result.error_message or "歌手权威名查询或创建失败。"
+        )
+    return updated
 
 
 async def _scraping_library_snapshots(
