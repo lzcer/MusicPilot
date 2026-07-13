@@ -2881,6 +2881,11 @@ def create_app() -> FastAPI:
         deleted_ids: list[int] = []
         not_found_ids: list[int] = []
         failures: list[MediaBulkDeleteFailure] = []
+        config: ScrapingConfig | None = None
+        if payload.mode in {"media_file", "all"}:
+            settings_payload = await state.repository.get_system_settings()
+            config = scraping_config_from_payload(settings_payload)
+        music_library_change_count = 0
         seen: set[int] = set()
         for media_id in payload.ids:
             if media_id in seen:
@@ -2890,15 +2895,28 @@ def create_app() -> FastAPI:
             if media is None:
                 not_found_ids.append(media_id)
                 continue
+            removes_library_result = _media_delete_removes_library_result(media, payload.mode)
             try:
-                deleted = await _delete_media_record(state, media, payload.mode)
+                deleted = await _delete_media_record(
+                    state,
+                    media,
+                    payload.mode,
+                    config=config,
+                )
             except Exception as exc:  # noqa: BLE001
                 failures.append(MediaBulkDeleteFailure(id=media_id, message=str(exc)))
                 continue
             if deleted:
                 deleted_ids.append(media_id)
+                if removes_library_result:
+                    music_library_change_count += 1
             else:
                 not_found_ids.append(media_id)
+        if music_library_change_count:
+            await _refresh_music_library_after_change(
+                state,
+                f"bulk media deletion, records={music_library_change_count}",
+            )
         return MediaBulkDeleteResponse(
             deleted_ids=deleted_ids,
             not_found_ids=not_found_ids,
@@ -3043,8 +3061,13 @@ def create_app() -> FastAPI:
         media = await state.repository.get_media_file(media_id)
         if media is None:
             raise HTTPException(status_code=404, detail="Media record not found.")
+        config: ScrapingConfig | None = None
+        if mode in {"media_file", "all"}:
+            settings_payload = await state.repository.get_system_settings()
+            config = scraping_config_from_payload(settings_payload)
+        removes_library_result = _media_delete_removes_library_result(media, mode)
         try:
-            deleted = await _delete_media_record(state, media, mode)
+            deleted = await _delete_media_record(state, media, mode, config=config)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
                 status_code=502,
@@ -3052,6 +3075,11 @@ def create_app() -> FastAPI:
             ) from exc
         if not deleted:
             raise HTTPException(status_code=404, detail="Media record not found.")
+        if removes_library_result:
+            await _refresh_music_library_after_change(
+                state,
+                f"media deletion, media_id={media_id}",
+            )
 
     @app.get("/api/music-library", response_model=MusicLibraryTrackPageResponse)
     async def music_library(
@@ -6750,37 +6778,35 @@ async def _sync_music_library_after_refresh(state: AppState) -> None:
         state.add_log("library", f"Music library sync after refresh failed: {exc}", "ERROR")
 
 
-async def _refresh_music_library_after_manual_organize(
+async def _refresh_music_library_after_change(
     state: AppState,
-    task_name: str,
+    reason: str,
 ) -> None:
-    server = await state.repository.default_media_server()
-    if server is None:
-        state.add_log(
-            "library",
-            f"Music library refresh after manual organization skipped: "
-            f"no media server, task={task_name}",
-            "WARNING",
-        )
-        return
     try:
+        server = await state.repository.default_media_server()
+        if server is None:
+            state.add_log(
+                "library",
+                f"Music library refresh skipped: no media server, reason={reason}",
+                "WARNING",
+            )
+            return
         client = build_media_server_client(server)
         await client.start_scan()
     except Exception as exc:  # noqa: BLE001
         state.add_log(
             "library",
-            f"Music library refresh after manual organization failed: "
-            f"task={task_name}, error={exc}",
+            f"Music library refresh failed: reason={reason}, error={exc}",
             "ERROR",
         )
         return
     state.add_log(
         "library",
-        f"Media library refresh requested after manual organization: {task_name}",
+        f"Media library refresh requested: reason={reason}",
     )
     sync_task = asyncio.create_task(
         _sync_music_library_after_refresh(state),
-        name="musicpilot-music-library-sync-after-manual-organization",
+        name="musicpilot-music-library-sync-after-refresh",
     )
     state._background_tasks.add(sync_task)
     sync_task.add_done_callback(state._background_tasks.discard)
@@ -6917,13 +6943,48 @@ async def _delete_media_record(
     state: AppState,
     media: MediaFile,
     mode: MediaDeleteMode,
+    *,
+    config: ScrapingConfig | None = None,
 ) -> bool:
     if mode in {"media_file", "all"}:
+        removes_library_result = _media_delete_removes_library_result(media, mode)
+        library_path: str | None = None
+        library_paths: tuple[Path, ...] = ()
+        old_file_size: int | None = None
+        if removes_library_result:
+            if config is None:
+                raise RuntimeError("Scraping configuration is required for media deletion.")
+            library_path = media.library_path
+            if not library_path:
+                raise RuntimeError("Media library path is required for media deletion.")
+            library_paths = _media_library_path_candidates(library_path, config)
+            old_file_size = next(
+                (
+                    size
+                    for library_path in library_paths
+                    if (size := _file_size_or_none(str(library_path))) is not None
+                ),
+                None,
+            )
         if mode == "all":
             await _delete_media_source(state, media)
-        if media.status == "success" and media.library_path:
-            await _delete_file_path(Path(media.library_path))
+        if removes_library_result:
+            if config is None or library_path is None:
+                raise RuntimeError("Media deletion preparation is incomplete.")
+            await _delete_music_library_tracks_for_media(
+                state,
+                media,
+                library_paths,
+                old_file_size,
+                config,
+                context="media deletion",
+            )
+            await _delete_file_path(Path(library_path))
     return await state.repository.delete_media_file(media.id)
+
+
+def _media_delete_removes_library_result(media: MediaFile, mode: MediaDeleteMode) -> bool:
+    return mode in {"media_file", "all"} and media.status == "success" and bool(media.library_path)
 
 
 async def _prepare_source_file_reorganize(
@@ -6963,12 +7024,13 @@ async def _prepare_media_record_reorganize(
             ),
             None,
         )
-        await _delete_reorganized_music_library_tracks(
+        await _delete_music_library_tracks_for_media(
             state,
             media,
             library_paths,
             old_file_size,
             config,
+            context="reorganization",
         )
         for library_path in library_paths:
             if media.status != "success":
@@ -6992,12 +7054,13 @@ async def _prepare_media_record_reorganize(
             ),
             None,
         )
-        await _delete_reorganized_music_library_tracks(
+        await _delete_music_library_tracks_for_media(
             state,
             media,
             legacy_paths,
             old_file_size,
             config,
+            context="reorganization",
         )
         for legacy_path in legacy_paths:
             await _delete_file_path(legacy_path)
@@ -7006,12 +7069,14 @@ async def _prepare_media_record_reorganize(
     return tuple(exclude_paths)
 
 
-async def _delete_reorganized_music_library_tracks(
+async def _delete_music_library_tracks_for_media(
     state: AppState,
     media: MediaFile,
     library_paths: tuple[Path, ...],
     old_file_size: int | None,
     config: ScrapingConfig,
+    *,
+    context: str,
 ) -> None:
     tracks = await state.repository.list_music_library_tracks()
     library_roots = tuple(
@@ -7049,7 +7114,7 @@ async def _delete_reorganized_music_library_tracks(
                 state.add_log(
                     "library",
                     "Music library cleanup skipped ambiguous metadata match: "
-                    f"media_id={media.id}, candidates={len(candidates)}",
+                    f"context={context}, media_id={media.id}, candidates={len(candidates)}",
                     "WARNING",
                 )
     if not matched:
@@ -7057,8 +7122,8 @@ async def _delete_reorganized_music_library_tracks(
     deleted = await state.repository.delete_music_library_tracks(track.id for track in matched)
     state.add_log(
         "library",
-        f"Removed stale music library track(s) before reorganization: "
-        f"media_id={media.id}, deleted={deleted}",
+        f"Removed music library track(s): "
+        f"context={context}, media_id={media.id}, deleted={deleted}",
     )
 
 
@@ -7728,7 +7793,10 @@ async def _scrape_manual_source_files(
         f"skipped={sum(1 for item in summary.results if item.status == 'skipped')}",
     )
     if any(item.status == "success" for item in summary.results):
-        await _refresh_music_library_after_manual_organize(state, task_name)
+        await _refresh_music_library_after_change(
+            state,
+            f"manual organization, task={task_name}",
+        )
     return summary
 
 

@@ -736,6 +736,7 @@ const systemTasksLoading = ref(false)
 const systemTasksInterrupting = ref(false)
 const downloadDeleteDialog = ref(false)
 const mediaDeleteDialog = ref(false)
+const mediaDeleteAllConfirmDialog = ref(false)
 const fileOrganizeDialog = ref(false)
 const fileDeleteDialog = ref(false)
 const siteTesting = ref(false)
@@ -2010,6 +2011,14 @@ function deleteSelectedMediaFiles() {
   mediaDeleteDialog.value = true
 }
 
+function requestDeleteMedia(mode: MediaDeleteMode) {
+  if (mode === 'all') {
+    mediaDeleteAllConfirmDialog.value = true
+    return
+  }
+  void confirmDeleteMedia(mode)
+}
+
 async function confirmDeleteMedia(mode: MediaDeleteMode) {
   const ids = [...pendingMediaDeleteIds.value]
   if (!ids.length) return
@@ -2043,6 +2052,7 @@ async function confirmDeleteMedia(mode: MediaDeleteMode) {
     pendingMediaDeleteIds.value = []
     pendingMediaDeleteLabel.value = ''
     mediaDeleteDialog.value = false
+    mediaDeleteAllConfirmDialog.value = false
     await loadMedia()
     if (deletingSingle) {
       notify('整理记录已删除')
@@ -7027,7 +7037,7 @@ onUnmounted(() => {
             variant="tonal"
             :disabled="mediaDeleting"
             :loading="activeMediaDeleteMode === 'record_only'"
-            @click="confirmDeleteMedia('record_only')"
+            @click="requestDeleteMedia('record_only')"
           >
             仅删除记录
           </v-btn>
@@ -7036,7 +7046,7 @@ onUnmounted(() => {
             variant="tonal"
             :disabled="mediaDeleting"
             :loading="activeMediaDeleteMode === 'media_file'"
-            @click="confirmDeleteMedia('media_file')"
+            @click="requestDeleteMedia('media_file')"
           >
             删除媒体文件
           </v-btn>
@@ -7044,9 +7054,38 @@ onUnmounted(() => {
             color="error"
             :disabled="mediaDeleting"
             :loading="activeMediaDeleteMode === 'all'"
-            @click="confirmDeleteMedia('all')"
+            @click="requestDeleteMedia('all')"
           >
             删除全部
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="mediaDeleteAllConfirmDialog" max-width="480">
+      <v-card title="确认删除全部">
+        <v-card-text class="dialog-stack">
+          <div>确认删除{{ pendingMediaDeleteLabel || '整理记录' }}？</div>
+          <v-alert type="error" variant="tonal" density="compact">
+            此操作将删除整理记录、媒体文件以及源文件，且不可恢复。
+          </v-alert>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn
+            variant="text"
+            :disabled="mediaDeleting"
+            @click="mediaDeleteAllConfirmDialog = false"
+          >
+            取消
+          </v-btn>
+          <v-btn
+            color="error"
+            :disabled="mediaDeleting"
+            :loading="activeMediaDeleteMode === 'all'"
+            @click="confirmDeleteMedia('all')"
+          >
+            确认删除全部
           </v-btn>
         </v-card-actions>
       </v-card>
