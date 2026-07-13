@@ -26,6 +26,12 @@ ScrapingMode = Literal["source", "mapped", "copy"]
 RequiredMetadata = Literal["album", "artist", "lyrics"]
 ClassifyBy = Literal["artist", "album", "artist_album"]
 DuplicateHandling = Literal["ignore", "overwrite", "keep_largest"]
+PathOperationCause = Literal[
+    "already_mapped",
+    "hardlink_created",
+    "copy_requested",
+    "hardlink_failed",
+]
 
 _INVALID_METADATA_TEXT_KEYS = frozenset(
     {
@@ -193,16 +199,22 @@ class ContextualMetadata:
 
 
 @dataclass(frozen=True, slots=True)
+class _OperationReasonContext:
+    configured_mode: ScrapingMode
+    manual: bool = False
+    missing_before: tuple[RequiredMetadata, ...] = ()
+    metadata_gain: tuple[RequiredMetadata, ...] = ()
+    writes_tags: bool = False
+    path_cause: PathOperationCause | None = None
+    completed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class _PathOperationResult:
     path: Path
     operation_type: ScrapingMode
     overwritten_existing: bool = False
-    cause: Literal[
-        "already_mapped",
-        "hardlink_created",
-        "copy_requested",
-        "hardlink_failed",
-    ] | None = None
+    cause: PathOperationCause | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,7 +342,9 @@ class LocalMusicScraper:
                     metadata=source_metadata,
                     status="failed",
                     operation_type=config.mode,
-                    operation_reason=_configured_operation_reason(config.mode),
+                    operation_reason=_operation_reason(
+                        _OperationReasonContext(configured_mode=config.mode)
+                    ),
                     error_message=str(exc) or exc.__class__.__name__,
                     stage=exc.__class__.__name__,
                 )
@@ -517,11 +531,6 @@ class LocalMusicScraper:
         )
         missing_before = _missing_metadata_fields(source_metadata, scrape_fields)
         needs_scrape = bool(missing_before)
-        operation_reason = _configured_operation_reason(
-            config.mode,
-            missing_before=missing_before if forced_metadata is None else (),
-            manual=forced_metadata is not None,
-        )
         metadata = _merge_metadata(source_metadata, match_metadata)
         candidate_count = 0
         candidate_reference = match_metadata
@@ -529,6 +538,27 @@ class LocalMusicScraper:
         tag_writer = self.tag_writer
         metadata_gain: tuple[RequiredMetadata, ...] = ()
         should_write_tags = forced_metadata is not None
+
+        def build_operation_reason(
+            *,
+            writes_tags: bool = False,
+            path_result: _PathOperationResult | None = None,
+            completed: bool = False,
+        ) -> str:
+            return _operation_reason(
+                _OperationReasonContext(
+                    configured_mode=config.mode,
+                    manual=forced_metadata is not None,
+                    missing_before=(
+                        missing_before if forced_metadata is None else ()
+                    ),
+                    metadata_gain=metadata_gain,
+                    writes_tags=writes_tags,
+                    path_cause=path_result.cause if path_result is not None else None,
+                    completed=completed,
+                )
+            )
+
         requires_identity_verification = False
         verification_reference = match_metadata
         if forced_metadata is None and contextual_metadata is not None:
@@ -586,7 +616,7 @@ class LocalMusicScraper:
                         metadata=metadata,
                         status="failed",
                         operation_type=config.mode,
-                        operation_reason=operation_reason,
+                        operation_reason=build_operation_reason(),
                         error_message=error_message,
                         stage=candidate_stage,
                         needs_metadata_update=True,
@@ -629,7 +659,7 @@ class LocalMusicScraper:
                         metadata=metadata,
                         status="failed",
                         operation_type=config.mode,
-                        operation_reason=operation_reason,
+                        operation_reason=build_operation_reason(),
                         error_message=error_message,
                         stage="identity_verification",
                         needs_metadata_update=needs_scrape,
@@ -674,7 +704,7 @@ class LocalMusicScraper:
                             metadata=metadata,
                             status="failed",
                             operation_type=config.mode,
-                            operation_reason=operation_reason,
+                            operation_reason=build_operation_reason(),
                             error_message=error_message,
                             stage="identity_verification",
                             needs_metadata_update=True,
@@ -780,7 +810,7 @@ class LocalMusicScraper:
                             metadata=source_metadata,
                             status="failed",
                             operation_type=config.mode,
-                            operation_reason=operation_reason,
+                            operation_reason=build_operation_reason(),
                             error_message=error_message,
                             stage=candidate_stage,
                             needs_metadata_update=needs_scrape,
@@ -814,7 +844,7 @@ class LocalMusicScraper:
                         metadata=source_metadata,
                         status="failed",
                         operation_type=config.mode,
-                        operation_reason=operation_reason,
+                        operation_reason=build_operation_reason(),
                         error_message=error_message,
                         stage=candidate_stage,
                         needs_metadata_update=needs_scrape,
@@ -830,7 +860,8 @@ class LocalMusicScraper:
                     metadata,
                     missing_before,
                 )
-        if tag_writer is None and (should_write_tags or metadata_gain):
+        writes_tags = should_write_tags or bool(metadata_gain)
+        if tag_writer is None and writes_tags:
             logger.info(
                 "Scraping file result: source=%s, status=failed, stage=tag_writer, "
                 "metadata=%s, metadata_gain=%s",
@@ -845,7 +876,7 @@ class LocalMusicScraper:
                     metadata=source_metadata,
                     status="failed",
                     operation_type=config.mode,
-                    operation_reason=operation_reason,
+                    operation_reason=build_operation_reason(writes_tags=writes_tags),
                     error_message="标签写入器不可用。",
                     stage="tag_writer",
                     needs_metadata_update=forced_metadata is not None or needs_scrape,
@@ -855,8 +886,6 @@ class LocalMusicScraper:
                 0,
                 0,
             )
-
-        writes_tags = should_write_tags or bool(metadata_gain)
 
         # Resolve artist to canonical name
         if self.artist_service is not None:
@@ -906,7 +935,7 @@ class LocalMusicScraper:
                         metadata=metadata,
                         status="skipped",
                         operation_type=config.mode,
-                        operation_reason=operation_reason,
+                        operation_reason=build_operation_reason(),
                         error_message=error_message,
                         stage="skip_duplicate",
                         needs_metadata_update=needs_scrape,
@@ -945,7 +974,7 @@ class LocalMusicScraper:
                             metadata=metadata,
                             status="skipped",
                             operation_type=config.mode,
-                            operation_reason=operation_reason,
+                            operation_reason=build_operation_reason(),
                             error_message=error_message,
                             stage="skip_smaller_duplicate",
                             needs_metadata_update=needs_scrape,
@@ -961,44 +990,37 @@ class LocalMusicScraper:
 
         overwritten_existing_target = False
         operation_type = config.mode
+        path_result: _PathOperationResult | None = None
         if config.mode == "mapped":
-            mapped_result = await asyncio.to_thread(
+            path_result = await asyncio.to_thread(
                 _copy_to_mapping,
                 source_file,
                 config,
                 hardlink=not writes_tags,
                 overwrite=not _will_classify_or_rename(config),
             )
-            working_file = mapped_result.path
-            operation_type = mapped_result.operation_type
-            operation_reason = _completed_operation_reason(
-                operation_reason,
-                configured_mode=config.mode,
-                path_result=mapped_result,
-                metadata_gain=metadata_gain,
-                writes_tags=writes_tags,
-            )
-            overwritten_existing_target = mapped_result.overwritten_existing
+            working_file = path_result.path
+            operation_type = path_result.operation_type
+            overwritten_existing_target = path_result.overwritten_existing
             mapped_files += 1
         elif config.mode == "copy":
-            mapped_result = await asyncio.to_thread(
+            path_result = await asyncio.to_thread(
                 _copy_to_mapping,
                 source_file,
                 config,
                 hardlink=False,
                 overwrite=not _will_classify_or_rename(config),
             )
-            working_file = mapped_result.path
-            operation_type = mapped_result.operation_type
-            operation_reason = _completed_operation_reason(
-                operation_reason,
-                configured_mode=config.mode,
-                path_result=mapped_result,
-                metadata_gain=metadata_gain,
-                writes_tags=writes_tags,
-            )
-            overwritten_existing_target = mapped_result.overwritten_existing
+            working_file = path_result.path
+            operation_type = path_result.operation_type
+            overwritten_existing_target = path_result.overwritten_existing
             mapped_files += 1
+
+        operation_reason = build_operation_reason(
+            writes_tags=writes_tags,
+            path_result=path_result,
+            completed=True,
+        )
 
         if should_write_tags or metadata_gain:
             assert tag_writer is not None
@@ -1650,45 +1672,74 @@ def _audio_files(path: Path) -> list[Path]:
     return []
 
 
-def _configured_operation_reason(
-    mode: ScrapingMode,
-    *,
-    missing_before: tuple[RequiredMetadata, ...] = (),
-    manual: bool = False,
-) -> str:
-    reason = {
-        "source": "配置指定在源目录处理",
-        "mapped": "配置指定映射文件",
-        "copy": "配置指定复制文件",
-    }[mode]
-    if manual:
-        return f"{reason}；使用手动元数据整理"
-    if missing_before:
-        fields = "、".join(_metadata_field_text(field) for field in missing_before)
-        return f"{reason}；因缺少{fields}触发刮削"
-    return reason
+def _operation_reason(context: _OperationReasonContext) -> str:
+    parts = [
+        {
+            "source": "配置指定在源目录处理",
+            "mapped": "配置指定映射文件",
+            "copy": "配置指定复制文件",
+        }[context.configured_mode]
+    ]
+    if context.manual:
+        parts.append("使用手动元数据整理")
+    elif context.missing_before:
+        parts.append(f"因缺少{_metadata_fields_text(context.missing_before)}触发刮削")
+        gained = tuple(
+            field for field in context.missing_before if field in context.metadata_gain
+        )
+        remaining = tuple(
+            field for field in context.missing_before if field not in context.metadata_gain
+        )
+        if gained:
+            parts.append(f"已补充{_metadata_fields_text(gained)}")
+        if remaining:
+            prefix = "仍缺少" if gained else "刮削后仍缺少"
+            parts.append(f"{prefix}{_metadata_fields_text(remaining)}")
+
+    if not context.completed:
+        return "；".join(parts)
+
+    def append_completion(*clauses: str) -> None:
+        if not clauses:
+            return
+        if not context.manual and context.missing_before:
+            parts[-1] = f"{parts[-1]}，{clauses[0]}"
+            parts.extend(clauses[1:])
+        else:
+            parts.extend(clauses)
+
+    if context.configured_mode == "source":
+        append_completion(
+            "已写入源文件" if context.writes_tags else "无需写入标签，已在源目录完成处理"
+        )
+        return "；".join(parts)
+
+    if context.path_cause == "already_mapped":
+        append_completion("无需写入标签，目标文件已映射，无需重复处理")
+    elif context.path_cause == "hardlink_created":
+        append_completion("无需写入标签，已成功创建硬链接")
+    elif context.path_cause == "hardlink_failed":
+        append_completion("无需写入标签", "硬链接创建失败，自动改用复制")
+    elif context.path_cause == "copy_requested":
+        if context.configured_mode == "mapped":
+            append_completion(
+                "需要写入标签，自动改用复制"
+                if context.writes_tags
+                else "已复制文件"
+            )
+        else:
+            append_completion(
+                "需要写入标签，已复制文件"
+                if context.writes_tags
+                else "无需写入标签，已复制文件"
+            )
+    else:
+        append_completion("已完成文件处理")
+    return "；".join(parts)
 
 
-def _completed_operation_reason(
-    configured_reason: str,
-    *,
-    configured_mode: ScrapingMode,
-    path_result: _PathOperationResult,
-    metadata_gain: tuple[RequiredMetadata, ...],
-    writes_tags: bool,
-) -> str:
-    if path_result.cause == "already_mapped":
-        return f"{configured_reason}；目标文件已映射，无需重复处理"
-    if path_result.cause == "hardlink_created":
-        return f"{configured_reason}；已成功创建硬链接"
-    if path_result.cause == "hardlink_failed":
-        return f"{configured_reason}；硬链接创建失败，自动改用复制"
-    if configured_mode == "mapped" and writes_tags:
-        if metadata_gain:
-            fields = "、".join(_metadata_field_text(field) for field in metadata_gain)
-            return f"{configured_reason}；需要写入{fields}，自动改用复制"
-        return f"{configured_reason}；需要写入标签，自动改用复制"
-    return configured_reason
+def _metadata_fields_text(fields: tuple[RequiredMetadata, ...]) -> str:
+    return "、".join(_metadata_field_text(field) for field in fields)
 
 
 def _metadata_field_text(field: RequiredMetadata) -> str:
