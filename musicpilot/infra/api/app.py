@@ -2908,7 +2908,11 @@ def create_app() -> FastAPI:
     @app.post("/api/media/retry", response_model=MediaRetryResponse)
     async def retry_media(payload: MediaRetryRequest) -> MediaRetryResponse:
         media_records: list[MediaFile] = []
+        seen_ids: set[int] = set()
         for mid in payload.ids:
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
             rec = await state.repository.get_media_file(mid)
             if rec and rec.source_path:
                 media_records.append(rec)
@@ -2918,12 +2922,41 @@ def create_app() -> FastAPI:
         config = scraping_config_from_payload(settings_payload)
         if not config.enabled:
             raise HTTPException(status_code=409, detail="请先在刮削设置中开启刮削")
-        source_files = tuple(Path(rec.source_path) for rec in media_records)
-        try:
-            summary = await _scrape_manual_source_files(
-                state, config, f"retry {len(source_files)} files", source_files
+        source_files = tuple(dict.fromkeys(Path(rec.source_path) for rec in media_records))
+        source_file_checks = await asyncio.gather(
+            *(asyncio.to_thread(source_file.is_file) for source_file in source_files)
+        )
+        invalid_source_file = next(
+            (
+                source_file
+                for source_file, source_is_file in zip(
+                    source_files,
+                    source_file_checks,
+                    strict=True,
+                )
+                if not source_is_file
+            ),
+            None,
+        )
+        if invalid_source_file is not None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"源文件不存在，无法重试：{invalid_source_file}",
             )
-        except Exception as exc:
+        exclude_library_paths: list[Path] = []
+        try:
+            for media in media_records:
+                exclude_library_paths.extend(
+                    await _prepare_media_record_reorganize(state, media, config)
+                )
+            summary = await _scrape_manual_source_files(
+                state,
+                config,
+                f"retry {len(source_files)} files",
+                source_files,
+                exclude_library_paths=tuple(dict.fromkeys(exclude_library_paths)),
+            )
+        except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"重试失败：{exc}") from exc
         return MediaRetryResponse(
             total=len(media_records),
