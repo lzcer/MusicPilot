@@ -668,13 +668,13 @@ const mediaTableHeaders = [
   { title: '', key: 'select', sortable: false, width: 48 },
   { title: '标题', key: 'title', sortable: false, width: 160 },
   { title: '艺人', key: 'artist', sortable: false, width: 150 },
-  { title: '专辑', key: 'album', sortable: false, width: 320 },
-  { title: '操作时间', key: 'operation_time', sortable: false, width: 180 },
+  { title: '专辑', key: 'album', sortable: false, width: 200 },
   { title: '类型', key: 'operation_type', sortable: false, width: 90 },
   { title: '状态', key: 'status', sortable: false, width: 90 },
   { title: '文件路径', key: 'path', sortable: false, width: 520 },
-  { title: '备注', key: 'remark', sortable: false, width: 180 },
-  { title: '操作', key: 'actions', sortable: false, width: 120 },
+  { title: '备注', key: 'remark', sortable: false, width: 300 },
+  { title: '操作时间', key: 'operation_time', sortable: false, width: 180 },
+  { title: '操作', key: 'actions', sortable: false, width: 160, fixed: 'end' as const },
 ]
 const fileRootType = ref<FileRootType>('source')
 const fileEntries = ref<FileEntry[]>([])
@@ -4898,13 +4898,34 @@ onUnmounted(() => {
                   />
                 </template>
                 <template #item.title="{ item }">
-                  {{ mediaTableRow(item).title || '-' }}
+                  <v-tooltip location="top" max-width="420">
+                    <template #activator="{ props }">
+                      <span v-bind="props" class="media-single-line-text">
+                        {{ mediaTableRow(item).title || '-' }}
+                      </span>
+                    </template>
+                    <span class="media-tooltip-text">{{ mediaTableRow(item).title || '-' }}</span>
+                  </v-tooltip>
                 </template>
                 <template #item.artist="{ item }">
-                  {{ mediaTableRow(item).artist || '-' }}
+                  <v-tooltip location="top" max-width="420">
+                    <template #activator="{ props }">
+                      <span v-bind="props" class="media-single-line-text">
+                        {{ mediaTableRow(item).artist || '-' }}
+                      </span>
+                    </template>
+                    <span class="media-tooltip-text">{{ mediaTableRow(item).artist || '-' }}</span>
+                  </v-tooltip>
                 </template>
                 <template #item.album="{ item }">
-                  {{ mediaTableRow(item).album || '-' }}
+                  <v-tooltip location="top" max-width="420">
+                    <template #activator="{ props }">
+                      <span v-bind="props" class="media-single-line-text">
+                        {{ mediaTableRow(item).album || '-' }}
+                      </span>
+                    </template>
+                    <span class="media-tooltip-text">{{ mediaTableRow(item).album || '-' }}</span>
+                  </v-tooltip>
                 </template>
                 <template #item.operation_time="{ item }">
                   {{ formatTime(mediaTableRow(item).operation_time) }}
@@ -4955,32 +4976,34 @@ onUnmounted(() => {
                   </div>
                 </template>
                 <template #item.actions="{ item }">
-                  <v-btn
-                    icon="mdi-pencil-box-outline"
-                    color="primary"
-                    variant="text"
-                    size="small"
-                    title="手动整理"
-                    :disabled="mediaManualSubmitting"
-                    @click="openManualOrganize(mediaTableRow(item))"
-                  />
-                  <v-btn
-                    icon="mdi-refresh"
-                    color="primary"
-                    variant="text"
-                    size="small"
-                    title="重试"
-                    :disabled="mediaRetrying"
-                    @click="retrySingleMedia(mediaTableRow(item))"
-                  />
-                  <v-btn
-                    icon="mdi-delete"
-                    color="error"
-                    variant="text"
-                    size="small"
-                    title="删除整理记录"
-                    @click="deleteMediaFile(mediaTableRow(item))"
-                  />
+                  <div class="media-actions">
+                    <v-btn
+                      icon="mdi-pencil-box-outline"
+                      color="primary"
+                      variant="text"
+                      size="small"
+                      title="手动整理"
+                      :disabled="mediaManualSubmitting"
+                      @click="openManualOrganize(mediaTableRow(item))"
+                    />
+                    <v-btn
+                      icon="mdi-refresh"
+                      color="primary"
+                      variant="text"
+                      size="small"
+                      title="重试"
+                      :disabled="mediaRetrying"
+                      @click="retrySingleMedia(mediaTableRow(item))"
+                    />
+                    <v-btn
+                      icon="mdi-delete"
+                      color="error"
+                      variant="text"
+                      size="small"
+                      title="删除整理记录"
+                      @click="deleteMediaFile(mediaTableRow(item))"
+                    />
+                  </div>
                 </template>
                 <template #no-data>
                   <div class="empty-cell">暂无整理记录</div>
@@ -8029,9 +8052,9 @@ button.dashboard-health-card:hover {
 }
 
 .media-table :deep(table) {
-  min-width: 1660px;
+  min-width: 1900px;
   table-layout: fixed;
-  width: 1660px;
+  width: 1900px;
 }
 
 .media-table :deep(.v-table__wrapper) {
@@ -8046,6 +8069,12 @@ button.dashboard-health-card:hover {
 
 .media-table :deep(.v-data-table__tr) {
   height: 56px;
+}
+
+.media-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: nowrap;
 }
 
 .media-cell-clip {
@@ -8076,6 +8105,7 @@ button.dashboard-health-card:hover {
   word-break: break-all;
 }
 
+.media-single-line-text,
 .media-remark-text {
   display: block;
   height: 20px;
