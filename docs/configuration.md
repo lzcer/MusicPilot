@@ -20,10 +20,18 @@ MusicPilot 的配置分为两类：
 | 数据目录 | 保存导入导出文件等运行数据；使用 SQLite 时也保存 SQLite 数据库文件 | `./data:/data` |
 | PostgreSQL 数据目录 | 持久化默认 PostgreSQL 数据库 | `./postgres:/var/lib/postgresql/data` |
 | 配置目录 | 保存自定义站点解析器等配置文件 | `./config:/config` |
-| 音乐库目录 | MusicPilot 整理后的音乐库目录，也是 Navidrome 应扫描的目录 | `/volume1/music:/music` |
-| 下载目录 | qBittorrent 保存音乐资源的目录 | `/volume1/downloads:/downloads` |
+| 媒体根目录 | 同时包含 MusicPilot 音乐库和 qBittorrent 下载目录 | `/volume1/media:/media` |
 
-如果 qBittorrent 和 MusicPilot 不在同一个容器或看到的路径不同，需要在下载器配置中同时填写“下载目录”和“本机对应目录”。例如 qBittorrent 保存路径是 `/downloads/music`，MusicPilot 容器中对应挂载路径是 `/downloads/music`，两项可以相同；如果 qBittorrent 返回的是 NAS 路径 `/volume1/downloads/music`，而 MusicPilot 容器内看到的是 `/downloads/music`，则需要分别填写这两个路径。
+媒体根目录中应包含音乐库和下载目录：
+
+```text
+/volume1/media/music
+/volume1/media/downloads
+```
+
+将共同父目录一次性挂载到 `/media` 后，MusicPilot 使用 `/media/music` 作为音乐库目录，使用 `/media/downloads` 作为下载目录。映射模式只有在源文件与目标文件位于同一文件系统和同一容器挂载点时才能创建硬链接。同一块物理硬盘、存储池或 NAS 卷不等于同一挂载点；分别挂载两个子目录，或者让目录跨文件系统、跨 Btrfs 子卷，都会导致硬链接失败并自动改用复制。
+
+如果 qBittorrent 和 MusicPilot 不在同一个容器或看到的路径不同，需要在下载器配置中同时填写“下载目录”和“本机对应目录”。例如 qBittorrent 保存路径是 `/media/downloads/music`，MusicPilot 容器中对应路径也是 `/media/downloads/music`，两项可以相同；如果 qBittorrent 返回的是 NAS 路径 `/volume1/media/downloads/music`，而 MusicPilot 容器内看到的是 `/media/downloads/music`，则需要分别填写这两个路径。
 
 ## 1.3. 启动环境变量
 
@@ -38,8 +46,7 @@ MusicPilot 的配置分为两类：
 | `MP_ADMIN_PASSWORD` | `musicpilot` | 管理员登录密码，生产环境必须修改。 |
 | `MP_SESSION_SECRET` | `musicpilot-dev-session-secret` | 会话密钥，生产环境必须改成随机长字符串。 |
 | `MP_DATABASE_URL` | `postgresql+asyncpg://musicpilot:musicpilot-change-me@postgres:5432/musicpilot` | 数据库连接串。默认使用 PostgreSQL；SQLite 仅适合测试和快速试用。 |
-| `MP_MUSIC_LIBRARY_PATH` | `./data/library` | 音乐库目录。Docker 部署通常设置为 `/music`。 |
-| `MP_DOWNLOAD_STAGING_PATH` | `./data/downloads` | 下载暂存目录。Docker 部署通常设置为 `/downloads`。 |
+| `MP_HOST_MEDIA_PATH` | `./data/media` | Docker Compose 使用的宿主机媒体根目录，其中应包含 `music` 和 `downloads` 子目录。 |
 | `MP_STATIC_DIR` | `frontend/dist` | 前端静态文件目录，镜像内通常是 `/app/frontend/dist`。 |
 | `MP_SYSTEM_INDEXER_PARSER_CONFIG` | `config/sites.parser.yaml` | 系统内置站点解析器文件，一般不需要修改。 |
 | `MP_INDEXER_PARSER_CONFIG` | `config/sites.parser.yaml` | 用户自定义站点解析器文件。Docker 部署通常设置为 `/config/sites.parser.yaml`。 |
@@ -58,10 +65,12 @@ environment:
   MP_ADMIN_PASSWORD: change-this-password
   MP_SESSION_SECRET: change-this-random-secret
   MP_DATABASE_URL: postgresql+asyncpg://musicpilot:musicpilot-change-me@postgres:5432/musicpilot
-  MP_MUSIC_LIBRARY_PATH: /music
-  MP_DOWNLOAD_STAGING_PATH: /downloads
   MP_INDEXER_PARSER_CONFIG: /config/sites.parser.yaml
+volumes:
+  - /volume1/media:/media
 ```
+
+已有部署使用 `MP_HOST_MUSIC_PATH` 和 `MP_HOST_DOWNLOADS_PATH` 时，应先把原目录放到同一个宿主机父目录下，再改为 `MP_HOST_MEDIA_PATH`。首次部署和已有部署都需要在 Web UI 中配置刮削源目录、映射目录以及下载器的“本机对应目录”。修改挂载配置不会自动移动已有文件。
 
 ## 1.4. 数据库选择
 
@@ -149,6 +158,8 @@ services:
 | 自动分类 | 开 / 关 | 根据艺术家、专辑或歌手-专辑建立分类目录。 |
 | 分类方式 | 艺术家、专辑、歌手-专辑 | 开启自动分类后生效；歌手-专辑会按 `歌手/专辑/歌曲` 保存，缺少专辑时使用 `歌手/未知专辑/歌曲`。 |
 | 重复文件处理 | 不处理、总是覆盖、保留最大文件 | 决定目标位置已有文件时如何处理。 |
+
+选择“映射文件”且无需写入标签时，MusicPilot 会优先创建硬链接。源文件目录和映射目录必须位于同一个 `/media` 挂载点，并且宿主机目录不能跨文件系统或 Btrfs 子卷；否则会自动改用复制并占用额外磁盘空间。
 
 重复文件处理的行为：
 
@@ -271,8 +282,8 @@ sites:
 
 | 场景 | 下载目录 | 本机对应目录 |
 | --- | --- | --- |
-| qBittorrent 与 MusicPilot 同容器路径一致 | `/downloads/music` | `/downloads/music` |
-| qBittorrent 在 NAS 上返回宿主路径，MusicPilot 在容器内读取 | `/volume1/downloads/music` | `/downloads/music` |
+| qBittorrent 与 MusicPilot 容器路径一致 | `/media/downloads/music` | `/media/downloads/music` |
+| qBittorrent 返回 NAS 宿主路径，MusicPilot 在容器内读取 | `/volume1/media/downloads/music` | `/media/downloads/music` |
 | Windows 本地开发 | `D:\Downloads\music` | `D:\Downloads\music` |
 
 下载完成后的整理流程依赖“本机对应目录”能被 MusicPilot 访问。如果测试连接成功但下载完成后找不到文件，优先检查这两个目录是否正确映射。
@@ -292,7 +303,7 @@ sites:
 
 保存音乐库配置后，页面会生成默认用户账号。需要用不同 Navidrome 用户同步歌单时，可以在“用户账号”中新增用户。默认账号请在上方音乐库配置中编辑。
 
-Navidrome 自身也需要能扫描到 MusicPilot 整理后的音乐库目录。Docker 部署时，建议让 Navidrome 和 MusicPilot 指向同一个宿主机音乐目录。
+Navidrome 自身也需要能扫描到 MusicPilot 整理后的音乐库目录。Docker 部署时，建议让 Navidrome 和 MusicPilot 都使用宿主机的 `/volume1/media/music`，在 MusicPilot 容器内该目录对应 `/media/music`。
 
 ## 2.6. 通知配置
 
@@ -341,15 +352,19 @@ Navidrome 自身也需要能扫描到 MusicPilot 整理后的音乐库目录。D
 
 检查下载器的“下载目录”和“本机对应目录”。前者是 qBittorrent 保存文件时看到的路径，后者是 MusicPilot 读取文件时看到的路径。容器部署时尤其容易出现 NAS 路径和容器挂载路径不一致。
 
-### 4.3. 站点或通知没有走代理
+### 4.3. 硬链接失败并自动改用复制
+
+如果界面提示“硬链接创建失败，自动改用复制”，先检查下载目录和音乐库目录是否通过共同父目录一次性挂载到 `/media`。即使两个目录位于同一块物理硬盘，独立的 Docker 挂载点仍不能互相创建硬链接；不同文件系统或 Btrfs 子卷也有同样限制。
+
+### 4.4. 站点或通知没有走代理
 
 保存系统代理后，还需要分别在站点或通知渠道开启“使用系统代理”。未开启的配置不会使用系统代理。
 
-### 4.4. Navidrome 测试失败
+### 4.5. Navidrome 测试失败
 
 确认 Navidrome 地址可以从 MusicPilot 所在环境访问，并确认用户名、密码正确。容器部署时还要确认 MusicPilot 容器和 Navidrome 容器或宿主机网络可互通。
 
-### 4.5. 刮削结果缺少专辑、艺术家或歌词
+### 4.6. 刮削结果缺少专辑、艺术家或歌词
 
 检查“缺失时尝试刮削”和“缺失则判定失败”。如果某个字段被设置为“缺失则判定失败”，在线源也没有补齐该字段时，本次整理会失败并记录原因。
 

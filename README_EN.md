@@ -141,14 +141,25 @@ ports:
 volumes:
   - /volume1/docker/musicpilot/data:/data
   - /volume1/docker/musicpilot/config:/config
-  - /volume1/music:/music
-  - /volume1/downloads:/downloads
+  - /volume1/media:/media
 environment:
   TZ: Asia/Shanghai
   MP_ADMIN_USERNAME: admin
   MP_ADMIN_PASSWORD: change-this-password
   MP_SESSION_SECRET: change-this-random-secret
 ```
+
+The `/volume1/media` directory should contain `music` and `downloads` as subdirectories. When using the repository `.env` file, replace `MP_HOST_MUSIC_PATH` and `MP_HOST_DOWNLOADS_PATH` with:
+
+```dotenv
+MP_HOST_MEDIA_PATH=/volume1/media
+```
+
+Mount the common parent directory once instead of mounting the two subdirectories separately. Hardlinks require the source and target to be on the same filesystem and under the same container mount. A single physical disk, storage pool, or NAS volume does not guarantee this; separate Docker mounts, filesystems, or Btrfs subvolumes still prevent hardlink creation and cause MusicPilot to fall back to copying.
+
+After the first startup, set the scraping source directory to `/media/downloads` and the mapped directory to `/media/music` in the Web UI system settings.
+
+For an existing deployment, place the original library and download directories under the shared host parent before restarting the container, then update the scraping source directory, mapped directory, and downloader local path in the Web UI. Changing the mount configuration does not move existing files automatically.
 
 If the Docker build container cannot reach PyPI while the host network works normally, keep:
 

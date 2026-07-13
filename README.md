@@ -156,8 +156,6 @@ services:
       MP_ADMIN_PASSWORD: change-this-password
       MP_SESSION_SECRET: change-this-random-secret
       MP_DATABASE_URL: postgresql+asyncpg://musicpilot:musicpilot-change-me@postgres:5432/musicpilot
-      MP_MUSIC_LIBRARY_PATH: /music
-      MP_DOWNLOAD_STAGING_PATH: /downloads
       MP_STATIC_DIR: /app/frontend/dist
       MP_INDEXER_PARSER_CONFIG: /config/sites.parser.yaml
       MP_RUNTIME_CONFIG: /config/runtime.json
@@ -171,8 +169,7 @@ services:
     volumes:
       - ./data:/data
       - ./config:/config
-      - /volume1/music:/music
-      - /volume1/downloads:/downloads
+      - /volume1/media:/media
     depends_on:
       postgres:
         condition: service_healthy
@@ -195,6 +192,19 @@ EOF
 ```
 
 需要调整端口、账号密码、密钥或目录时，直接修改 `docker-compose.yml` 里的对应值。
+
+媒体目录应通过共同父目录一次性挂载。上面的示例要求 NAS 中使用如下目录结构：
+
+```text
+/volume1/media/music
+/volume1/media/downloads
+```
+
+MusicPilot 容器内对应 `/media/music` 和 `/media/downloads`。映射模式只有在源文件与目标文件位于同一文件系统和同一容器挂载点时才能创建硬链接；即使两个目录位于同一块物理硬盘、同一存储池或同一 NAS 卷，分别挂载为 `/music` 和 `/downloads` 仍会被视为跨挂载点并自动改用复制。不同文件系统或不同 Btrfs 子卷也不能创建硬链接。
+
+首次启动后，需要在 Web UI 的系统设置中把源文件目录设为 `/media/downloads`、映射目录设为 `/media/music`。
+
+已有部署升级时，需要把原来的音乐库和下载目录整理到同一个宿主机父目录中，并同步更新刮削源目录、映射目录以及下载器的“本机对应目录”。调整挂载本身不会移动已有文件，请在重启容器前确认新目录中已经包含原有数据。
 
 如果希望固定版本，建议把镜像改为明确的版本号，例如：
 
@@ -278,14 +288,21 @@ ports:
 volumes:
   - /volume1/docker/musicpilot/data:/data
   - /volume1/docker/musicpilot/config:/config
-  - /volume1/music:/music
-  - /volume1/downloads:/downloads
+  - /volume1/media:/media
 environment:
   TZ: Asia/Shanghai
   MP_ADMIN_USERNAME: admin
   MP_ADMIN_PASSWORD: change-this-password
   MP_SESSION_SECRET: change-this-random-secret
 ```
+
+`/volume1/media` 下应包含 `music` 和 `downloads` 两个目录。使用仓库中的 `.env` 时，将旧的 `MP_HOST_MUSIC_PATH` 和 `MP_HOST_DOWNLOADS_PATH` 替换为：
+
+```dotenv
+MP_HOST_MEDIA_PATH=/volume1/media
+```
+
+不要把两个子目录分别挂载到容器，否则映射模式无法跨挂载点创建硬链接。已有部署还需要在 Web UI 中更新刮削和下载器路径，具体配置见[详细配置教程](docs/configuration.md)。
 
 如果 Docker 构建时容器网络无法访问 PyPI，而宿主机网络正常，可以保留：
 

@@ -19,10 +19,18 @@ Before deployment, confirm these directories:
 | --- | --- | --- |
 | Data directory | Stores the SQLite database, export/import files, and other runtime data. When PostgreSQL is used, it can still store local export files and related data. | `./data:/data` |
 | Config directory | Stores custom site parser files and other configuration files. | `./config:/config` |
-| Music library directory | Stores the organized MusicPilot library, and should also be scanned by Navidrome. | `/volume1/music:/music` |
-| Download directory | Stores music resources downloaded by qBittorrent. | `/volume1/downloads:/downloads` |
+| Media root directory | Contains both the organized MusicPilot library and the qBittorrent download directory. | `/volume1/media:/media` |
 
-If qBittorrent and MusicPilot are not in the same container, or if they see different paths, configure both "download path" and "local path" in the downloader settings. For example, if qBittorrent saves files to `/downloads/music` and MusicPilot sees the same path in its container, both values can be the same. If qBittorrent reports the NAS path `/volume1/downloads/music` while MusicPilot sees `/downloads/music` inside the container, fill in those two paths separately.
+The media root should contain the library and download directories:
+
+```text
+/volume1/media/music
+/volume1/media/downloads
+```
+
+Mount the common parent once at `/media`, then use `/media/music` as the MusicPilot library and `/media/downloads` as the download directory. Mapped mode can create hardlinks only when the source and target are on the same filesystem and under the same container mount. A single physical disk, storage pool, or NAS volume does not guarantee this; separate mounts, filesystems, or Btrfs subvolumes cause hardlink creation to fail and MusicPilot to fall back to copying.
+
+If qBittorrent and MusicPilot are not in the same container, or if they see different paths, configure both "download path" and "local path" in the downloader settings. For example, if qBittorrent saves files to `/media/downloads/music` and MusicPilot sees the same path in its container, both values can be the same. If qBittorrent reports the NAS path `/volume1/media/downloads/music` while MusicPilot sees `/media/downloads/music` inside the container, fill in those two paths separately.
 
 ## 1.3. Startup Environment Variables
 
@@ -37,8 +45,7 @@ Common environment variables:
 | `MP_ADMIN_PASSWORD` | `musicpilot` | Administrator login password. Change this in production. |
 | `MP_SESSION_SECRET` | `musicpilot-dev-session-secret` | Session secret. Change this to a long random string in production. |
 | `MP_DATABASE_URL` | `sqlite+aiosqlite:///./data/musicpilot.db` | Database connection string. SQLite is fine for quick trials; PostgreSQL is recommended for long-running and production deployments. |
-| `MP_MUSIC_LIBRARY_PATH` | `./data/library` | Music library path. Docker deployments usually use `/music`. |
-| `MP_DOWNLOAD_STAGING_PATH` | `./data/downloads` | Download staging path. Docker deployments usually use `/downloads`. |
+| `MP_HOST_MEDIA_PATH` | `./data/media` | Host media root used by Docker Compose. It should contain `music` and `downloads` subdirectories. |
 | `MP_STATIC_DIR` | `frontend/dist` | Frontend static file directory. Container images usually use `/app/frontend/dist`. |
 | `MP_SYSTEM_INDEXER_PARSER_CONFIG` | `config/sites.parser.yaml` | System site parser file. Usually does not need to be changed. |
 | `MP_INDEXER_PARSER_CONFIG` | `config/sites.parser.yaml` | User custom site parser file. Docker deployments usually use `/config/sites.parser.yaml`. |
@@ -57,10 +64,12 @@ environment:
   MP_ADMIN_PASSWORD: change-this-password
   MP_SESSION_SECRET: change-this-random-secret
   MP_DATABASE_URL: sqlite+aiosqlite:////data/musicpilot.db
-  MP_MUSIC_LIBRARY_PATH: /music
-  MP_DOWNLOAD_STAGING_PATH: /downloads
   MP_INDEXER_PARSER_CONFIG: /config/sites.parser.yaml
+volumes:
+  - /volume1/media:/media
 ```
+
+For an existing deployment that uses `MP_HOST_MUSIC_PATH` and `MP_HOST_DOWNLOADS_PATH`, place both directories under one host parent before replacing them with `MP_HOST_MEDIA_PATH`. Both new and existing deployments must configure the scraping source directory, mapped directory, and downloader local path in the Web UI. Changing mounts does not move existing files automatically.
 
 ## 1.4. Database Choice
 
@@ -147,6 +156,8 @@ Scraping completes metadata, lyrics, tags, and target paths after downloads fini
 | Auto classify | On / off | Create classification directories by artist, album, or artist-album. |
 | Classify by | Artist, album, artist-album | Applies when auto classify is enabled; artist-album saves files as `Artist/Album/Track`, using `Artist/Unknown Album/Track` when album metadata is missing. |
 | Duplicate handling | Ignore, always overwrite, keep largest file | Decides what happens when the target file already exists. |
+
+When "mapped file" is selected and no tags need to be written, MusicPilot tries to create a hardlink. The source and mapped directories must be under the same `/media` mount, and their host directories must not cross filesystems or Btrfs subvolumes. Otherwise MusicPilot falls back to copying and consumes additional disk space.
 
 Duplicate handling behavior:
 
@@ -269,8 +280,8 @@ Path examples:
 
 | Scenario | Download path | Local path |
 | --- | --- | --- |
-| qBittorrent and MusicPilot see the same container path | `/downloads/music` | `/downloads/music` |
-| qBittorrent returns a NAS host path, while MusicPilot reads inside a container | `/volume1/downloads/music` | `/downloads/music` |
+| qBittorrent and MusicPilot see the same container path | `/media/downloads/music` | `/media/downloads/music` |
+| qBittorrent returns a NAS host path, while MusicPilot reads inside a container | `/volume1/media/downloads/music` | `/media/downloads/music` |
 | Windows local development | `D:\Downloads\music` | `D:\Downloads\music` |
 
 The post-download organization flow depends on MusicPilot being able to access the "local path". If the connection test succeeds but MusicPilot cannot find files after download completion, check these two path values first.
@@ -290,7 +301,7 @@ The current music library type is Navidrome. MusicPilot uses Navidrome to query 
 
 After saving the music library configuration, the page creates a default user account. If you need to sync playlists with different Navidrome users, add users under "User accounts". Edit the default account in the main music library configuration above.
 
-Navidrome itself must also be able to scan the MusicPilot-organized music library directory. In Docker deployments, make Navidrome and MusicPilot point to the same host music directory.
+Navidrome itself must also be able to scan the MusicPilot-organized music library directory. In Docker deployments, make Navidrome and MusicPilot use `/volume1/media/music` on the host; this directory is available to MusicPilot as `/media/music`.
 
 ## 2.6. Notification Configuration
 
@@ -339,18 +350,22 @@ Check whether `sites.parser.yaml` contains a `base_url` with the same host. Matc
 
 Check the downloader's "download path" and "local path". The first is the path qBittorrent sees when saving files; the second is the path MusicPilot sees when reading files. Container deployments often have mismatches between NAS paths and container mount paths.
 
-### 4.3. A Site Or Notification Channel Does Not Use The Proxy
+### 4.3. Hardlink Creation Fails And Falls Back To Copying
+
+If the UI reports that hardlink creation failed and copying was used instead, first confirm that the download and library directories are exposed through one common parent mounted at `/media`. Separate Docker mounts cannot create hardlinks between each other even when both host directories are on the same physical disk. Different filesystems or Btrfs subvolumes have the same limitation.
+
+### 4.4. A Site Or Notification Channel Does Not Use The Proxy
 
 After saving the system proxy, you still need to enable "use system proxy" on each site or notification channel. Configurations that do not enable it will not use the system proxy.
 
-### 4.4. Navidrome Test Fails
+### 4.5. Navidrome Test Fails
 
 Confirm that the Navidrome URL is reachable from the MusicPilot environment and that the username and password are correct. In container deployments, also confirm that the MusicPilot container can reach the Navidrome container or host network.
 
-### 4.5. Scraping Results Are Missing Album, Artist, Or Lyrics
+### 4.6. Scraping Results Are Missing Album, Artist, Or Lyrics
 
 Check "try scraping when missing" and "fail when missing". If a field is set to "fail when missing" and online sources still do not provide it, the organization task will fail and record the reason.
 
-### 4.6. Configuration Is Missing After Database Migration Or Moving Hosts
+### 4.7. Configuration Is Missing After Database Migration Or Moving Hosts
 
 Confirm that you migrated the ZIP generated by "database export", or that you preserved the database file pointed to by `MP_DATABASE_URL`. Copying only `config/sites.parser.yaml` migrates site parsers only. It does not migrate sites, downloaders, music libraries, or notification configuration saved through the Web UI.
