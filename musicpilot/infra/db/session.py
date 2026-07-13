@@ -102,6 +102,7 @@ class Database:
                     "status": "VARCHAR(64) NOT NULL DEFAULT 'success'",
                     "error_message": "TEXT",
                     "operation_type": "VARCHAR(32) NOT NULL DEFAULT 'mapped'",
+                    "operation_reason": "TEXT",
                 },
             )
             await _add_sqlite_columns(
@@ -232,6 +233,7 @@ async def _ensure_media_files_library_path_nullable(conn: object) -> None:
             source_path TEXT NOT NULL,
             library_path TEXT,
             operation_type VARCHAR(32) NOT NULL DEFAULT 'mapped',
+            operation_reason TEXT,
             title VARCHAR(512),
             artist VARCHAR(512),
             album VARCHAR(512),
@@ -255,6 +257,7 @@ async def _ensure_media_files_library_path_nullable(conn: object) -> None:
             source_path,
             library_path,
             operation_type,
+            operation_reason,
             title,
             artist,
             album,
@@ -271,7 +274,8 @@ async def _ensure_media_files_library_path_nullable(conn: object) -> None:
             torrent_hash,
             source_path,
             CASE WHEN status = 'success' THEN library_path ELSE NULL END,
-            'mapped',
+            operation_type,
+            operation_reason,
             title,
             artist,
             album,

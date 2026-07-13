@@ -152,6 +152,7 @@ class ScrapingFileResult:
     metadata: TrackMetadata
     status: Literal["success", "failed", "skipped"]
     operation_type: ScrapingMode
+    operation_reason: str | None = None
     error_message: str | None = None
     stage: str = "completed"
     needs_metadata_update: bool = False
@@ -196,6 +197,12 @@ class _PathOperationResult:
     path: Path
     operation_type: ScrapingMode
     overwritten_existing: bool = False
+    cause: Literal[
+        "already_mapped",
+        "hardlink_created",
+        "copy_requested",
+        "hardlink_failed",
+    ] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,6 +330,7 @@ class LocalMusicScraper:
                     metadata=source_metadata,
                     status="failed",
                     operation_type=config.mode,
+                    operation_reason=_configured_operation_reason(config.mode),
                     error_message=str(exc) or exc.__class__.__name__,
                     stage=exc.__class__.__name__,
                 )
@@ -509,6 +517,11 @@ class LocalMusicScraper:
         )
         missing_before = _missing_metadata_fields(source_metadata, scrape_fields)
         needs_scrape = bool(missing_before)
+        operation_reason = _configured_operation_reason(
+            config.mode,
+            missing_before=missing_before if forced_metadata is None else (),
+            manual=forced_metadata is not None,
+        )
         metadata = _merge_metadata(source_metadata, match_metadata)
         candidate_count = 0
         candidate_reference = match_metadata
@@ -573,6 +586,7 @@ class LocalMusicScraper:
                         metadata=metadata,
                         status="failed",
                         operation_type=config.mode,
+                        operation_reason=operation_reason,
                         error_message=error_message,
                         stage=candidate_stage,
                         needs_metadata_update=True,
@@ -615,6 +629,7 @@ class LocalMusicScraper:
                         metadata=metadata,
                         status="failed",
                         operation_type=config.mode,
+                        operation_reason=operation_reason,
                         error_message=error_message,
                         stage="identity_verification",
                         needs_metadata_update=needs_scrape,
@@ -659,6 +674,7 @@ class LocalMusicScraper:
                             metadata=metadata,
                             status="failed",
                             operation_type=config.mode,
+                            operation_reason=operation_reason,
                             error_message=error_message,
                             stage="identity_verification",
                             needs_metadata_update=True,
@@ -764,6 +780,7 @@ class LocalMusicScraper:
                             metadata=source_metadata,
                             status="failed",
                             operation_type=config.mode,
+                            operation_reason=operation_reason,
                             error_message=error_message,
                             stage=candidate_stage,
                             needs_metadata_update=needs_scrape,
@@ -797,6 +814,7 @@ class LocalMusicScraper:
                         metadata=source_metadata,
                         status="failed",
                         operation_type=config.mode,
+                        operation_reason=operation_reason,
                         error_message=error_message,
                         stage=candidate_stage,
                         needs_metadata_update=needs_scrape,
@@ -827,6 +845,7 @@ class LocalMusicScraper:
                     metadata=source_metadata,
                     status="failed",
                     operation_type=config.mode,
+                    operation_reason=operation_reason,
                     error_message="标签写入器不可用。",
                     stage="tag_writer",
                     needs_metadata_update=forced_metadata is not None or needs_scrape,
@@ -885,6 +904,7 @@ class LocalMusicScraper:
                         metadata=metadata,
                         status="skipped",
                         operation_type=config.mode,
+                        operation_reason=operation_reason,
                         error_message=error_message,
                         stage="skip_duplicate",
                         needs_metadata_update=needs_scrape,
@@ -923,6 +943,7 @@ class LocalMusicScraper:
                             metadata=metadata,
                             status="skipped",
                             operation_type=config.mode,
+                            operation_reason=operation_reason,
                             error_message=error_message,
                             stage="skip_smaller_duplicate",
                             needs_metadata_update=needs_scrape,
@@ -948,6 +969,12 @@ class LocalMusicScraper:
             )
             working_file = mapped_result.path
             operation_type = mapped_result.operation_type
+            operation_reason = _completed_operation_reason(
+                operation_reason,
+                configured_mode=config.mode,
+                path_result=mapped_result,
+                metadata_gain=metadata_gain,
+            )
             overwritten_existing_target = mapped_result.overwritten_existing
             mapped_files += 1
         elif config.mode == "copy":
@@ -960,6 +987,12 @@ class LocalMusicScraper:
             )
             working_file = mapped_result.path
             operation_type = mapped_result.operation_type
+            operation_reason = _completed_operation_reason(
+                operation_reason,
+                configured_mode=config.mode,
+                path_result=mapped_result,
+                metadata_gain=metadata_gain,
+            )
             overwritten_existing_target = mapped_result.overwritten_existing
             mapped_files += 1
 
@@ -1010,6 +1043,7 @@ class LocalMusicScraper:
                 metadata=metadata,
                 status="success",
                 operation_type=operation_type,
+                operation_reason=operation_reason,
                 error_message=remark,
                 needs_metadata_update=forced_metadata is not None or needs_scrape,
                 candidate_count=candidate_count,
@@ -1612,6 +1646,52 @@ def _audio_files(path: Path) -> list[Path]:
     return []
 
 
+def _configured_operation_reason(
+    mode: ScrapingMode,
+    *,
+    missing_before: tuple[RequiredMetadata, ...] = (),
+    manual: bool = False,
+) -> str:
+    reason = {
+        "source": "配置指定在源目录处理",
+        "mapped": "配置指定映射文件",
+        "copy": "配置指定复制文件",
+    }[mode]
+    if manual:
+        return f"{reason}；使用手动元数据整理"
+    if missing_before:
+        fields = "、".join(_metadata_field_text(field) for field in missing_before)
+        return f"{reason}；因缺少{fields}触发刮削"
+    return reason
+
+
+def _completed_operation_reason(
+    configured_reason: str,
+    *,
+    configured_mode: ScrapingMode,
+    path_result: _PathOperationResult,
+    metadata_gain: tuple[RequiredMetadata, ...],
+) -> str:
+    if path_result.cause == "already_mapped":
+        return f"{configured_reason}；目标文件已映射，无需重复处理"
+    if path_result.cause == "hardlink_created":
+        return f"{configured_reason}；已成功创建硬链接"
+    if path_result.cause == "hardlink_failed":
+        return f"{configured_reason}；硬链接创建失败，自动改用复制"
+    if configured_mode == "mapped" and metadata_gain:
+        fields = "、".join(_metadata_field_text(field) for field in metadata_gain)
+        return f"{configured_reason}；需要写入{fields}，自动改用复制"
+    return configured_reason
+
+
+def _metadata_field_text(field: RequiredMetadata) -> str:
+    return {
+        "album": "专辑",
+        "artist": "艺术家",
+        "lyrics": "歌词",
+    }[field]
+
+
 def _copy_to_mapping(
     source_file: Path,
     config: ScrapingConfig,
@@ -1631,7 +1711,11 @@ def _copy_to_mapping(
     if not overwrite:
         target = _unique_path(target)
     elif _same_existing_file(source_file, target):
-        return _PathOperationResult(target, operation_type="mapped")
+        return _PathOperationResult(
+            target,
+            operation_type="mapped",
+            cause="already_mapped",
+        )
     overwritten_existing = overwrite and target.exists()
     target.parent.mkdir(parents=True, exist_ok=True)
     if hardlink:
@@ -1643,9 +1727,12 @@ def _copy_to_mapping(
                 target,
                 operation_type="mapped",
                 overwritten_existing=overwritten_existing,
+                cause="hardlink_created",
             )
         except OSError:
-            pass
+            hardlink_failed = True
+    else:
+        hardlink_failed = False
     if overwritten_existing:
         _remove_existing_target(target)
     shutil.copy2(source_file, target)
@@ -1653,6 +1740,7 @@ def _copy_to_mapping(
         target,
         operation_type="copy",
         overwritten_existing=overwritten_existing,
+        cause="hardlink_failed" if hardlink_failed else "copy_requested",
     )
 
 

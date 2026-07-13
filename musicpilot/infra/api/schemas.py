@@ -747,6 +747,7 @@ class MediaFileResponse(BaseModel):
     source_path: str
     library_path: str | None = None
     operation_type: str = "mapped"
+    operation_reason: str | None = None
     status: str = "success"
     operation_time: datetime
     remark: str | None = None

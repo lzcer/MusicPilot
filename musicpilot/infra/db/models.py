@@ -91,6 +91,7 @@ class MediaFile(TimestampMixin, Base):
     source_path: Mapped[str] = mapped_column(Text)
     library_path: Mapped[str | None] = mapped_column(Text, unique=True, nullable=True)
     operation_type: Mapped[str] = mapped_column(String(32), default="mapped")
+    operation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     title: Mapped[str | None] = mapped_column(String(512), nullable=True)
     artist: Mapped[str | None] = mapped_column(String(512), nullable=True)
     album: Mapped[str | None] = mapped_column(String(512), nullable=True)

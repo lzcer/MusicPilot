@@ -117,6 +117,7 @@ type MediaFile = {
   source_path: string
   library_path?: string | null
   operation_type?: string
+  operation_reason?: string | null
   status: string
   operation_time: string
   remark?: string | null
@@ -4201,6 +4202,10 @@ function mediaOperationTypeText(type: string | undefined) {
   }[type || 'mapped'] ?? (type || '映射')
 }
 
+function mediaOperationReason(row: MediaFile) {
+  return row.operation_reason?.trim() || '历史数据未记录'
+}
+
 const mediaStatusFilterOptions = [
   { title: '全部', value: '' },
   { title: '成功', value: 'success' },
@@ -4905,9 +4910,16 @@ onUnmounted(() => {
                   {{ formatTime(mediaTableRow(item).operation_time) }}
                 </template>
                 <template #item.operation_type="{ item }">
-                  <v-chip size="small" variant="tonal">
-                    {{ mediaOperationTypeText(mediaTableRow(item).operation_type) }}
-                  </v-chip>
+                  <v-tooltip location="top" max-width="420">
+                    <template #activator="{ props }">
+                      <v-chip v-bind="props" size="small" variant="tonal">
+                        {{ mediaOperationTypeText(mediaTableRow(item).operation_type) }}
+                      </v-chip>
+                    </template>
+                    <span class="media-tooltip-text">
+                      {{ mediaOperationReason(mediaTableRow(item)) }}
+                    </span>
+                  </v-tooltip>
                 </template>
                 <template #item.status="{ item }">
                   <v-chip

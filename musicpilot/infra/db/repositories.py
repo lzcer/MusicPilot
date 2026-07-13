@@ -111,8 +111,10 @@ class SqlAlchemyMediaRepository:
             media_file.album = metadata.album
             media_file.year = metadata.year
             media_file.track_number = metadata.track_number
+            media_file.operation_type = "mapped"
             media_file.status = "success"
             media_file.error_message = None
+            media_file.operation_reason = "下载处理流程已创建硬链接"
             media_file.metadata_payload = asdict(metadata)
             await session.commit()
 
@@ -123,6 +125,7 @@ class SqlAlchemyMediaRepository:
         source_path: Path,
         library_path: Path | None,
         operation_type: str = "mapped",
+        operation_reason: str | None = None,
         metadata: TrackMetadata,
         status: str,
         error_message: str | None = None,
@@ -153,6 +156,7 @@ class SqlAlchemyMediaRepository:
             media_file.source_path = str(source_path)
             media_file.library_path = result_path
             media_file.operation_type = operation_type
+            media_file.operation_reason = operation_reason
             media_file.title = metadata.title
             media_file.artist = metadata.artist
             media_file.album = metadata.album
