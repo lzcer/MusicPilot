@@ -810,10 +810,15 @@ class TelegramBotAdapter:
         pages = _page_count(len(session.torrents), self._TORRENT_PAGE_SIZE)
         lines = [f"<b>种子搜索结果（第 {session.page + 1}/{pages} 页）</b>"]
         for index, item in page_items:
+            source = item.source or "未知"
             published_at = item.published_at or "未知"
             lines.extend(
                 (
                     f"\n{index + 1}. <b>{escape(_short(item.title, 220))}</b>",
+                    (
+                        f"站点：{escape(_short(source, 80))} "
+                        f"· 大小：{_format_size(item.size_bytes)}"
+                    ),
                     (
                         f"发布时间：{escape(_short(published_at, 80))} · 做种：{item.seeders} "
                         f"· 下载：{item.leechers}"
@@ -954,6 +959,20 @@ def _page_items(values: Sequence[T], page: int, page_size: int) -> list[tuple[in
 
 def _progress_text(progress: float) -> str:
     return f"{max(0, min(progress, 1)) * 100:.0f}%"
+
+
+def _format_size(value: int | None) -> str:
+    if value is None:
+        return "未知"
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(value)
+    index = 0
+    while size >= 1024 and index < len(units) - 1:
+        size /= 1024
+        index += 1
+    if index == 0:
+        return f"{int(size)} {units[index]}"
+    return f"{size:.2f} {units[index]}"
 
 
 def _short(value: str, length: int) -> str:
