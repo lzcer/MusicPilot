@@ -4,6 +4,16 @@ sites:
         base_url: https://kp.m-team.cc
     adapter: mteam
   - targets:
+      - name: Redacted
+        base_url: https://redacted.sh
+      - name: DicMusic
+        base_url: https://dicmusic.com
+      - name: Orpheus
+        base_url: https://orpheus.network
+      - name: DesiGaane
+        base_url: https://desigaane.rocks
+    adapter: gazelle
+  - targets:
       - name: OpenCD
         base_url: https://open.cd
       - name: HDFans
@@ -62,11 +72,11 @@ sites:
     adapter: nexusphp
     parser:
       search_path: ajax.php
-      search_query_param: searchstr
+      search_query_param: torrentname
       search_params:
         section: torrents
         disablegrouping: "1"
-        action: basic
+        action: advanced
         searchtags: ""
         tags_type: "0"
         order_by: s3
