@@ -36,7 +36,7 @@ import {
   VWindow,
   VWindowItem,
 } from 'vuetify/components'
-import { Ripple } from 'vuetify/directives'
+import { Intersect, Ripple } from 'vuetify/directives'
 import 'vuetify/styles'
 import '@mdi/font/css/materialdesignicons.css'
 import './style.css'
@@ -80,6 +80,7 @@ const vuetify = createVuetify({
     VWindowItem,
   },
   directives: {
+    Intersect,
     Ripple,
   },
   theme: {

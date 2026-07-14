@@ -48,6 +48,15 @@ type MediaCandidate = {
   cover_url?: string | null
   source: string
   external_id: string
+  group_key?: string | null
+}
+
+type MetadataCandidatePageResponse = {
+  query: string
+  artist?: string | null
+  candidates: MediaCandidate[]
+  next_offset?: number | null
+  has_more: boolean
 }
 
 type MetadataSiteSearchResponse = {
@@ -594,6 +603,12 @@ const searchText = ref('')
 const searchArtist = ref('')
 const searchResults = ref<SearchResult[]>([])
 const metadataCandidates = ref<MediaCandidate[]>([])
+const metadataSearchQuery = ref('')
+const metadataSearchArtist = ref('')
+const metadataNextOffset = ref<number | null>(null)
+const metadataHasMore = ref(false)
+const metadataPageLoading = ref(false)
+const metadataPageLoadFailed = ref(false)
 const selectedMedia = ref<MediaCandidate | null>(null)
 const siteConfirmDialog = ref(false)
 const noMetadataDialog = ref(false)
@@ -627,6 +642,7 @@ let artistBuildTimer: number | undefined
 let systemTaskTimer: number | undefined
 let systemTaskRefreshPending = false
 let metadataSearchStream: EventSource | undefined
+let metadataSearchGeneration = 0
 
 const downloads = ref<DownloadTask[]>([])
 const downloadTaskItems = ref<DownloadTaskItem[]>([])
@@ -1575,9 +1591,18 @@ async function interruptSystemTasks(ids: number[]) {
 }
 
 async function runSearch() {
-  if (!searchText.value.trim()) return
+  const query = trimmedInput(searchText.value)
+  const artist = trimmedInput(searchArtist.value)
+  if (!query && !artist) return
+  const generation = ++metadataSearchGeneration
   searchDialog.value = false
   metadataSearchLoading.value = true
+  metadataPageLoading.value = false
+  metadataPageLoadFailed.value = false
+  metadataSearchQuery.value = query
+  metadataSearchArtist.value = artist
+  metadataNextOffset.value = null
+  metadataHasMore.value = false
   selectedMedia.value = null
   selectedAlbumNames.value = []
   searchResults.value = []
@@ -1587,24 +1612,119 @@ async function runSearch() {
   searchSiteFilter.value = ''
   searchPage.value = 1
   try {
-    const params = new URLSearchParams({ query: searchText.value.trim(), limit: '12' })
-    if (searchArtist.value.trim()) {
-      params.set('artist', searchArtist.value.trim())
-    }
-    const response = await api<{ candidates: MediaCandidate[] }>(`/api/metadata/search?${params.toString()}`)
-    metadataCandidates.value = response.candidates
+    await loadMetadataCandidatePage(0, generation)
+    if (generation !== metadataSearchGeneration) return
     if (!metadataCandidates.value.length) {
-      noMetadataDialog.value = true
+      if (query) {
+        noMetadataDialog.value = true
+      } else {
+        notify('未找到媒体信息', 'warning')
+      }
     }
   } catch (error) {
+    if (generation !== metadataSearchGeneration) return
     notify(error instanceof Error ? error.message : '媒体信息搜索失败', 'error')
   } finally {
-    metadataSearchLoading.value = false
+    if (generation === metadataSearchGeneration) {
+      metadataSearchLoading.value = false
+    }
   }
+}
+
+async function loadMetadataCandidatePage(offset: number, generation: number) {
+  const params = new URLSearchParams({
+    query: metadataSearchQuery.value,
+    offset: String(offset)
+  })
+  if (metadataSearchArtist.value) {
+    params.set('artist', metadataSearchArtist.value)
+  }
+  const response = await api<MetadataCandidatePageResponse>(
+    `/api/metadata/search?${params.toString()}`
+  )
+  if (generation !== metadataSearchGeneration) return 0
+  const added = mergeMetadataCandidates(response.candidates)
+  metadataNextOffset.value = response.next_offset ?? null
+  metadataHasMore.value = response.has_more && metadataNextOffset.value !== null
+  return added
+}
+
+function mergeMetadataCandidates(incoming: MediaCandidate[]) {
+  const byKey = new Map(
+    metadataCandidates.value.map((candidate) => [metadataCandidateGroupKey(candidate), candidate])
+  )
+  let added = 0
+  for (const candidate of incoming) {
+    const key = metadataCandidateGroupKey(candidate)
+    const current = byKey.get(key)
+    if (!current) {
+      const next = { ...candidate, albums: albumList(candidate) }
+      metadataCandidates.value.push(next)
+      byKey.set(key, next)
+      added += 1
+      continue
+    }
+    const albums = Array.from(new Set([...albumList(current), ...albumList(candidate)]))
+    current.albums = albums
+    current.album ||= candidate.album || albums[0] || null
+    current.cover_url ||= candidate.cover_url || null
+    current.release_date ||= candidate.release_date || null
+  }
+  return added
+}
+
+function metadataCandidateGroupKey(candidate: MediaCandidate) {
+  return candidate.group_key || `${candidate.source}:${candidate.external_id}`
+}
+
+async function loadMoreMetadataCandidates() {
+  const offset = metadataNextOffset.value
+  if (
+    offset === null ||
+    !metadataHasMore.value ||
+    metadataSearchLoading.value ||
+    metadataPageLoading.value
+  ) {
+    return
+  }
+  const generation = metadataSearchGeneration
+  metadataPageLoading.value = true
+  metadataPageLoadFailed.value = false
+  let shouldContinue = false
+  try {
+    const added = await loadMetadataCandidatePage(offset, generation)
+    shouldContinue = added === 0 && metadataHasMore.value
+  } catch (error) {
+    if (generation !== metadataSearchGeneration) return
+    metadataPageLoadFailed.value = true
+    notify(error instanceof Error ? error.message : '更多媒体信息加载失败', 'error')
+  } finally {
+    if (generation === metadataSearchGeneration) {
+      metadataPageLoading.value = false
+    }
+  }
+  if (shouldContinue && generation === metadataSearchGeneration) {
+    await loadMoreMetadataCandidates()
+  }
+}
+
+function onMetadataLoadMoreIntersect(isIntersecting: boolean) {
+  if (isIntersecting) {
+    void loadMoreMetadataCandidates()
+  }
+}
+
+function stopMetadataCandidatePaging() {
+  metadataSearchGeneration += 1
+  metadataNextOffset.value = null
+  metadataHasMore.value = false
+  metadataPageLoading.value = false
+  metadataPageLoadFailed.value = false
 }
 
 function runDirectSearch() {
   if (!searchText.value.trim()) return
+  stopMetadataCandidatePaging()
   noMetadataDialog.value = false
   metadataCandidates.value = []
   selectedMedia.value = null
@@ -1644,6 +1764,7 @@ function runDirectSearch() {
 function openDirectSiteSearchConfirm() {
   const title = trimmedInput(searchText.value)
   if (!title) return
+  stopMetadataCandidatePaging()
   searchDialog.value = false
   metadataCandidates.value = []
   searchResults.value = []
@@ -1678,6 +1799,7 @@ function openSiteConfirm(candidate: MediaCandidate) {
 async function runMetadataSiteSearch() {
   if (!selectedMedia.value || !canRunMetadataSiteSearch.value) return
   const siteIds = selectedEnabledSiteIds.value
+  stopMetadataCandidatePaging()
   siteConfirmDialog.value = false
   torrentSearchLoading.value = true
   metadataCandidates.value = []
@@ -1783,7 +1905,8 @@ function rawMediaCandidate(candidate: MediaCandidate) {
     release_date: candidate.release_date ?? null,
     cover_url: candidate.cover_url ?? null,
     source: candidate.source,
-    external_id: candidate.external_id
+    external_id: candidate.external_id,
+    group_key: candidate.group_key ?? null
   }
 }
 
@@ -4619,6 +4742,31 @@ onUnmounted(() => {
                 </div>
               </article>
             </div>
+            <div
+              v-if="
+                metadataCandidates.length &&
+                !metadataSearchLoading &&
+                (metadataHasMore || metadataPageLoading || metadataPageLoadFailed)
+              "
+              v-intersect="onMetadataLoadMoreIntersect"
+              class="metadata-load-more"
+            >
+              <v-progress-circular
+                v-if="metadataPageLoading"
+                indeterminate
+                color="primary"
+                size="24"
+                width="2"
+              />
+              <v-btn
+                v-else-if="metadataPageLoadFailed"
+                prepend-icon="mdi-refresh"
+                variant="text"
+                @click="loadMoreMetadataCandidates"
+              >
+                重新加载
+              </v-btn>
+            </div>
 
             <v-card class="search-panel">
               <div v-if="searchResults.length" class="search-result-controls">
@@ -6093,22 +6241,41 @@ onUnmounted(() => {
     <v-dialog v-model="searchDialog" max-width="460">
       <v-card title="搜索">
         <v-card-text class="dialog-stack">
-          <v-text-field v-model="searchText" label="歌曲名" autofocus @keyup.enter="runSearch" />
-          <v-text-field v-model="searchArtist" label="歌手（可选）" @keyup.enter="runSearch" />
+          <v-text-field
+            v-model="searchText"
+            label="歌曲名"
+            persistent-hint
+            autofocus
+            @keyup.enter="runSearch"
+          />
+          <v-text-field
+            v-model="searchArtist"
+            label="歌手（可选）"
+            hint="直接搜索站点时不会使用"
+            persistent-hint
+            @keyup.enter="runSearch"
+          />
         </v-card-text>
         <v-card-actions>
           <v-spacer />
           <v-btn variant="text" @click="searchDialog = false">取消</v-btn>
           <v-btn
-            color="primary"
             prepend-icon="mdi-server-network"
-            variant="tonal"
+            variant="text"
             :disabled="!trimmedInput(searchText)"
             @click="openDirectSiteSearchConfirm"
           >
             搜索站点
           </v-btn>
-          <v-btn color="primary" :loading="searchLoading" @click="runSearch">搜索</v-btn>
+          <v-btn
+            color="primary"
+            prepend-icon="mdi-magnify"
+            :disabled="!trimmedInput(searchText) && !trimmedInput(searchArtist)"
+            :loading="searchLoading"
+            @click="runSearch"
+          >
+            搜索
+          </v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>

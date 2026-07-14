@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import httpx
 
 from musicpilot.ports.metadata import MediaCandidate, TrackMetadata
+
+
+@dataclass(frozen=True, slots=True)
+class MusicBrainzSearchPage:
+    candidates: tuple[MediaCandidate, ...]
+    next_offset: int | None
+    has_more: bool
 
 
 class MusicBrainzProvider:
@@ -79,16 +88,47 @@ class MusicBrainzProvider:
         if candidates or not artist:
             return candidates
 
-        fallback_body = await self._recording_search(_fallback_recording_query(query, artist), limit=min(limit, 50))
+        fallback_body = await self._recording_search(
+            _fallback_recording_query(query, artist),
+            limit=min(limit, 50),
+        )
         return self._media_candidates(fallback_body, query=query, limit=limit)
 
-    async def _recording_search(self, query: str, *, limit: int) -> dict[str, object]:
+    async def search_page(
+        self,
+        query: str,
+        *,
+        artist: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> MusicBrainzSearchPage:
+        search_query = _recording_query(query, artist)
+        body = await self._recording_search(search_query, limit=limit, offset=offset)
+        page = self._media_search_page(body, query=query, limit=limit, offset=offset)
+        if page.candidates or not artist or not query.strip():
+            return page
+
+        fallback_body = await self._recording_search(
+            _fallback_recording_query(query, artist),
+            limit=limit,
+            offset=offset,
+        )
+        return self._media_search_page(fallback_body, query=query, limit=limit, offset=offset)
+
+    async def _recording_search(
+        self,
+        query: str,
+        *,
+        limit: int,
+        offset: int = 0,
+    ) -> dict[str, object]:
         response = await self._client.get(
             "/recording",
             params={
                 "query": query,
                 "fmt": "json",
-                "limit": max(1, min(limit, 50)),
+                "limit": max(1, min(limit, 100)),
+                "offset": max(offset, 0),
                 "inc": "artist-credits+releases",
             },
         )
@@ -101,7 +141,8 @@ class MusicBrainzProvider:
         body: dict[str, object],
         *,
         query: str,
-        limit: int,
+        limit: int | None,
+        release_limit: int | None = 3,
     ) -> tuple[MediaCandidate, ...]:
         candidates: list[MediaCandidate] = []
         seen: set[tuple[str, str, str]] = set()
@@ -115,7 +156,8 @@ class MusicBrainzProvider:
             artist_credit = item.get("artist-credit") or []
             artist_name = str(artist_credit[0].get("name")) if artist_credit else None
             releases = item.get("releases") or [{}]
-            for release in releases[:3]:
+            selected_releases = releases if release_limit is None else releases[:release_limit]
+            for release in selected_releases:
                 album = release.get("title")
                 key = (title.lower(), str(artist_name or "").lower(), str(album or "").lower())
                 if key in seen:
@@ -132,9 +174,33 @@ class MusicBrainzProvider:
                         external_id=str(item.get("id") or ""),
                     )
                 )
-                if len(candidates) >= limit:
+                if limit is not None and len(candidates) >= limit:
                     return tuple(candidates)
         return tuple(candidates)
+
+    def _media_search_page(
+        self,
+        body: dict[str, object],
+        *,
+        query: str,
+        limit: int,
+        offset: int,
+    ) -> MusicBrainzSearchPage:
+        recordings = body.get("recordings", [])
+        raw_count = len(recordings) if isinstance(recordings, list) else 0
+        total = _optional_int(body.get("count"))
+        has_more = offset + raw_count < total if total is not None else raw_count >= limit
+        next_offset = offset + raw_count if has_more and raw_count else None
+        return MusicBrainzSearchPage(
+            candidates=self._media_candidates(
+                body,
+                query=query,
+                limit=None,
+                release_limit=None,
+            ),
+            next_offset=next_offset,
+            has_more=next_offset is not None,
+        )
 
 
 def _parse_year(date_value: str | None) -> int | None:
@@ -151,15 +217,20 @@ def _cover_url(release_id: str) -> str:
 
 
 def _recording_query(title: str, artist: str | None = None) -> str:
-    query = f'recording:"{_lucene_phrase(title)}"'
+    title_text = str(title or "").strip()
     artist_values = _artist_query_values(artist)
-    if not artist_values:
-        return query
     artist_query = " OR ".join(
         f'{field}:"{_lucene_phrase(value)}"'
         for value in artist_values
         for field in ("artistname", "creditname", "artist")
     )
+    if not title_text:
+        if not artist_query:
+            raise ValueError("Title and artist cannot both be empty.")
+        return f"({artist_query})"
+    query = f'recording:"{_lucene_phrase(title_text)}"'
+    if not artist_query:
+        return query
     return f"{query} AND ({artist_query})"
 
 
@@ -180,3 +251,10 @@ def _artist_query_values(artist: str | None) -> tuple[str, ...]:
 
 def _lucene_phrase(value: str) -> str:
     return str(value).strip().replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None

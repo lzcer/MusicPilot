@@ -532,6 +532,23 @@ class SearchMediaExecutor:
         query = str(payload.get("query") or "")
         artist = _optional_string(payload.get("artist"))
         limit = _optional_int(payload.get("limit")) or 10
+        page_size = _optional_int(payload.get("page_size"))
+        if page_size is not None:
+            offset = max(_optional_int(payload.get("offset")) or 0, 0)
+            candidates, next_offset, has_more = await _search_media_candidate_page_direct(
+                self.state,
+                query,
+                artist=artist,
+                page_size=page_size,
+                offset=offset,
+            )
+            return TaskExecutionResult(
+                result={
+                    "candidates": [item.model_dump() for item in candidates],
+                    "next_offset": next_offset,
+                    "has_more": has_more,
+                }
+            )
         aggregated = await _search_media_candidates_direct(self.state, query, limit, artist=artist)
         return TaskExecutionResult(
             result={"candidates": [item.model_dump() for item in aggregated]}
@@ -1648,24 +1665,34 @@ def create_app() -> FastAPI:
 
     @app.get("/api/metadata/search", response_model=MetadataSearchResponse)
     async def metadata_search(
-        query: str,
-        limit: int = 10,
+        query: str = "",
         artist: str | None = None,
+        offset: int = Query(default=0, ge=0),
     ) -> MetadataSearchResponse:
+        query_text = query.strip()
         artist_text = artist.strip() if artist else None
-        aggregated = await _search_media_candidates(
+        if not query_text and not artist_text:
+            raise HTTPException(status_code=422, detail="歌名和歌手不能同时为空。")
+        aggregated, next_offset, has_more = await _search_media_candidate_page(
             state,
-            query,
-            limit,
+            query_text,
             artist=artist_text,
+            offset=offset,
             log_category="metadata",
         )
-        query_text = f"{query} / {artist_text}" if artist_text else query
+        log_query = f"{query_text} / {artist_text}" if artist_text else query_text
         state.add_log(
             "metadata",
-            f"Metadata search completed: {query_text}, {len(aggregated)} candidate group(s)",
+            f"Metadata search completed: {log_query}, offset={offset}, "
+            f"{len(aggregated)} candidate group(s)",
         )
-        return MetadataSearchResponse(query=query, artist=artist_text, candidates=aggregated)
+        return MetadataSearchResponse(
+            query=query_text,
+            artist=artist_text,
+            candidates=aggregated,
+            next_offset=next_offset,
+            has_more=has_more,
+        )
 
     @app.post("/api/search/by-metadata", response_model=MetadataSiteSearchResponse)
     async def search_by_metadata(
@@ -5029,6 +5056,69 @@ async def _search_site_candidates_direct(
     return site_name, results, errors
 
 
+async def _search_media_candidate_page(
+    state: AppState,
+    query: str,
+    *,
+    artist: str | None = None,
+    offset: int = 0,
+    log_category: str,
+) -> tuple[list[MediaCandidateResponse], int | None, bool]:
+    page_size = 100
+    task_id = await state.task_manager.enqueue(
+        TaskCreate(
+            task_type="SEARCH_MEDIA",
+            resource_keys=[await _media_search_resource_key(state)],
+            payload={
+                "query": query,
+                "artist": artist,
+                "page_size": page_size,
+                "offset": offset,
+                "log_category": log_category,
+            },
+        )
+    )
+    task = await state.task_manager.wait_for_task(task_id)
+    if task.status != "SUCCEEDED":
+        raise RuntimeError(task.error_message or f"Media search failed: {query or artist}")
+    result = task.result or {}
+    candidates: list[MediaCandidateResponse] = []
+    for item in result.get("candidates", []):
+        if not isinstance(item, dict):
+            continue
+        candidates.append(MediaCandidateResponse(**item))
+    next_offset = _optional_int(result.get("next_offset"))
+    has_more = bool(result.get("has_more")) and next_offset is not None
+    return candidates, next_offset, has_more
+
+
+async def _search_media_candidate_page_direct(
+    state: AppState,
+    query: str,
+    *,
+    artist: str | None = None,
+    page_size: int = 100,
+    offset: int = 0,
+) -> tuple[list[MediaCandidateResponse], int | None, bool]:
+    for provider in state.metadata.providers:
+        search_page = getattr(provider, "search_page", None)
+        if search_page is None:
+            continue
+        try:
+            page = await search_page(
+                query,
+                artist=artist,
+                limit=min(max(page_size, 1), 100),
+                offset=max(offset, 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            state.add_log("metadata", f"Metadata provider failed: {exc}", "WARNING")
+            continue
+        aggregated = _aggregate_media_candidates(list(page.candidates), limit=None)
+        return aggregated, page.next_offset, page.has_more
+    return [], None, False
+
+
 async def _search_media_candidates(
     state: AppState,
     query: str,
@@ -6280,6 +6370,7 @@ def _candidate_response(item: MediaCandidate) -> MediaCandidateResponse:
         cover_url=item.cover_url,
         source=item.source,
         external_id=item.external_id,
+        group_key=_media_candidate_group_key(item.title, item.artist),
     )
 
 
@@ -6326,7 +6417,7 @@ def _file_organize_response_from_task_result(
 def _aggregate_media_candidates(
     candidates: list[MediaCandidate],
     *,
-    limit: int,
+    limit: int | None,
 ) -> list[MediaCandidateResponse]:
     by_key: dict[tuple[str, str], MediaCandidateResponse] = {}
     for candidate in candidates:
@@ -6347,7 +6438,18 @@ def _aggregate_media_candidates(
             current.album = album
         if current.release_date is None and candidate.release_date:
             current.release_date = candidate.release_date
-    return list(by_key.values())[:limit]
+    aggregated = list(by_key.values())
+    return aggregated if limit is None else aggregated[:limit]
+
+
+def _media_candidate_group_key(title: str, artist: str | None) -> str:
+    normalized = "\n".join(
+        (
+            normalize_search_text(title),
+            normalize_search_text(artist or ""),
+        )
+    )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
 
 
 def _downloader_response(item: DownloaderConfig) -> DownloaderResponse:

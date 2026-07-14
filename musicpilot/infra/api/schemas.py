@@ -72,12 +72,15 @@ class MediaCandidateResponse(BaseModel):
     cover_url: str | None = None
     source: str
     external_id: str
+    group_key: str | None = None
 
 
 class MetadataSearchResponse(BaseModel):
     query: str
     artist: str | None = None
     candidates: list[MediaCandidateResponse]
+    next_offset: int | None = None
+    has_more: bool = False
 
 
 class MetadataSiteSearchRequest(BaseModel):

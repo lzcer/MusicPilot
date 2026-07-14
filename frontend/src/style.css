@@ -196,6 +196,13 @@ body {
   color: #667085;
 }
 
+.metadata-load-more {
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .selected-media-summary {
   max-width: min(760px, 100%);
   color: #344054;
