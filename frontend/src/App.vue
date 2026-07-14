@@ -1,5 +1,7 @@
 ﻿<script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { api, apiNoContent, readError } from './api'
+import DirectoryPickerField from './components/DirectoryPickerField.vue'
 import ScrollableTable from './components/ScrollableTable.vue'
 import TruncatedTableCell from './components/TruncatedTableCell.vue'
 
@@ -1391,48 +1393,6 @@ const someFilesSelected = computed(
     selectedFilePaths.value.length > 0 &&
     !fileEntryPaths.value.every((path) => selectedFilePaths.value.includes(path))
 )
-
-async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(url, {
-    credentials: 'include',
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.headers ?? {})
-    }
-  })
-  if (!response.ok) {
-    throw new Error(await readError(response))
-  }
-  return response.json() as Promise<T>
-}
-
-async function apiNoContent(url: string, options: RequestInit = {}) {
-  const response = await fetch(url, {
-    credentials: 'include',
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.headers ?? {})
-    }
-  })
-  if (!response.ok) {
-    throw new Error(await readError(response))
-  }
-}
-
-async function readError(response: Response) {
-  const text = await response.text()
-  if (!text) return response.statusText
-  try {
-    const data = JSON.parse(text) as { detail?: unknown; message?: unknown }
-    if (typeof data.detail === 'string') return data.detail
-    if (typeof data.message === 'string') return data.message
-    return text
-  } catch {
-    return text
-  }
-}
 
 function notify(text: string, color = 'success') {
   snackbar.value = { show: true, color, text }
@@ -6097,11 +6057,11 @@ onUnmounted(() => {
                           {{ scrapingModeDescription }}
                         </div>
                       </div>
-                      <v-text-field
+                      <DirectoryPickerField
                         v-model="systemForm.scraping.source_directory"
                         label="源文件目录"
                       />
-                      <v-text-field
+                      <DirectoryPickerField
                         v-if="systemForm.scraping.mode !== 'source'"
                         v-model="systemForm.scraping.mapped_directory"
                         :label="systemForm.scraping.mode === 'copy' ? '复制目录' : '映射目录'"

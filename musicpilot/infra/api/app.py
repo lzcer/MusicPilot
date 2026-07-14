@@ -114,6 +114,9 @@ from musicpilot.infra.api.schemas import (
     DashboardResponse,
     DashboardStorageSummaryResponse,
     DashboardTaskSummaryResponse,
+    DirectoryBreadcrumbResponse,
+    DirectoryEntryResponse,
+    DirectoryListResponse,
     DownloadDeleteMode,
     DownloaderCreateRequest,
     DownloaderResponse,
@@ -2719,6 +2722,10 @@ def create_app() -> FastAPI:
     async def logs(limit: int = 200) -> list[LogEntryResponse]:
         limited = max(1, min(limit, 500))
         return [LogEntryResponse(**entry) for entry in list(state.logs)[:limited]]
+
+    @app.get("/api/directories", response_model=DirectoryListResponse)
+    async def directories(path: str | None = None) -> DirectoryListResponse:
+        return await asyncio.to_thread(_directory_list_response, path)
 
     @app.get("/api/files", response_model=FileListResponse)
     async def source_files(
@@ -7527,6 +7534,100 @@ def _file_size_or_none(path: str | None) -> int | None:
 
 def _scraping_source_root_or_409(config: ScrapingConfig) -> Path:
     return _scraping_file_root_or_409(config, "source")
+
+
+def _directory_list_response(raw_path: str | None) -> DirectoryListResponse:
+    if not raw_path:
+        if os.name == "nt":
+            entries = [
+                DirectoryEntryResponse(name=str(drive), path=str(drive))
+                for drive in _windows_directory_roots()
+            ]
+            return DirectoryListResponse(
+                breadcrumbs=[DirectoryBreadcrumbResponse(title="根目录", path="")],
+                entries=entries,
+            )
+        directory = Path("/")
+    else:
+        directory = Path(raw_path).expanduser()
+        if not directory.is_absolute():
+            raise HTTPException(status_code=400, detail="只能选择绝对目录路径。")
+
+    try:
+        directory = directory.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="目录不存在。") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=422, detail=f"无法读取目录：{exc}") from exc
+    if not directory.is_dir():
+        raise HTTPException(status_code=422, detail="只能选择目录。")
+
+    try:
+        entries = _directory_browser_entries(directory)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="没有权限读取该目录。") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=422, detail=f"无法读取目录：{exc}") from exc
+
+    return DirectoryListResponse(
+        path=str(directory),
+        parent=_directory_browser_parent(directory),
+        breadcrumbs=_directory_browser_breadcrumbs(directory),
+        entries=entries,
+    )
+
+
+def _windows_directory_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        root = Path(f"{letter}:\\")
+        try:
+            if root.is_dir():
+                roots.append(root)
+        except OSError:
+            continue
+    return tuple(roots)
+
+
+def _directory_browser_entries(directory: Path) -> list[DirectoryEntryResponse]:
+    entries: list[DirectoryEntryResponse] = []
+    for item in directory.iterdir():
+        try:
+            resolved = item.resolve(strict=True)
+            if not resolved.is_dir():
+                continue
+        except OSError:
+            continue
+        entries.append(DirectoryEntryResponse(name=item.name, path=str(resolved)))
+    entries.sort(key=lambda item: item.name.casefold())
+    return entries
+
+
+def _directory_browser_parent(directory: Path) -> str | None:
+    if directory.parent != directory:
+        return str(directory.parent)
+    if os.name == "nt":
+        return ""
+    return None
+
+
+def _directory_browser_breadcrumbs(directory: Path) -> list[DirectoryBreadcrumbResponse]:
+    if os.name == "nt":
+        breadcrumbs = [DirectoryBreadcrumbResponse(title="根目录", path="")]
+        anchor = Path(directory.anchor)
+        breadcrumbs.append(DirectoryBreadcrumbResponse(title=directory.anchor, path=str(anchor)))
+        current = anchor
+        for part in directory.relative_to(anchor).parts:
+            current /= part
+            breadcrumbs.append(DirectoryBreadcrumbResponse(title=part, path=str(current)))
+        return breadcrumbs
+
+    breadcrumbs = [DirectoryBreadcrumbResponse(title="/", path="/")]
+    current = Path("/")
+    for part in directory.relative_to(current).parts:
+        current /= part
+        breadcrumbs.append(DirectoryBreadcrumbResponse(title=part, path=str(current)))
+    return breadcrumbs
 
 
 def _manual_source_file_for_task(config: ScrapingConfig, source_path: str) -> Path:

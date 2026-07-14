@@ -39,6 +39,23 @@ class TestResponse(BaseModel):
     message: str
 
 
+class DirectoryBreadcrumbResponse(BaseModel):
+    title: str
+    path: str
+
+
+class DirectoryEntryResponse(BaseModel):
+    name: str
+    path: str
+
+
+class DirectoryListResponse(BaseModel):
+    path: str | None = None
+    parent: str | None = None
+    breadcrumbs: list[DirectoryBreadcrumbResponse] = Field(default_factory=list)
+    entries: list[DirectoryEntryResponse] = Field(default_factory=list)
+
+
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1)
     limit: int = Field(default=20, ge=1, le=100)

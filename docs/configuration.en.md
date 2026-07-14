@@ -148,8 +148,8 @@ Scraping completes metadata, lyrics, tags, and target paths after downloads fini
 | --- | --- | --- |
 | Enable scraping | On / off | When disabled, automatic scraping will not run. |
 | Scraping mode | Source file, mapped file, copied file | Controls where processed files come from and where they are written. |
-| Source directory | Path | Source directory used for manual organization. |
-| Mapped directory / copied directory | Path | Required when "mapped file" or "copied file" is selected. |
+| Source directory | Directory picker | Source directory used for manual organization. Available directories come from the filesystem visible to the MusicPilot runtime. |
+| Mapped directory / copied directory | Directory picker | Required when "mapped file" or "copied file" is selected. Available directories come from the filesystem visible to the MusicPilot runtime. |
 | Try scraping when missing | Album, artist, lyrics | Try online completion when these fields are missing. |
 | Fail when missing | Album, artist, lyrics | If these fields are still missing, the organization task is treated as failed. |
 | Auto rename | On / off | Rename files according to metadata. |
@@ -158,6 +158,8 @@ Scraping completes metadata, lyrics, tags, and target paths after downloads fini
 | Duplicate handling | Ignore, always overwrite, keep largest file | Decides what happens when the target file already exists. |
 
 When "mapped file" is selected and no tags need to be written, MusicPilot tries to create a hardlink. The source and mapped directories must be under the same `/media` mount, and their host directories must not cross filesystems or Btrfs subvolumes. Otherwise MusicPilot falls back to copying and consumes additional disk space.
+
+The directory picker can only browse paths that are already mounted and accessible to the MusicPilot process or container. It does not create directories or Docker mounts. Linux and Docker environments start at `/`; a direct Windows installation starts with the available drives and then navigates into directories.
 
 Duplicate handling behavior:
 
