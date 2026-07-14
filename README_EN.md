@@ -35,6 +35,7 @@ Downloader support:
 Site support:
 
 - [x] OpenCD
+- [x] M-Team
 - [x] HDFans
 - [x] HHClub
 - [x] JPOP

@@ -16,6 +16,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   DOCKERHUB_REGISTRY: docker.io
+  DOCKERHUB_USERNAME: lzcer
   DOCKERHUB_IMAGE: docker.io/lzcer/musicpilot
 
 jobs:
@@ -24,8 +25,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.release.outputs.tag }}
-      image: ${{ steps.release.outputs.image }}
-      dockerhub_image: ${{ steps.release.outputs.dockerhub_image }}
       release_url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.release.outputs.tag }}
 
     steps:
@@ -86,7 +85,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.DOCKERHUB_REGISTRY }}
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Extract Docker metadata
@@ -117,20 +116,12 @@ jobs:
         id: notes
         shell: bash
         env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
           RELEASE_TAG_SHA: ${{ steps.release.outputs.tag_sha }}
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
-          RELEASE_IMAGE: ${{ steps.release.outputs.image }}
-          RELEASE_DOCKERHUB_IMAGE: ${{ steps.release.outputs.dockerhub_image }}
           PREVIOUS_TAG: ${{ steps.release.outputs.previous_tag }}
         run: |
           set -euo pipefail
 
-          tag="${RELEASE_TAG}"
           tag_sha="${RELEASE_TAG_SHA}"
-          version="${RELEASE_VERSION}"
-          image="${RELEASE_IMAGE}"
-          dockerhub_image="${RELEASE_DOCKERHUB_IMAGE}"
           previous_tag="${PREVIOUS_TAG}"
           notes_file="${RUNNER_TEMP}/release-notes.md"
 
@@ -260,20 +251,6 @@ jobs:
             fi
           fi
 
-          {
-            echo
-            echo "## 2. 容器镜像"
-            echo
-            echo "- GHCR: \`${image}:${tag}\`"
-            echo "- GHCR: \`${image}:${version}\`"
-            echo "- Docker Hub: \`${dockerhub_image}:${tag}\`"
-            echo "- Docker Hub: \`${dockerhub_image}:${version}\`"
-            if [[ "${tag}" != *-* ]]; then
-              echo "- GHCR: \`${image}:latest\`"
-              echo "- Docker Hub: \`${dockerhub_image}:latest\`"
-            fi
-          } >> "${notes_file}"
-
           echo "path=${notes_file}" >> "${GITHUB_OUTPUT}"
 
       - name: Publish GitHub Release
@@ -312,8 +289,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           RELEASE_TAG: ${{ needs.publish.outputs.tag }}
-          RELEASE_IMAGE: ${{ needs.publish.outputs.image }}
-          RELEASE_DOCKERHUB_IMAGE: ${{ needs.publish.outputs.dockerhub_image }}
           RELEASE_URL: ${{ needs.publish.outputs.release_url }}
         run: |
           set -euo pipefail
@@ -330,9 +305,6 @@ jobs:
           message="<b>MusicPilot ${RELEASE_TAG} 已发布</b>"
 
           if [[ -n "${notes}" ]]; then
-            # Strip the "容器镜像" section (we include Docker info separately)
-            notes="${notes%%## 2.*}"
-
             # Keep the Telegram summary focused on release sections and commit subjects
             notes="$(printf '%s\n' "${notes}" | sed -e '/^## 1\. 更新内容$/d' -e '/^[[:space:]][[:space:]]/d')"
 
@@ -358,8 +330,8 @@ jobs:
             message+=$'\n\n'"${notes}"
           fi
 
-          # Footer: release link + Docker images
-          message+=$'\n\n'"<a href=\"${RELEASE_URL}\">查看 GitHub Release</a>"$'\n'"GHCR：<code>${RELEASE_IMAGE}:${RELEASE_TAG}</code>"$'\n'"Docker Hub：<code>${RELEASE_DOCKERHUB_IMAGE}:${RELEASE_TAG}</code>"
+          # Footer: release link
+          message+=$'\n\n'"<a href=\"${RELEASE_URL}\">查看 GitHub Release</a>"
 
           curl --fail --silent --show-error --retry 3 --connect-timeout 10 --max-time 30 \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \

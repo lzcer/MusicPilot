@@ -35,6 +35,7 @@ Telegram 通知频道：[https://telegram.me/musicpilot_channel](https://telegra
 站点支持：
 
 - [x] OpenCD
+- [x] M-Team
 - [x] HDFans
 - [x] HHClub
 - [x] JPOP
