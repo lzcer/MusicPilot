@@ -304,7 +304,7 @@ jobs:
           fi
 
           # Fetch release notes from the published GitHub Release
-          notes="$(gh release view "${RELEASE_TAG}" --json body --jq '.body' 2>/dev/null || true)"
+          notes="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json body --jq '.body')"
 
           # Build message — start with the header
           message="<b>MusicPilot ${RELEASE_TAG} 已发布</b>"
