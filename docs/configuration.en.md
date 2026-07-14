@@ -13,6 +13,18 @@ In most cases, only deployment paths, the administrator account, the database UR
 
 ## 1.2. Preparation Before First Startup
 
+Using a published multi-architecture image is recommended. Docker Hub and GHCR contain the same image and version tags, so choose either registry based on network availability:
+
+```yaml
+# Docker Hub
+image: lzcer/musicpilot:latest
+
+# GHCR
+image: ghcr.io/lzcer/musicpilot:latest
+```
+
+Both image sources support `linux/amd64` and `linux/arm64`.
+
 Before deployment, confirm these directories:
 
 | Directory | Purpose | Docker example |

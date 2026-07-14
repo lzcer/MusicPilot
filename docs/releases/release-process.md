@@ -1,6 +1,6 @@
 # 1. 发布流程
 
-MusicPilot 使用 GitHub Actions 在推送版本标签时自动构建 Docker 镜像、推送到 GHCR，并创建 GitHub Release。
+MusicPilot 使用 GitHub Actions 在推送版本标签时自动构建 Docker 镜像、推送到 GHCR 和 Docker Hub，并创建 GitHub Release。
 
 ## 1.1. 触发条件
 
@@ -24,7 +24,7 @@ git push origin v0.1.0
 workflow 会自动完成以下动作：
 
 1. 构建 Docker 镜像。
-2. 推送镜像到 GHCR。
+2. 推送镜像到 GHCR 和 Docker Hub。
 3. 使用首版发布说明创建 GitHub Release。
 
 ## 1.3. 后续发布
@@ -50,17 +50,27 @@ git push origin v0.1.1
 ghcr.io/lzcer/musicpilot:v0.1.0
 ghcr.io/lzcer/musicpilot:0.1.0
 ghcr.io/lzcer/musicpilot:latest
+docker.io/lzcer/musicpilot:v0.1.0
+docker.io/lzcer/musicpilot:0.1.0
+docker.io/lzcer/musicpilot:latest
 ```
 
 预发布版本包含 `-`，例如 `v1.0.0-beta.1`，不会更新 `latest`。
 
-## 1.5. GHCR 可见性
+## 1.5. 镜像仓库配置
 
-首次推送 GHCR 包后，如果镜像需要公开访问，需要在 GitHub Packages 页面确认包的可见性为 public。构建、推送和 Release 创建本身由 workflow 自动完成。
+首次推送 GHCR 包后，如果镜像需要公开访问，需要在 GitHub Packages 页面确认包的可见性为 public。
+
+Docker Hub 仓库需要提前创建，并在仓库的 `Settings` → `Secrets and variables` → `Actions` 中配置以下 Repository secrets：
+
+1. `DOCKERHUB_USERNAME`：Docker Hub 用户名，本仓库填写 `lzcer`。
+2. `DOCKERHUB_TOKEN`：具有 Read/Write 权限的 Docker Hub Access Token。
+
+GHCR 和 Docker Hub 使用同一次多架构构建产生的镜像标签。任一仓库登录或推送失败时，发布任务都会失败，不会继续创建 GitHub Release。
 
 ## 1.6. Telegram 频道通知
 
-发布成功并创建 GitHub Release 后，workflow 会向 Telegram 频道发送包含版本号、Release 链接和 Docker 镜像标签的通知。
+发布成功并创建 GitHub Release 后，workflow 会向 Telegram 频道发送包含版本号、Release 链接、GHCR 镜像标签和 Docker Hub 镜像标签的通知。
 
 在仓库的 `Settings` → `Secrets and variables` → `Actions` 中新增以下 Repository secrets：
 

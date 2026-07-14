@@ -124,7 +124,25 @@ The settings page groups runtime parameters by downloader, music library, notifi
 
 ## 6. Quick Start
 
-The following workflow is suitable for building and running MusicPilot directly from source on a NAS or server.
+Published Docker images are recommended for running MusicPilot on a NAS or server. Build from source only when you need to modify or debug the project locally.
+
+### 6.1. Deploy With Published Docker Images
+
+MusicPilot publishes the same multi-architecture image to Docker Hub and GHCR. Set the MusicPilot service's `image` field in your Compose file to either address:
+
+```yaml
+# Docker Hub
+image: lzcer/musicpilot:latest
+
+# GHCR
+image: ghcr.io/lzcer/musicpilot:latest
+```
+
+Both images support `linux/amd64` and `linux/arm64`.
+
+### 6.2. Build From Source
+
+The following workflow builds and runs MusicPilot directly from source.
 
 1. Clone the project and enter the directory:
 
@@ -201,7 +219,7 @@ git pull
 docker compose up -d --build
 ```
 
-### 6.1. Recommended PostgreSQL Database
+### 6.3. Recommended PostgreSQL Database
 
 MusicPilot can start quickly with SQLite, but PostgreSQL is recommended for long-running and production deployments. Download polling, task queues, playlist sync, library refreshes, and database backups continuously write runtime data, and PostgreSQL is more reliable for concurrency, recovery, and maintenance.
 
@@ -234,7 +252,7 @@ services:
       - postgres
 ```
 
-### 6.2. Configuration Guide
+### 6.4. Configuration Guide
 
 After the first startup, configure sites, downloaders, music libraries, organization rules, and notification channels in the Web UI.
 

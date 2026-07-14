@@ -13,6 +13,18 @@ MusicPilot 的配置分为两类：
 
 ## 1.2. 首次启动前准备
 
+推荐直接使用已发布的多架构镜像。Docker Hub 和 GHCR 中的镜像内容与版本标签一致，可以根据网络情况任选其一：
+
+```yaml
+# Docker Hub
+image: lzcer/musicpilot:latest
+
+# GHCR
+image: ghcr.io/lzcer/musicpilot:latest
+```
+
+两个镜像源均支持 `linux/amd64` 和 `linux/arm64`。
+
 部署前建议先确认以下目录：
 
 | 目录 | 用途 | Docker 示例 |
