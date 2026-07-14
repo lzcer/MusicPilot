@@ -994,16 +994,33 @@ class AppState:
         keywords = _metadata_search_keywords(media)
         exclude = await _get_exclude_keywords(self)
         minimum_seeders = await _get_minimum_seeders(self)
-        results: list[SearchResult] = []
-        indexer: object
-        for indexer in self.indexers:
-            for keyword in keywords:
-                try:
-                    _source, found = await _search_indexer(self, indexer, keyword, 200)
-                except Exception as exc:  # noqa: BLE001
-                    self.add_log("search", f"Telegram torrent search failed: {exc}", "WARNING")
-                    continue
-                results.extend(found)
+
+        async def search_indexer(indexer: object) -> list[SearchResult]:
+            site_name = str(getattr(indexer, "name", "unknown"))
+            max_concurrency = max(1, int(getattr(indexer.config, "max_concurrency", 1)))
+            semaphore = asyncio.Semaphore(max_concurrency)
+
+            async def search_keyword(keyword: str) -> tuple[SearchResult, ...]:
+                async with semaphore:
+                    try:
+                        _source, found = await _search_indexer(self, indexer, keyword, 200)
+                    except Exception as exc:  # noqa: BLE001
+                        self.add_log(
+                            "search",
+                            "Telegram torrent search failed: "
+                            f"site={site_name}, keyword={keyword}, error={exc}",
+                            "WARNING",
+                        )
+                        return ()
+                    return found
+
+            groups = await asyncio.gather(*(search_keyword(keyword) for keyword in keywords))
+            return [result for group in groups for result in group]
+
+        site_groups = await asyncio.gather(
+            *(search_indexer(indexer) for indexer in self.indexers)
+        )
+        results = [result for group in site_groups for result in group]
         merged = _filter_by_minimum_seeders(
             _filter_by_exclude_keywords(_dedupe_results(results), exclude), minimum_seeders
         )
@@ -6312,8 +6329,12 @@ async def _run_metadata_site_search_stream(
         await task.finish()
         return
     try:
-        for indexer in indexers:
-            await _run_metadata_site_search_for_indexer(state, task, indexer, limit)
+        await asyncio.gather(
+            *(
+                _run_metadata_site_search_for_indexer(state, task, indexer, limit)
+                for indexer in indexers
+            )
+        )
     except Exception as exc:  # noqa: BLE001
         state.add_log("search", f"Streaming metadata site search failed: {exc}", "ERROR")
     finally:
