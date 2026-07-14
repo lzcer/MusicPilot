@@ -120,6 +120,7 @@ class DownloadResponse(BaseModel):
 
 DownloadDeleteMode = Literal["record_only", "all"]
 MediaDeleteMode = Literal["record_only", "media_file", "all"]
+MediaClearMode = Literal["record_only", "media_file"]
 FileEntryType = Literal["file", "directory"]
 FileRootType = Literal["source", "mapped"]
 

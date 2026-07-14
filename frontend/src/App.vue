@@ -119,6 +119,7 @@ type DownloadTaskItem = {
 
 type DownloadDeleteMode = 'record_only' | 'all'
 type MediaDeleteMode = 'record_only' | 'media_file' | 'all'
+type MediaClearMode = 'record_only' | 'media_file'
 
 type MediaFile = {
   id: number
@@ -758,6 +759,8 @@ const systemTasksInterrupting = ref(false)
 const downloadDeleteDialog = ref(false)
 const mediaDeleteDialog = ref(false)
 const mediaDeleteAllConfirmDialog = ref(false)
+const mediaClearDialog = ref(false)
+const mediaClearConfirmDialog = ref(false)
 const fileOrganizeDialog = ref(false)
 const fileDeleteDialog = ref(false)
 const siteTesting = ref(false)
@@ -789,6 +792,7 @@ const playlistPageDownloading = ref(false)
 const deleting = ref(false)
 const downloadDeleting = ref(false)
 const mediaDeleting = ref(false)
+const mediaClearing = ref(false)
 const fileOrganizing = ref(false)
 const fileDeleting = ref(false)
 const activeDownloadDeleteMode = ref<DownloadDeleteMode | null>(null)
@@ -832,6 +836,7 @@ const pendingDownloadDeleteLabel = ref('')
 const pendingMediaDelete = ref<MediaFile | null>(null)
 const pendingMediaDeleteIds = ref<number[]>([])
 const pendingMediaDeleteLabel = ref('')
+const pendingMediaClearMode = ref<MediaClearMode | null>(null)
 const pendingFileOrganize = ref<FileEntry | null>(null)
 const pendingFileOrganizePaths = ref<string[]>([])
 const pendingFileOrganizeLabel = ref('')
@@ -2137,6 +2142,52 @@ function deleteSelectedMediaFiles() {
   pendingMediaDeleteIds.value = ids
   pendingMediaDeleteLabel.value = `选中的 ${ids.length} 条整理记录`
   mediaDeleteDialog.value = true
+}
+
+function requestClearMedia(mode: MediaClearMode) {
+  pendingMediaClearMode.value = mode
+  mediaClearDialog.value = false
+  mediaClearConfirmDialog.value = true
+}
+
+function closeMediaClearConfirm() {
+  mediaClearConfirmDialog.value = false
+  pendingMediaClearMode.value = null
+}
+
+async function confirmClearMedia() {
+  const mode = pendingMediaClearMode.value
+  if (!mode) return
+  mediaClearing.value = true
+  try {
+    const result = await api<MediaBulkDeleteResponse>(`/api/media/clear?mode=${mode}`, {
+      method: 'DELETE'
+    })
+    selectedMediaIds.value = []
+    mediaPage.value = 1
+    mediaClearDialog.value = false
+    mediaClearConfirmDialog.value = false
+    pendingMediaClearMode.value = null
+    await loadMedia()
+    if (result.failures.length) {
+      notify(
+        `已清空 ${result.deleted_ids.length} 条，失败 ${result.failures.length} 条`,
+        'warning'
+      )
+    } else if (result.not_found_ids.length) {
+      notify(
+        `已清空 ${result.deleted_ids.length} 条，${result.not_found_ids.length} 条记录已不存在`,
+        'warning'
+      )
+    } else {
+      notify(`已清空 ${result.deleted_ids.length} 条整理记录`)
+    }
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '整理记录清空失败', 'error')
+    await loadMedia()
+  } finally {
+    mediaClearing.value = false
+  }
 }
 
 function requestDeleteMedia(mode: MediaDeleteMode) {
@@ -4993,6 +5044,16 @@ onUnmounted(() => {
               >
                 删除
               </v-btn>
+              <v-btn
+                prepend-icon="mdi-delete-sweep"
+                color="error"
+                variant="tonal"
+                :disabled="mediaClearing"
+                :loading="mediaClearing"
+                @click="mediaClearDialog = true"
+              >
+                清空记录
+              </v-btn>
               <v-text-field
                 v-model="mediaQuery"
                 label="搜索整理记录"
@@ -7243,6 +7304,77 @@ onUnmounted(() => {
             @click="confirmDeleteMedia('all')"
           >
             确认删除全部
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="mediaClearDialog" max-width="580">
+      <v-card title="清空全部整理记录">
+        <v-card-text class="dialog-stack">
+          <div>
+            此操作将作用于全部整理记录，不受当前搜索条件、状态筛选、分页或勾选项影响。
+          </div>
+          <v-alert type="warning" variant="tonal" density="compact">
+            <div>仅删除记录：清空整理记录，保留媒体文件和源文件。</div>
+            <div>删除媒体文件：清空整理记录及关联的媒体库文件，保留源文件。</div>
+          </v-alert>
+        </v-card-text>
+        <v-card-actions class="delete-action-buttons">
+          <v-btn variant="text" :disabled="mediaClearing" @click="mediaClearDialog = false">
+            取消
+          </v-btn>
+          <v-spacer />
+          <v-btn
+            variant="tonal"
+            :disabled="mediaClearing"
+            @click="requestClearMedia('record_only')"
+          >
+            仅删除记录
+          </v-btn>
+          <v-btn
+            color="error"
+            :disabled="mediaClearing"
+            @click="requestClearMedia('media_file')"
+          >
+            删除媒体文件
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="mediaClearConfirmDialog" max-width="520">
+      <v-card
+        :title="
+          pendingMediaClearMode === 'media_file' ? '再次确认删除媒体文件' : '再次确认清空记录'
+        "
+      >
+        <v-card-text>
+          <v-alert
+            :type="pendingMediaClearMode === 'media_file' ? 'error' : 'warning'"
+            variant="tonal"
+            density="compact"
+          >
+            <template v-if="pendingMediaClearMode === 'media_file'">
+              将永久清空全部整理记录，并删除记录关联的媒体库文件及对应音乐库索引；源文件不会被删除。此操作不可恢复。
+            </template>
+            <template v-else>
+              将永久清空全部整理记录；媒体文件和源文件不会被删除。此操作不可恢复。
+            </template>
+          </v-alert>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="mediaClearing" @click="closeMediaClearConfirm">
+            取消
+          </v-btn>
+          <v-btn
+            color="error"
+            :disabled="mediaClearing"
+            :loading="mediaClearing"
+            @click="confirmClearMedia"
+          >
+            {{ pendingMediaClearMode === 'media_file' ? '确认删除媒体文件' : '确认清空记录' }}
           </v-btn>
         </v-card-actions>
       </v-card>

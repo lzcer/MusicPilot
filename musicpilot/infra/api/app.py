@@ -142,6 +142,7 @@ from musicpilot.infra.api.schemas import (
     MediaBulkDeleteRequest,
     MediaBulkDeleteResponse,
     MediaCandidateResponse,
+    MediaClearMode,
     MediaDeleteMode,
     MediaFilePageResponse,
     MediaFileResponse,
@@ -3007,18 +3008,20 @@ def create_app() -> FastAPI:
             page_size=page_size,
         )
 
-    @app.delete("/api/media", response_model=MediaBulkDeleteResponse)
-    async def delete_media_files(payload: MediaBulkDeleteRequest) -> MediaBulkDeleteResponse:
+    async def delete_media_records(
+        media_ids: Iterable[int],
+        mode: MediaDeleteMode,
+    ) -> MediaBulkDeleteResponse:
         deleted_ids: list[int] = []
         not_found_ids: list[int] = []
         failures: list[MediaBulkDeleteFailure] = []
         config: ScrapingConfig | None = None
-        if payload.mode in {"media_file", "all"}:
+        if mode in {"media_file", "all"}:
             settings_payload = await state.repository.get_system_settings()
             config = scraping_config_from_payload(settings_payload)
         music_library_change_count = 0
         seen: set[int] = set()
-        for media_id in payload.ids:
+        for media_id in media_ids:
             if media_id in seen:
                 continue
             seen.add(media_id)
@@ -3026,12 +3029,12 @@ def create_app() -> FastAPI:
             if media is None:
                 not_found_ids.append(media_id)
                 continue
-            removes_library_result = _media_delete_removes_library_result(media, payload.mode)
+            removes_library_result = _media_delete_removes_library_result(media, mode)
             try:
                 deleted = await _delete_media_record(
                     state,
                     media,
-                    payload.mode,
+                    mode,
                     config=config,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -3053,6 +3056,17 @@ def create_app() -> FastAPI:
             not_found_ids=not_found_ids,
             failures=failures,
         )
+
+    @app.delete("/api/media", response_model=MediaBulkDeleteResponse)
+    async def delete_media_files(payload: MediaBulkDeleteRequest) -> MediaBulkDeleteResponse:
+        return await delete_media_records(payload.ids, payload.mode)
+
+    @app.delete("/api/media/clear", response_model=MediaBulkDeleteResponse)
+    async def clear_media_files(
+        mode: MediaClearMode = "record_only",
+    ) -> MediaBulkDeleteResponse:
+        media_ids = [media.id for media in await state.repository.list_media_files()]
+        return await delete_media_records(media_ids, mode)
 
     @app.post("/api/media/retry", response_model=MediaRetryResponse)
     async def retry_media(payload: MediaRetryRequest) -> MediaRetryResponse:
