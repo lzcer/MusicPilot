@@ -2133,8 +2133,12 @@ def create_app() -> FastAPI:
 
     @app.post("/api/settings/media-servers/test", response_model=TestResponse)
     async def test_media_server(payload: MediaServerCreateRequest) -> TestResponse:
+        password = payload.password
+        if not password and payload.id:
+            existing = await state.repository.get_media_server(payload.id)
+            password = existing.password if existing else ""
         try:
-            client = build_media_server_client(payload)
+            client = build_media_server_client(payload.model_copy(update={"password": password}))
             await client.ping()
         except Exception as exc:  # noqa: BLE001
             return TestResponse(ok=False, message=f"媒体服务器连接失败：{exc}")
@@ -6535,6 +6539,7 @@ def _downloader_response(item: DownloaderConfig) -> DownloaderResponse:
         type=item.type,
         base_url=item.base_url,
         username=item.username,
+        password_configured=bool(item.password),
         download_path=item.download_path,
         local_path=item.local_path,
         listen_mode=item.listen_mode,
@@ -6574,6 +6579,7 @@ def _media_server_response(item: MediaServerConfig) -> MediaServerResponse:
         base_url=item.base_url,
         api_key=item.api_key,
         username=item.username,
+        password_configured=bool(item.password),
         is_default=item.is_default,
         enabled=item.enabled,
     )
@@ -6584,6 +6590,7 @@ def _notifier_response(item: NotifierChannel) -> NotifierResponse:
         id=item.id,
         name=item.name,
         type=item.type,
+        bot_token_configured=bool(item.bot_token),
         webhook_url=item.webhook_url,
         chat_ids=item.chat_ids,
         use_proxy=item.use_proxy,

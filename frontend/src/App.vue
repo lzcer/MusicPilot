@@ -395,6 +395,7 @@ type DownloaderConfig = {
   type: string
   base_url: string
   username: string
+  password_configured: boolean
   download_path: string
   local_path: string
   listen_mode: string
@@ -410,6 +411,7 @@ type MediaServerConfig = {
   base_url: string
   api_key: string
   username: string
+  password_configured: boolean
   is_default: boolean
   enabled: boolean
 }
@@ -418,6 +420,7 @@ type NotifierConfig = {
   id?: string | null
   name: string
   type: string
+  bot_token_configured: boolean
   webhook_url: string
   chat_ids: string
   use_proxy: boolean
@@ -898,6 +901,54 @@ const mediaServerUserForm = ref({
   password: '',
   enabled: true
 })
+
+const secretMask = '••••••••'
+
+function maskedSecret(configured: boolean) {
+  return configured ? secretMask : ''
+}
+
+function submittedSecret(secret: string) {
+  return secret === secretMask ? '' : secret
+}
+
+function updateSecret(current: string, value: string) {
+  if (current !== secretMask) return value
+  if (value === secretMask) return value
+
+  let start = 0
+  while (start < current.length && start < value.length && current[start] === value[start]) {
+    start += 1
+  }
+
+  let currentEnd = current.length
+  let valueEnd = value.length
+  while (
+    currentEnd > start &&
+    valueEnd > start &&
+    current[currentEnd - 1] === value[valueEnd - 1]
+  ) {
+    currentEnd -= 1
+    valueEnd -= 1
+  }
+  return value.slice(start, valueEnd)
+}
+
+function updateDownloaderPassword(value: string) {
+  downloaderForm.value.password = updateSecret(downloaderForm.value.password, value)
+}
+
+function updateMediaServerPassword(value: string) {
+  mediaServerForm.value.password = updateSecret(mediaServerForm.value.password, value)
+}
+
+function updateMediaServerUserPassword(value: string) {
+  mediaServerUserForm.value.password = updateSecret(mediaServerUserForm.value.password, value)
+}
+
+function updateNotifierBotToken(value: string) {
+  notifierForm.value.bot_token = updateSecret(notifierForm.value.bot_token, value)
+}
 
 const notifierForm = ref({
   id: null as string | null,
@@ -3493,7 +3544,7 @@ function editDownloader(downloader: DownloaderConfig) {
     type: downloader.type,
     base_url: downloader.base_url,
     username: downloader.username,
-    password: '',
+    password: maskedSecret(downloader.password_configured),
     download_path: downloader.download_path ?? '',
     local_path: downloader.local_path ?? '',
     listen_mode: downloader.listen_mode ?? 'polling',
@@ -3514,7 +3565,10 @@ async function testDownloader() {
   try {
     const result = await api<TestResponse>('/api/settings/downloaders/test', {
       method: 'POST',
-      body: JSON.stringify(downloaderForm.value)
+      body: JSON.stringify({
+        ...downloaderForm.value,
+        password: submittedSecret(downloaderForm.value.password)
+      })
     })
     notify(result.message, result.ok ? 'success' : 'error')
   } catch (error) {
@@ -3537,7 +3591,10 @@ async function saveDownloader() {
       : '/api/settings/downloaders',
     {
       method: editing ? 'PUT' : 'POST',
-      body: JSON.stringify(downloaderForm.value)
+      body: JSON.stringify({
+        ...downloaderForm.value,
+        password: submittedSecret(downloaderForm.value.password)
+      })
     }
   )
   await loadDownloaders()
@@ -3574,7 +3631,7 @@ function syncMediaServerFormFromDefault() {
     base_url: server.base_url,
     api_key: server.api_key,
     username: server.username,
-    password: '',
+    password: maskedSecret(server.password_configured),
     is_default: true,
     enabled: server.enabled
   }
@@ -3618,7 +3675,7 @@ function editMediaServerUser(server: MediaServerConfig) {
   mediaServerUserForm.value = {
     id: server.id ?? null,
     username: server.username,
-    password: '',
+    password: maskedSecret(server.password_configured),
     enabled: server.enabled
   }
   mediaServerDialog.value = true
@@ -3633,7 +3690,7 @@ function mediaServerUserPayload() {
     base_url: mediaServerForm.value.base_url,
     api_key: mediaServerForm.value.api_key,
     username,
-    password: mediaServerUserForm.value.password,
+    password: submittedSecret(mediaServerUserForm.value.password),
     is_default: false,
     enabled: mediaServerUserForm.value.enabled
   }
@@ -3665,6 +3722,7 @@ async function testMediaServer() {
       method: 'POST',
       body: JSON.stringify({
         ...mediaServerForm.value,
+        password: submittedSecret(mediaServerForm.value.password),
         is_default: true
       })
     })
@@ -3686,6 +3744,7 @@ async function saveMediaServer() {
       method: editing ? 'PUT' : 'POST',
       body: JSON.stringify({
         ...mediaServerForm.value,
+        password: submittedSecret(mediaServerForm.value.password),
         is_default: true
       })
     }
@@ -3768,7 +3827,7 @@ function editNotifier(notifier: NotifierConfig) {
     id: notifier.id ?? null,
     name: notifier.name,
     type: notifier.type,
-    bot_token: '',
+    bot_token: maskedSecret(notifier.bot_token_configured),
     webhook_url: notifier.webhook_url,
     chat_ids: notifier.chat_ids,
     use_proxy: notifier.use_proxy,
@@ -3784,7 +3843,10 @@ async function testNotifier() {
   try {
     const result = await api<TestResponse>('/api/settings/notifiers/test', {
       method: 'POST',
-      body: JSON.stringify(notifierForm.value)
+      body: JSON.stringify({
+        ...notifierForm.value,
+        bot_token: submittedSecret(notifierForm.value.bot_token)
+      })
     })
     notify(result.message, result.ok ? 'success' : 'error')
   } catch (error) {
@@ -3800,7 +3862,10 @@ async function saveNotifier() {
     editing ? `/api/settings/notifiers/${editingNotifierId.value}` : '/api/settings/notifiers',
     {
       method: editing ? 'PUT' : 'POST',
-      body: JSON.stringify(notifierForm.value)
+      body: JSON.stringify({
+        ...notifierForm.value,
+        bot_token: submittedSecret(notifierForm.value.bot_token)
+      })
     }
   )
   if (editing) {
@@ -5890,10 +5955,11 @@ onUnmounted(() => {
                     <v-text-field v-model="mediaServerForm.api_key" label="API Token" />
                     <v-text-field v-model="mediaServerForm.username" label="默认用户名" />
                     <v-text-field
-                      v-model="mediaServerForm.password"
+                      :model-value="mediaServerForm.password"
                       label="默认用户密码"
                       type="password"
                       :placeholder="mediaServerForm.id ? '留空则保持原密码' : ''"
+                      @update:model-value="updateMediaServerPassword"
                     />
                     <v-switch
                       v-model="mediaServerForm.enabled"
@@ -6857,10 +6923,11 @@ onUnmounted(() => {
           <v-text-field v-model="downloaderForm.base_url" label="地址" />
           <v-text-field v-model="downloaderForm.username" label="用户名" />
           <v-text-field
-            v-model="downloaderForm.password"
+            :model-value="downloaderForm.password"
             label="密码"
             type="password"
             :placeholder="editingDownloaderId ? '留空则保持原密码' : ''"
+            @update:model-value="updateDownloaderPassword"
           />
           <v-text-field
             v-model="downloaderForm.download_path"
@@ -6911,10 +6978,11 @@ onUnmounted(() => {
         <v-card-text class="dialog-stack">
           <v-text-field v-model="mediaServerUserForm.username" label="用户名" autofocus />
           <v-text-field
-            v-model="mediaServerUserForm.password"
+            :model-value="mediaServerUserForm.password"
             label="密码"
             type="password"
             :placeholder="editingMediaServerId ? '留空则保持原密码' : ''"
+            @update:model-value="updateMediaServerUserPassword"
           />
           <v-switch
             v-model="mediaServerUserForm.enabled"
@@ -6938,9 +7006,11 @@ onUnmounted(() => {
           <v-select v-model="notifierForm.type" :items="['telegram']" label="类型" />
           <v-text-field v-model="notifierForm.name" label="名称" />
           <v-text-field
-            v-model="notifierForm.bot_token"
+            :model-value="notifierForm.bot_token"
             label="Bot Token"
+            type="password"
             :placeholder="editingNotifierId ? '留空则保持原 Token' : ''"
+            @update:model-value="updateNotifierBotToken"
           />
           <v-text-field v-model="notifierForm.webhook_url" label="Webhook URL" />
           <v-text-field v-model="notifierForm.chat_ids" label="Chat IDs" />

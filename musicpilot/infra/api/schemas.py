@@ -501,6 +501,7 @@ class DownloaderResponse(BaseModel):
     type: str
     base_url: str
     username: str
+    password_configured: bool = False
     download_path: str = ""
     local_path: str = ""
     listen_mode: str = "polling"
@@ -528,6 +529,7 @@ class MediaServerResponse(BaseModel):
     base_url: str
     api_key: str = ""
     username: str = ""
+    password_configured: bool = False
     is_default: bool
     enabled: bool = True
 
@@ -549,6 +551,7 @@ class NotifierResponse(BaseModel):
     id: str | None = None
     name: str
     type: str
+    bot_token_configured: bool = False
     webhook_url: str = ""
     chat_ids: str = ""
     use_proxy: bool = False
