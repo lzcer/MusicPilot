@@ -127,10 +127,7 @@ def build_indexers(
             continue
         if entry.adapter == "gazelle":
             crawlers.append(
-                GazelleCrawler(
-                    _gazelle_site_config(site),
-                    proxy_url=site_proxy_url,
-                )
+                GazelleCrawler(_gazelle_site_config(site), proxy_url=site_proxy_url)
             )
             continue
         crawlers.append(
@@ -193,6 +190,7 @@ def _gazelle_site_config(raw: Any) -> GazelleSiteConfig:
             site_id=str(raw["id"]) if raw.get("id") else None,
             max_concurrency=int(raw.get("max_concurrency", 2)),
             user_agent=str(raw["user_agent"]) if raw.get("user_agent") else None,
+            request_interval=float(raw.get("request_interval", 3)),
         )
     except KeyError as exc:
         raise ValueError(f"Missing required site config key {exc.args[0]!r}") from exc

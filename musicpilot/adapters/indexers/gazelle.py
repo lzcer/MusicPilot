@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
@@ -19,6 +21,7 @@ class GazelleSiteConfig:
     site_id: str | None = None
     max_concurrency: int = 2
     user_agent: str | None = None
+    request_interval: float = 3.0
 
 
 class GazelleCrawler:
@@ -32,6 +35,8 @@ class GazelleCrawler:
         self._client = client
         self._proxy_url = proxy_url
         self._semaphore = asyncio.Semaphore(config.max_concurrency)
+        self._request_lock = asyncio.Lock()
+        self._next_request_at = 0.0
 
     @property
     def name(self) -> str:
@@ -77,8 +82,7 @@ class GazelleCrawler:
                 if len(results) >= limit:
                     break
 
-            pages = _to_int(response.get("pages"))
-            if page >= pages or len(groups) == 0:
+            if page >= _to_int(response.get("pages")):
                 break
             page += 1
         return tuple(results)
@@ -89,7 +93,7 @@ class GazelleCrawler:
         try:
             payload = await self._get_json("ajax.php", {"action": "index"})
             response = payload.get("response")
-            if not isinstance(response, dict) or not str(response.get("username") or "").strip():
+            if not isinstance(response, dict) or not _text(response.get("username")):
                 return SiteAuthCheck(False, f"{self.name} Cookie 无效或已过期。")
         except Exception as exc:  # noqa: BLE001
             return SiteAuthCheck(False, f"{self.name} 连接测试失败：{exc}")
@@ -103,6 +107,8 @@ class GazelleCrawler:
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in {401, 403}:
                 message = f"{self.name} Cookie 无效或已过期。"
+            elif exc.response.status_code == 429:
+                message = f"{self.name} 请求过于频繁，请稍后重试。"
             else:
                 message = f"{self.name} 种子文件下载失败，HTTP {exc.response.status_code}。"
             raise RuntimeError(message) from exc
@@ -116,12 +122,15 @@ class GazelleCrawler:
 
     async def _get_json(self, path: str, params: dict[str, str]) -> dict[str, Any]:
         try:
-            url = urljoin(self.config.base_url.rstrip("/") + "/", path)
-            response = await self._get(url, params=params)
+            response = await self._get(
+                urljoin(self.config.base_url.rstrip("/") + "/", path), params=params
+            )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in {401, 403}:
                 message = f"{self.name} Cookie 无效或已过期。"
+            elif exc.response.status_code == 429:
+                message = f"{self.name} 请求过于频繁，请稍后重试。"
             else:
                 message = f"{self.name} 请求失败，HTTP {exc.response.status_code}。"
             raise RuntimeError(message) from exc
@@ -147,17 +156,44 @@ class GazelleCrawler:
         accept: str = "application/json",
     ) -> httpx.Response:
         async with self._semaphore:
-            headers = {"Accept": accept}
-            if self.config.cookie:
-                headers["Cookie"] = self.config.cookie
-            if self.config.user_agent:
-                headers["User-Agent"] = self.config.user_agent
-            if self._client is not None:
-                return await self._client.get(url, params=params, headers=headers)
-            async with httpx.AsyncClient(
-                http2=True, timeout=30, follow_redirects=True, proxy=self._proxy_url
-            ) as client:
-                return await client.get(url, params=params, headers=headers)
+            for attempt in range(2):
+                await self._wait_for_request_slot()
+                response = await self._send_get(url, params=params, accept=accept)
+                if response.status_code != 429 or attempt:
+                    return response
+                await self._apply_retry_after(response)
+        raise AssertionError("unreachable")
+
+    async def _send_get(
+        self, url: str, *, params: dict[str, str] | None, accept: str
+    ) -> httpx.Response:
+        headers = {"Accept": accept}
+        if self.config.cookie:
+            headers["Cookie"] = self.config.cookie
+        if self.config.user_agent:
+            headers["User-Agent"] = self.config.user_agent
+        if self._client is not None:
+            return await self._client.get(url, params=params, headers=headers)
+        async with httpx.AsyncClient(
+            http2=True, timeout=30, follow_redirects=True, proxy=self._proxy_url
+        ) as client:
+            return await client.get(url, params=params, headers=headers)
+
+    async def _wait_for_request_slot(self) -> None:
+        async with self._request_lock:
+            loop = asyncio.get_running_loop()
+            wait_seconds = self._next_request_at - loop.time()
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+            self._next_request_at = loop.time() + self.config.request_interval
+
+    async def _apply_retry_after(self, response: httpx.Response) -> None:
+        retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
+        if retry_after is None:
+            retry_after = self.config.request_interval
+        async with self._request_lock:
+            loop = asyncio.get_running_loop()
+            self._next_request_at = max(self._next_request_at, loop.time() + retry_after)
 
     def _search_results(self, raw_group: object) -> tuple[SearchResult, ...]:
         if not isinstance(raw_group, dict):
@@ -196,16 +232,16 @@ class GazelleCrawler:
                         f"torrents.php?{urlencode({'action': 'download', 'id': torrent_id})}",
                     ),
                     details_url=urljoin(
-                        self.config.base_url.rstrip("/") + "/",
-                        f"torrents.php?{details_query}",
+                        self.config.base_url.rstrip("/") + "/", f"torrents.php?{details_query}"
                     ),
                     source=self.name,
                     seeders=_to_int(torrent.get("seeders")),
                     leechers=_to_int(torrent.get("leechers")),
                     size_bytes=_to_int(torrent.get("size")) or None,
-                    subtitle=(
-                        " / ".join(part for part in (edition, format_description) if part) or None
-                    ),
+                    subtitle=" / ".join(
+                        part for part in (edition, format_description) if part
+                    )
+                    or None,
                     published_at=_text(torrent.get("time")) or None,
                     promotion=_promotion(torrent),
                     metadata={
@@ -254,6 +290,19 @@ def _api_error(payload: object) -> str:
     return "响应格式无效"
 
 
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value).astimezone(UTC)
+            return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
+        except (TypeError, ValueError):
+            return None
+
+
 def _artist_name(group: dict[str, Any]) -> str:
     artist = group.get("artist") or group.get("artists")
     if isinstance(artist, str):
@@ -279,10 +328,8 @@ def _edition(torrent: dict[str, Any]) -> str:
 
 
 def _promotion(torrent: dict[str, Any]) -> str | None:
-    if torrent.get("isPersonalFreeleech"):
-        return "FREE"
-    if torrent.get("isFreeleech") or torrent.get("isFreeload"):
-        return "FREE"
-    if torrent.get("isNeutralLeech"):
+    if torrent.get("isFreeload") or torrent.get("isNeutralLeech"):
         return "0X"
+    if torrent.get("isPersonalFreeleech") or torrent.get("isFreeleech"):
+        return "FREE"
     return None

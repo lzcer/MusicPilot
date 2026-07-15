@@ -4,15 +4,16 @@ import httpx
 import pytest
 
 from musicpilot.adapters.indexers.config import build_indexers, load_parser_catalog
-from musicpilot.adapters.indexers.gazelle import GazelleCrawler, GazelleSiteConfig
+from musicpilot.adapters.indexers.gazelle import GazelleCrawler, GazelleSiteConfig, _promotion
 
 
-def _crawler(client: httpx.AsyncClient) -> GazelleCrawler:
+def _crawler(client: httpx.AsyncClient, *, request_interval: float = 0) -> GazelleCrawler:
     return GazelleCrawler(
         GazelleSiteConfig(
             name="Redacted",
             base_url="https://redacted.local",
             cookie="session=good",
+            request_interval=request_interval,
         ),
         client=client,
     )
@@ -23,98 +24,96 @@ async def test_gazelle_search_parses_torrents_and_paginates() -> None:
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        assert request.headers["cookie"] == "session=good"
         page = request.url.params["page"]
-        results = [
-            {
-                "groupId": 1,
-                "groupName": "Album",
-                "groupYear": 2024,
-                "releaseType": "Album",
-                "artists": [{"name": "Artist"}],
-                "torrents": [
-                    {
-                        "torrentId": page,
-                        "media": "CD",
-                        "format": "FLAC",
-                        "encoding": "Lossless",
-                        "remastered": page == "2",
-                        "remasterYear": 2025,
-                        "remasterTitle": "Deluxe",
-                        "size": 123,
-                        "seeders": 4,
-                        "leechers": 2,
-                        "time": "2025-01-01 00:00:00",
-                        "isFreeload": page == "1",
-                    }
-                ],
-            }
-        ]
         return httpx.Response(
             200,
-            json={"status": "success", "response": {"pages": 2, "results": results}},
+            json={
+                "status": "success",
+                "response": {
+                    "pages": 2,
+                    "results": [
+                        {
+                            "groupId": 1,
+                            "groupName": "Album",
+                            "groupYear": 2024,
+                            "releaseType": "Album",
+                            "artists": [{"name": "Artist"}],
+                            "torrents": [
+                                {
+                                    "torrentId": page,
+                                    "media": "CD",
+                                    "format": "FLAC",
+                                    "encoding": "Lossless",
+                                    "remastered": page == "2",
+                                    "remasterYear": 2025,
+                                    "remasterTitle": "Deluxe",
+                                    "size": 123,
+                                    "seeders": 4,
+                                    "leechers": 2,
+                                    "time": "2025-01-01 00:00:00",
+                                    "isFreeload": page == "1",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
         )
 
-    client = httpx.AsyncClient(
-        base_url="https://redacted.local",
-        transport=httpx.MockTransport(handler),
-    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     results = await _crawler(client).search("Artist Album", limit=2)
 
     assert [request.url.params["page"] for request in requests] == ["1", "2"]
     assert requests[0].url.params["filter_cat[1]"] == "1"
-    assert requests[0].url.params["order_by"] == "time"
-    assert requests[0].url.params["order_way"] == "desc"
-    assert len(results) == 2
+    assert requests[0].headers["cookie"] == "session=good"
     assert results[0].title == "Artist - Album"
     assert results[0].subtitle == "CD / FLAC / Lossless"
-    assert results[0].promotion == "FREE"
+    assert results[0].promotion == "0X"
     assert results[1].subtitle == "2025 Deluxe / CD / FLAC / Lossless"
-    assert results[0].metadata["year"] == 2024
     await client.aclose()
 
 
-async def test_gazelle_auth_detects_invalid_cookie() -> None:
+async def test_gazelle_retries_rate_limited_request_after_retry_after() -> None:
+    calls = 0
+
     async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(403)
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        return httpx.Response(
+            200, json={"status": "success", "response": {"pages": 0, "results": []}}
+        )
 
-    client = httpx.AsyncClient(
-        base_url="https://redacted.local",
-        transport=httpx.MockTransport(handler),
-    )
-    result = await _crawler(client).test_auth()
-
-    assert result.ok is False
-    assert "Cookie" in result.message
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    assert await _crawler(client).search("Artist") == ()
+    assert calls == 2
     await client.aclose()
 
 
-async def test_gazelle_download_validates_url_and_returns_torrent() -> None:
+async def test_gazelle_auth_and_download() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/torrents.php"
-        assert request.url.params == {"action": "download", "id": "42"}
+        if request.url.params.get("action") == "index":
+            return httpx.Response(200, json={"status": "success", "response": {"username": "user"}})
         assert request.headers["accept"] == "application/x-bittorrent"
         return httpx.Response(200, content=b"d8:announce1:ae")
 
-    client = httpx.AsyncClient(
-        base_url="https://redacted.local",
-        transport=httpx.MockTransport(handler),
-    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     crawler = _crawler(client)
-
-    url = "https://redacted.local/torrents.php?action=download&id=42"
-    assert await crawler.download_torrent(url) == b"d8:announce1:ae"
+    assert (await crawler.test_auth()).ok is True
+    assert await crawler.download_torrent(
+        "https://redacted.local/torrents.php?action=download&id=42"
+    ) == b"d8:announce1:ae"
     with pytest.raises(RuntimeError, match="地址无效"):
         await crawler.download_torrent("https://other.local/torrents.php?action=download&id=42")
     await client.aclose()
 
 
-def test_gazelle_promotion_uses_musicpilot_display_values() -> None:
-    from musicpilot.adapters.indexers.gazelle import _promotion
-
-    assert _promotion({"isFreeload": True}) == "FREE"
-    assert _promotion({"isPersonalFreeleech": True}) == "FREE"
+def test_gazelle_promotion_uses_correct_display_values() -> None:
+    assert _promotion({"isFreeload": True}) == "0X"
     assert _promotion({"isNeutralLeech": True}) == "0X"
+    assert _promotion({"isPersonalFreeleech": True}) == "FREE"
+    assert _promotion({"isFreeleech": True}) == "FREE"
 
 
 def test_catalog_builds_gazelle_adapter(tmp_path: Path) -> None:

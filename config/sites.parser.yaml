@@ -72,11 +72,11 @@ sites:
     adapter: nexusphp
     parser:
       search_path: ajax.php
-      search_query_param: torrentname
+      search_query_param: searchstr
       search_params:
         section: torrents
         disablegrouping: "1"
-        action: advanced
+        action: basic
         searchtags: ""
         tags_type: "0"
         order_by: s3
