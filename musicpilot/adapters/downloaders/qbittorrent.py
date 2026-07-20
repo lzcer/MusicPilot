@@ -6,7 +6,22 @@ from pathlib import Path
 
 import httpx
 
-from musicpilot.ports.downloader import DownloadState, DownloadStatus, TorrentFile
+from musicpilot.ports.downloader import (
+    DownloadState,
+    DownloadStatus,
+    TorrentFile,
+)
+
+_COMPLETED_TORRENT_STATES = frozenset(
+    {
+        "forcedUP",
+        "pausedUP",
+        "queuedUP",
+        "stalledUP",
+        "stoppedUP",
+        "uploading",
+    }
+)
 
 
 class QBittorrentAuthError(RuntimeError):
@@ -155,7 +170,7 @@ class QBittorrentClient:
             return DownloadStatus(torrent_hash, "", DownloadState.FAILED, 0.0)
         item = items[0]
         progress = _optional_float(item.get("progress"))
-        state = DownloadState.COMPLETED if progress >= 1 else DownloadState.DOWNLOADING
+        state = _download_state(item, progress)
         save_path = item.get("save_path")
         content_path = item.get("content_path")
         return DownloadStatus(
@@ -215,7 +230,7 @@ class QBittorrentClient:
 def _status_from_item(item: dict[str, object]) -> DownloadStatus:
     torrent_hash = str(item.get("hash", ""))
     progress = _optional_float(item.get("progress"))
-    state = DownloadState.COMPLETED if progress >= 1 else DownloadState.DOWNLOADING
+    state = _download_state(item, progress)
     save_path = item.get("save_path")
     content_path = item.get("content_path")
     return DownloadStatus(
@@ -228,6 +243,13 @@ def _status_from_item(item: dict[str, object]) -> DownloadStatus:
         tags=_tags_from_item(item.get("tags")),
         size_bytes=_optional_int(item.get("total_size")),
     )
+
+
+def _download_state(item: dict[str, object], progress: float) -> DownloadState:
+    native_state = str(item.get("state", ""))
+    if progress >= 1 and native_state in _COMPLETED_TORRENT_STATES:
+        return DownloadState.COMPLETED
+    return DownloadState.DOWNLOADING
 
 
 def _file_from_item(item: dict[str, object]) -> TorrentFile:

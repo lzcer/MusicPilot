@@ -8378,7 +8378,7 @@ async def _poll_download_tasks_once(state: AppState) -> None:
             "progress": status.progress,
             "save_path": str(status.save_path) if status.save_path is not None else None,
         }
-        if status.progress >= 1:
+        if status.state == DownloadState.COMPLETED:
             changes.update({"status": "completed", "completed_at": datetime.now(UTC)})
         else:
             changes["status"] = "downloading"
