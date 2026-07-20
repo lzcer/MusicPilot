@@ -79,6 +79,7 @@ class QBittorrentClient:
         save_path = getattr(self, "download_path", "")
         if save_path:
             data["savepath"] = save_path
+            data["autoTMM"] = "false"
         response = await self._request(
             "POST",
             "/api/v2/torrents/add",
@@ -113,6 +114,7 @@ class QBittorrentClient:
         save_path = getattr(self, "download_path", "")
         if save_path:
             data["savepath"] = save_path
+            data["autoTMM"] = "false"
         response = await self._request(
             "POST",
             "/api/v2/torrents/add",
