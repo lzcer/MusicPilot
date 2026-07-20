@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
+from weakref import WeakValueDictionary
 
 from opencc import OpenCC
 
@@ -84,6 +85,20 @@ _AUDIO_EXTENSIONS = {
     ".opus",
     ".wav",
     ".wma",
+}
+
+_ALBUM_COVER_EXTENSION_PRIORITY = {
+    ".jpg": 0,
+    ".jpeg": 1,
+    ".png": 2,
+    ".webp": 3,
+    ".gif": 4,
+}
+_ALBUM_COVER_STEM_PRIORITY = {
+    "folder": 2,
+    "front": 3,
+    "album": 4,
+    "artwork": 5,
 }
 
 # Patterns for stripping noise from directory/filename metadata
@@ -250,6 +265,7 @@ class LocalMusicScraper:
         self.metadata = metadata
         self.tag_writer = tag_writer
         self.artist_service = artist_service
+        self._album_cover_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
     async def process_download(
         self,
@@ -373,6 +389,8 @@ class LocalMusicScraper:
             if on_file_result is not None:
                 await on_file_result(result)
 
+        await self._organize_album_covers(config, tuple(results))
+
         return ScrapingSummary(
             source_files=len(audio_files),
             mapped_files=mapped_files,
@@ -381,6 +399,92 @@ class LocalMusicScraper:
             failed_files=sum(1 for item in results if item.status == "failed"),
             results=tuple(results),
         )
+
+    async def _organize_album_covers(
+        self,
+        config: ScrapingConfig,
+        results: tuple[ScrapingFileResult, ...],
+    ) -> None:
+        if not config.auto_classify or config.classify_by not in {"album", "artist_album"}:
+            return
+
+        source_targets: dict[Path, set[Path]] = {}
+        for result in results:
+            if result.status != "success" or result.library_path is None:
+                continue
+            source_targets.setdefault(result.source_path.parent, set()).add(
+                result.library_path.parent
+            )
+
+        target_sources: dict[Path, set[Path]] = {}
+        for source_dir, target_dirs in source_targets.items():
+            if len(target_dirs) != 1:
+                logger.warning(
+                    "Album cover skipped for ambiguous source directory: source=%s, targets=%s",
+                    source_dir,
+                    sorted(str(item) for item in target_dirs),
+                )
+                continue
+            target_dir = next(iter(target_dirs))
+            target_sources.setdefault(target_dir, set()).add(source_dir)
+
+        for target_dir, source_dirs in sorted(
+            target_sources.items(),
+            key=lambda item: str(item[0]).casefold(),
+        ):
+            candidates: list[Path] = []
+            for source_dir in sorted(source_dirs, key=lambda item: str(item).casefold()):
+                try:
+                    candidates.extend(await asyncio.to_thread(_album_cover_candidates, source_dir))
+                except OSError as exc:
+                    logger.warning(
+                        "Album cover discovery failed: source=%s, error=%s",
+                        source_dir,
+                        exc,
+                    )
+            if not candidates:
+                continue
+
+            source_cover = min(candidates, key=_album_cover_sort_key)
+            lock_key = _album_cover_lock_key(target_dir)
+            lock = self._album_cover_locks.setdefault(lock_key, asyncio.Lock())
+            async with lock:
+                try:
+                    action, output_path, fallback_error = await asyncio.to_thread(
+                        _transfer_album_cover,
+                        source_cover,
+                        target_dir,
+                        config,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Album cover organization failed: source=%s, target_dir=%s, error=%s",
+                        source_cover,
+                        target_dir,
+                        exc,
+                    )
+                    continue
+                if action == "existing":
+                    logger.info(
+                        "Album cover skipped because target exists: source=%s, target=%s",
+                        source_cover,
+                        output_path,
+                    )
+                elif fallback_error is not None:
+                    logger.warning(
+                        "Album cover hardlink failed and copied instead: source=%s, "
+                        "target=%s, error=%s",
+                        source_cover,
+                        output_path,
+                        fallback_error,
+                    )
+                else:
+                    logger.info(
+                        "Album cover organized: source=%s, target=%s, action=%s",
+                        source_cover,
+                        output_path,
+                        action,
+                    )
 
     async def _preload_metadata_candidates(
         self,
@@ -1870,6 +1974,116 @@ def _metadata_field_text(field: RequiredMetadata) -> str:
     }[field]
 
 
+def _album_cover_candidates(source_dir: Path) -> tuple[Path, ...]:
+    if not source_dir.is_dir():
+        return ()
+    candidates = [
+        path
+        for path in source_dir.iterdir()
+        if path.is_file() and _album_cover_sort_key_or_none(path) is not None
+    ]
+    return tuple(sorted(candidates, key=_album_cover_sort_key))
+
+
+def _album_cover_lock_key(target_dir: Path) -> str:
+    return os.path.normcase(os.path.abspath(target_dir))
+
+
+def _album_cover_sort_key(path: Path) -> tuple[int, int, int, str]:
+    key = _album_cover_sort_key_or_none(path)
+    if key is None:
+        raise ValueError(f"Not an album cover candidate: {path}")
+    return key
+
+
+def _album_cover_sort_key_or_none(path: Path) -> tuple[int, int, int, str] | None:
+    extension_priority = _ALBUM_COVER_EXTENSION_PRIORITY.get(path.suffix.casefold())
+    if extension_priority is None:
+        return None
+
+    stem = path.stem.casefold()
+    if stem == "cover":
+        stem_priority = 0
+        number_priority = 0
+    elif stem.startswith("cover_") and stem[6:].isdigit():
+        stem_priority = 1
+        number_priority = int(stem[6:])
+    elif stem in _ALBUM_COVER_STEM_PRIORITY:
+        stem_priority = _ALBUM_COVER_STEM_PRIORITY[stem]
+        number_priority = 0
+    else:
+        return None
+    return (
+        stem_priority,
+        number_priority,
+        extension_priority,
+        str(path).casefold(),
+    )
+
+
+def _existing_album_cover(target_dir: Path) -> Path | None:
+    if not target_dir.is_dir():
+        return None
+    covers = sorted(
+        (
+            path
+            for path in target_dir.iterdir()
+            if path.is_file()
+            and path.stem.casefold() == "cover"
+            and path.suffix.casefold() in _ALBUM_COVER_EXTENSION_PRIORITY
+        ),
+        key=lambda path: str(path).casefold(),
+    )
+    return covers[0] if covers else None
+
+
+def _transfer_album_cover(
+    source_path: Path,
+    target_dir: Path,
+    config: ScrapingConfig,
+) -> tuple[str, Path, OSError | None]:
+    existing = _existing_album_cover(target_dir)
+    if existing is not None:
+        return "existing", existing, None
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / f"Cover{source_path.suffix}"
+    if config.mode == "mapped":
+        try:
+            os.link(source_path, target_path)
+            return "hardlink", target_path, None
+        except FileExistsError:
+            return "existing", target_path, None
+        except OSError as exc:
+            if not _copy_file_without_overwrite(source_path, target_path):
+                return "existing", target_path, None
+            return "copy", target_path, exc
+
+    if not _copy_file_without_overwrite(source_path, target_path):
+        return "existing", target_path, None
+    if config.mode == "source":
+        source_path.unlink()
+        _remove_empty_parents(source_path.parent, config)
+        return "move", target_path, None
+    return "copy", target_path, None
+
+
+def _copy_file_without_overwrite(source_path: Path, target_path: Path) -> bool:
+    target_created = False
+    try:
+        with source_path.open("rb") as source, target_path.open("xb") as target:
+            target_created = True
+            shutil.copyfileobj(source, target)
+        shutil.copystat(source_path, target_path)
+    except FileExistsError:
+        return False
+    except Exception:
+        if target_created:
+            target_path.unlink(missing_ok=True)
+        raise
+    return True
+
+
 def _copy_to_mapping(
     source_file: Path,
     config: ScrapingConfig,
@@ -2005,7 +2219,11 @@ def _remove_empty_parents(source_dir: Path, config: ScrapingConfig) -> None:
         except (OSError, PermissionError):
             break
         # Stop at the mapped/source root directory — don't remove it
-        root = config.mapped_directory or config.source_directory
+        root = (
+            config.mapped_directory
+            if config.mode in {"mapped", "copy"}
+            else config.source_directory
+        )
         if root and parent == root:
             break
         parent = parent.parent
