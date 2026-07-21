@@ -1,3 +1,4 @@
+from musicpilot.adapters.indexers.base_url import normalize_site_base_url
 from musicpilot.adapters.indexers.config import (
     ParserCatalog,
     ParserCatalogEntry,
@@ -21,5 +22,6 @@ __all__ = [
     "build_nexusphp_indexers",
     "load_merged_parser_catalog",
     "load_parser_catalog",
+    "normalize_site_base_url",
     "parser_config_from_mapping",
 ]

@@ -46,6 +46,7 @@ from musicpilot.adapters.indexers import (
     ParserCatalogEntry,
     build_indexers,
     load_merged_parser_catalog,
+    normalize_site_base_url,
 )
 from musicpilot.adapters.indexers.nexusphp import NexusPHPParserConfig
 from musicpilot.adapters.media_servers import build_media_server_client
@@ -1933,6 +1934,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/sites/test", response_model=TestResponse)
     async def test_site(payload: SiteCreateRequest) -> TestResponse:
+        payload = _normalize_site_request_or_422(payload)
         entry = _supported_indexer_or_422(state, payload.base_url)
         _validate_site_credentials(payload, entry)
         proxy_url = None
@@ -1954,6 +1956,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/sites", response_model=SiteResponse, status_code=201)
     async def create_site(payload: SiteCreateRequest) -> SiteResponse:
+        payload = _normalize_site_request_or_422(payload)
         entry = _supported_indexer_or_422(state, payload.base_url)
         _validate_site_credentials(payload, entry)
         try:
@@ -1977,6 +1980,7 @@ def create_app() -> FastAPI:
 
     @app.put("/api/sites/{site_id}", response_model=SiteResponse)
     async def update_site(site_id: str, payload: SiteCreateRequest) -> SiteResponse:
+        payload = _normalize_site_request_or_422(payload)
         entry = _supported_indexer_or_422(state, payload.base_url)
         _validate_site_credentials(payload, entry)
         try:
@@ -7147,7 +7151,7 @@ def _site_payload(site: IndexerSite) -> dict[str, object]:
     return {
         "id": site.id,
         "name": site.name,
-        "base_url": site.base_url,
+        "base_url": normalize_site_base_url(site.base_url),
         "cookie": site.cookie,
         "auth_type": site.auth_type,
         "api_key": site.api_key,
@@ -9911,6 +9915,14 @@ def _supported_indexer_or_422(state: AppState, base_url: str) -> ParserCatalogEn
             detail="当前站点暂不支持，请先在 sites.parser.yaml 中配置适配器。",
         )
     return entry
+
+
+def _normalize_site_request_or_422(payload: SiteCreateRequest) -> SiteCreateRequest:
+    try:
+        base_url = normalize_site_base_url(payload.base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return payload.model_copy(update={"base_url": base_url})
 
 
 def _supported_parser_or_422(state: AppState, base_url: str) -> NexusPHPParserConfig:

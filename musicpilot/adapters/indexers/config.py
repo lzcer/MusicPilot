@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 import yaml
 
+from musicpilot.adapters.indexers.base_url import normalize_site_base_url
 from musicpilot.adapters.indexers.mteam import MTeamCrawler, MTeamSiteConfig
 from musicpilot.adapters.indexers.nexusphp import (
     FieldRule,
@@ -146,7 +147,7 @@ def _site_config(raw: Any, entry: ParserCatalogEntry) -> NexusPHPSiteConfig:
     try:
         return NexusPHPSiteConfig(
             name=str(raw["name"]),
-            base_url=str(raw["base_url"]),
+            base_url=normalize_site_base_url(str(raw["base_url"])),
             cookie=str(raw["cookie"]) if raw.get("cookie") else None,
             site_id=str(raw["id"]) if raw.get("id") else None,
             parser=entry.parser,
@@ -163,7 +164,7 @@ def _mteam_site_config(raw: Any) -> MTeamSiteConfig:
     try:
         return MTeamSiteConfig(
             name=str(raw["name"]),
-            base_url=str(raw["base_url"]),
+            base_url=normalize_site_base_url(str(raw["base_url"])),
             api_key=str(raw["api_key"]).strip() if raw.get("api_key") else None,
             site_id=str(raw["id"]) if raw.get("id") else None,
             max_concurrency=int(raw.get("max_concurrency", 2)),
