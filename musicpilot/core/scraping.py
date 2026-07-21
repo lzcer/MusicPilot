@@ -16,6 +16,12 @@ from opencc import OpenCC
 
 from musicpilot.core.artist import ArtistService, split_artist_credit
 from musicpilot.core.metadata import MetadataCascade
+from musicpilot.core.track_variants import (
+    TrackVariantSignature,
+    build_track_variant_signature,
+    strong_variants_match,
+    variant_sort_score,
+)
 from musicpilot.ports.metadata import TrackMetadata
 from musicpilot.ports.tag_writer import TagWriter
 
@@ -153,6 +159,7 @@ class ScrapingConfig:
     auto_classify: bool = False
     classify_by: ClassifyBy = "artist"
     duplicate_handling: DuplicateHandling = "ignore"
+    track_version_control: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +252,19 @@ class _MatchScore:
     @property
     def total(self) -> int:
         return self.title + self.artist + self.album
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateScore:
+    base: _MatchScore
+    variant: int
+    collaboration: int
+    variants_match: bool
+    collaboration_matches: bool
+
+    @property
+    def ranking_total(self) -> int:
+        return self.base.total + self.variant + self.collaboration
 
 
 @dataclass(frozen=True, slots=True)
@@ -611,6 +631,8 @@ class LocalMusicScraper:
                 verification_reference,
                 cached_candidates,
                 artist_service=self.artist_service,
+                track_version_control=config.track_version_control,
+                reference_file=source_file,
             )
             candidates = cached_candidates
             if verified is None:
@@ -626,6 +648,8 @@ class LocalMusicScraper:
                     verification_reference,
                     candidates,
                     artist_service=self.artist_service,
+                    track_version_control=config.track_version_control,
+                    reference_file=source_file,
                 )
             return source_file, candidates, verified
         looked_up = await _select_metadata_candidate(
@@ -633,6 +657,8 @@ class LocalMusicScraper:
             cached_candidates,
             config.required_metadata,
             artist_service=self.artist_service,
+            track_version_control=config.track_version_control,
+            reference_file=source_file,
         )
         candidates = cached_candidates
         if looked_up is None:
@@ -647,6 +673,8 @@ class LocalMusicScraper:
                 online_candidates,
                 config.required_metadata,
                 artist_service=self.artist_service,
+                track_version_control=config.track_version_control,
+                reference_file=source_file,
             )
         if looked_up is None and not _same_metadata_match_key(
             match_metadata,
@@ -663,6 +691,8 @@ class LocalMusicScraper:
                 fallback_candidates,
                 config.required_metadata,
                 artist_service=self.artist_service,
+                track_version_control=config.track_version_control,
+                reference_file=source_file,
             )
         return source_file, candidates, looked_up
 
@@ -754,11 +784,15 @@ class LocalMusicScraper:
                 raw_dir_meta,
             )
             verification_reference = _identity_verification_reference(metadata)
+        input_variant_signature = _metadata_variant_signature(
+            match_metadata,
+            source_file=source_file,
+        )
         logger.info(
             "Scraping file input: source=%s, source_metadata=%s, dir_inferred=%s, "
             "match_metadata=%s, fallback_metadata=%s, scrape_fields=%s, "
             "missing_before=%s, cached_candidates=%s, forced_metadata=%s, "
-            "contextual_metadata=%s, verify_identity=%s",
+            "contextual_metadata=%s, verify_identity=%s, version=%s, version_evidence=%s",
             source_file,
             _metadata_log_text(source_metadata),
             _metadata_log_text(dir_meta),
@@ -772,6 +806,8 @@ class LocalMusicScraper:
                 contextual_metadata.metadata if contextual_metadata is not None else None
             ),
             requires_identity_verification,
+            _variant_signature_text(input_variant_signature),
+            _variant_evidence_text(input_variant_signature),
         )
         if forced_metadata is not None:
             metadata = _merge_metadata(source_metadata, forced_metadata)
@@ -811,10 +847,14 @@ class LocalMusicScraper:
                     verification_reference,
                     candidates,
                     artist_service=self.artist_service,
+                    track_version_control=config.track_version_control,
+                    reference_file=source_file,
                 )
             else:
                 verified, candidates = await self._verify_metadata_identity(
-                    verification_reference
+                    verification_reference,
+                    source_file=source_file,
+                    track_version_control=config.track_version_control,
                 )
             candidate_count = len(candidates)
             if verified is None:
@@ -822,6 +862,8 @@ class LocalMusicScraper:
                     verification_reference,
                     candidates,
                     artist_service=self.artist_service,
+                    track_version_control=config.track_version_control,
+                    reference_file=source_file,
                 )
                 logger.info(
                     "Scraping file result: source=%s, status=failed, "
@@ -880,6 +922,8 @@ class LocalMusicScraper:
                         config.required_metadata,
                         candidates,
                         artist_service=self.artist_service,
+                        track_version_control=config.track_version_control,
+                        reference_file=source_file,
                     )
                     logger.info(
                         "Scraping file result: source=%s, status=failed, "
@@ -920,6 +964,8 @@ class LocalMusicScraper:
                 cached_candidates,
                 config.required_metadata,
                 artist_service=self.artist_service,
+                track_version_control=config.track_version_control,
+                reference_file=source_file,
             )
             logger.info(
                 "Scraping cached candidate result: source=%s, selected=%s",
@@ -938,6 +984,8 @@ class LocalMusicScraper:
                     online_candidates,
                     config.required_metadata,
                     artist_service=self.artist_service,
+                    track_version_control=config.track_version_control,
+                    reference_file=source_file,
                 )
                 logger.info(
                     "Scraping online candidate result: source=%s, "
@@ -957,6 +1005,8 @@ class LocalMusicScraper:
                     fallback_candidates,
                     config.required_metadata,
                     artist_service=self.artist_service,
+                    track_version_control=config.track_version_control,
+                    reference_file=source_file,
                 )
                 candidates = (*candidates, *fallback_candidates)
                 candidate_reference = fallback_metadata
@@ -992,20 +1042,35 @@ class LocalMusicScraper:
                 else:
                     metadata = _merge_metadata(metadata, looked_up)
             missing_required = _missing_metadata_fields(metadata, config.required_metadata)
+            version_error = (
+                await _version_control_failure_text(
+                    candidate_reference,
+                    config.required_metadata,
+                    candidates,
+                    artist_service=self.artist_service,
+                    reference_file=source_file,
+                )
+                if looked_up is None and config.track_version_control
+                else None
+            )
             if looked_up is None:
-                if not missing_required:
+                if not missing_required and version_error is None:
                     metadata_gain = _filled_metadata_fields(
                         source_metadata,
                         metadata,
                         missing_before,
                     )
                 else:
-                    error_message = await _candidate_failure_message(
-                        candidate_reference,
-                        config.required_metadata,
-                        candidates,
-                        artist_service=self.artist_service,
-                    )
+                    error_message = version_error
+                    if error_message is None:
+                        error_message = await _candidate_failure_message(
+                            candidate_reference,
+                            config.required_metadata,
+                            candidates,
+                            artist_service=self.artist_service,
+                            track_version_control=config.track_version_control,
+                            reference_file=source_file,
+                        )
                     logger.info(
                         "Scraping file result: source=%s, status=failed, stage=%s, "
                         "metadata=%s, error=%s",
@@ -1037,6 +1102,8 @@ class LocalMusicScraper:
                     config.required_metadata,
                     candidates,
                     artist_service=self.artist_service,
+                    track_version_control=config.track_version_control,
+                    reference_file=source_file,
                 )
                 logger.info(
                     "Scraping file result: source=%s, status=failed, stage=%s, "
@@ -1118,6 +1185,8 @@ class LocalMusicScraper:
             _duplicate_metadata_candidates(source_metadata, match_metadata, metadata),
             (*library_tracks, *media_history),
             artist_service=self.artist_service,
+            track_version_control=config.track_version_control,
+            source_file=source_file,
         )
         duplicate = duplicate_match.track if duplicate_match is not None else None
         overwrite_duplicate = False
@@ -1256,7 +1325,7 @@ class LocalMusicScraper:
             metadata,
             config,
             classification_artist=classification_artist,
-            overwrite=True,
+            overwrite=not config.track_version_control or overwrite_duplicate,
         )
         final_file = final_result.path
         overwritten_existing_target = (
@@ -1316,12 +1385,17 @@ class LocalMusicScraper:
         reference: TrackMetadata,
         candidates: tuple[TrackMetadata, ...],
         required: tuple[RequiredMetadata, ...] = (),
+        *,
+        track_version_control: bool = False,
+        reference_file: Path | None = None,
     ) -> TrackMetadata | None:
         return await _select_metadata_candidate(
             reference,
             candidates,
             required,
             artist_service=self.artist_service,
+            track_version_control=track_version_control,
+            reference_file=reference_file,
         )
 
     async def metadata_candidate_failure_message(
@@ -1329,23 +1403,33 @@ class LocalMusicScraper:
         reference: TrackMetadata,
         candidates: tuple[TrackMetadata, ...],
         required: tuple[RequiredMetadata, ...] = (),
+        *,
+        track_version_control: bool = False,
+        reference_file: Path | None = None,
     ) -> str:
         return await _candidate_failure_message(
             reference,
             required,
             candidates,
             artist_service=self.artist_service,
+            track_version_control=track_version_control,
+            reference_file=reference_file,
         )
 
     async def _verify_metadata_identity(
         self,
         reference: TrackMetadata,
+        *,
+        source_file: Path | None = None,
+        track_version_control: bool = False,
     ) -> tuple[TrackMetadata | None, tuple[TrackMetadata, ...]]:
         candidates = await self._search_metadata_candidates(reference, reference, ())
         verified = await _select_identity_candidate(
             reference,
             candidates,
             artist_service=self.artist_service,
+            track_version_control=track_version_control,
+            reference_file=source_file,
         )
         return verified, candidates
 
@@ -1363,34 +1447,31 @@ class LocalMusicScraper:
             (match_metadata.title, match_metadata.artist),
             (source_metadata.title, source_metadata.artist),
         ]:
-            search_title = _metadata_search_title(title)
-            if not search_title:
-                continue
-            # Search with each alias of the artist
-            if self.artist_service is not None and artist:
-                aliases = await self.artist_service.get_aliases(artist)
-                for alias in aliases:
-                    query: tuple[str, str | None] = (search_title, alias)
+            for search_title in _metadata_search_titles(title):
+                # Search with each alias of the artist
+                if self.artist_service is not None and artist:
+                    aliases = await self.artist_service.get_aliases(artist)
+                    for alias in aliases:
+                        query: tuple[str, str | None] = (search_title, alias)
+                        if query not in seen_queries:
+                            seen_queries.add(query)
+                            searches.append(query)
+                else:
+                    query = (search_title, artist)
                     if query not in seen_queries:
                         seen_queries.add(query)
                         searches.append(query)
-            else:
-                query: tuple[str, str | None] = (search_title, artist)
-                if query not in seen_queries:
-                    seen_queries.add(query)
-                    searches.append(query)
 
         # Also add a pure title search as fallback
         for title in (match_metadata.title, source_metadata.title):
-            search_title = _metadata_search_title(title)
-            if search_title:
+            for search_title in _metadata_search_titles(title):
                 query = (search_title, None)
                 if query not in seen_queries:
                     seen_queries.add(query)
                     searches.append(query)
 
         candidates: list[TrackMetadata] = []
-        seen: set[tuple[str, str, str]] = set()
+        seen: set[tuple[object, ...]] = set()
         for title, artist in searches:
             if not title:
                 continue
@@ -1401,11 +1482,7 @@ class LocalMusicScraper:
                 limit=5,
             ):
                 for candidate in batch:
-                    key = (
-                        _normalize_match_text(candidate.title),
-                        _normalize_match_text(candidate.artist),
-                        _normalize_match_text(candidate.album),
-                    )
+                    key = _metadata_candidate_key(candidate)
                     if key in seen:
                         continue
                     seen.add(key)
@@ -1534,6 +1611,7 @@ def scraping_config_from_payload(payload: dict[str, object]) -> ScrapingConfig:
             else "artist"
         ),
         duplicate_handling=duplicate_handling,
+        track_version_control=bool(scraping.get("track_version_control")),
     )
 
 
@@ -2258,13 +2336,9 @@ def _duplicate_metadata_candidates(
     scraped_metadata: TrackMetadata,
 ) -> tuple[TrackMetadata, ...]:
     candidates: list[TrackMetadata] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[object, ...]] = set()
     for metadata in (source_metadata, match_metadata, scraped_metadata):
-        key = (
-            _normalize_match_text(metadata.title),
-            _normalize_match_text(metadata.artist),
-            _normalize_match_text(metadata.album),
-        )
+        key = _metadata_candidate_key(metadata)
         if not key[0] or key in seen:
             continue
         seen.add(key)
@@ -2276,14 +2350,10 @@ def _merge_metadata_candidates(
     *candidate_groups: tuple[TrackMetadata, ...],
 ) -> tuple[TrackMetadata, ...]:
     candidates: list[TrackMetadata] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[object, ...]] = set()
     for group in candidate_groups:
         for metadata in group:
-            key = (
-                _normalize_match_text(metadata.title),
-                _normalize_match_text(metadata.artist),
-                _normalize_match_text(metadata.album),
-            )
+            key = _metadata_candidate_key(metadata)
             if key in seen:
                 continue
             seen.add(key)
@@ -2296,17 +2366,48 @@ async def _find_duplicate_media(
     tracks: tuple[LibraryTrackSnapshot, ...],
     *,
     artist_service: ArtistService | None = None,
+    track_version_control: bool = False,
+    source_file: Path | None = None,
 ) -> _DuplicateMatch | None:
     best: _DuplicateMatch | None = None
     best_score = 0
     for metadata in candidates:
-        title = normalize_metadata_match_text(metadata.title)
+        metadata_signature = _metadata_variant_signature(metadata, source_file=source_file)
+        title = (
+            metadata_signature.normalized_base_title
+            if track_version_control
+            else normalize_metadata_match_text(metadata.title)
+        )
         artist = normalize_metadata_match_text(metadata.artist)
         album = normalize_metadata_match_text(metadata.album)
         if not title:
             continue
         for track in tracks:
-            if normalize_metadata_match_text(track.title) != title:
+            track_metadata = TrackMetadata(
+                title=track.title,
+                artist=track.artist,
+                album=track.album,
+            )
+            track_path = Path(track.path) if track.path else None
+            track_signature = _metadata_variant_signature(
+                track_metadata,
+                source_file=track_path,
+            )
+            track_title = (
+                track_signature.normalized_base_title
+                if track_version_control
+                else normalize_metadata_match_text(track.title)
+            )
+            if track_title != title:
+                continue
+            if track_version_control and (
+                not strong_variants_match(metadata_signature, track_signature)
+                or not await _collaboration_signatures_match(
+                    metadata_signature,
+                    track_signature,
+                    artist_service=artist_service,
+                )
+            ):
                 continue
             track_artist = normalize_metadata_match_text(track.artist)
             track_album = normalize_metadata_match_text(track.album)
@@ -2426,7 +2527,8 @@ def _scraping_config_log_text(config: ScrapingConfig) -> str:
         f"scrape_when_missing={config.scrape_when_missing}, "
         f"required_metadata={config.required_metadata}, "
         f"auto_rename={config.auto_rename}, auto_classify={config.auto_classify}, "
-        f"classify_by={config.classify_by!r}, duplicate_handling={config.duplicate_handling!r}"
+        f"classify_by={config.classify_by!r}, duplicate_handling={config.duplicate_handling!r}, "
+        f"track_version_control={config.track_version_control}"
         "}"
     )
 
@@ -2434,11 +2536,14 @@ def _scraping_config_log_text(config: ScrapingConfig) -> str:
 def _metadata_log_text(metadata: TrackMetadata | None) -> str:
     if metadata is None:
         return "None"
+    signature = _metadata_variant_signature(metadata)
     return (
         "{"
         f"title={metadata.title!r}, artist={metadata.artist!r}, album={metadata.album!r}, "
         f"year={metadata.year!r}, track_number={metadata.track_number!r}, "
         f"lyrics={bool(metadata.lyrics)}, cover_url={metadata.cover_url!r}, "
+        f"version={_variant_signature_text(signature)!r}, "
+        f"version_evidence={_variant_evidence_text(signature)!r}, "
         f"extra_keys={sorted(metadata.extra.keys()) if metadata.extra else []}"
         "}"
     )
@@ -2659,6 +2764,18 @@ def _metadata_search_title(title: str | None) -> str | None:
     return normalized.strip() or text
 
 
+def _metadata_search_titles(title: str | None) -> tuple[str, ...]:
+    values: list[str] = []
+    for item in (
+        title,
+        build_track_variant_signature(title=title).base_title,
+    ):
+        search_title = _metadata_search_title(item)
+        if search_title and search_title not in values:
+            values.append(search_title)
+    return tuple(values)
+
+
 def _strip_track_prefix(value: str) -> str:
     return re.sub(
         r"^\s*(?:(?:cd\s*)?\d{1,3}(?:[.\-_、\s]+))+",
@@ -2677,6 +2794,8 @@ async def _select_metadata_candidate(
     required: tuple[RequiredMetadata, ...],
     *,
     artist_service: ArtistService | None = None,
+    track_version_control: bool = False,
+    reference_file: Path | None = None,
 ) -> TrackMetadata | None:
     """Select the best metadata candidate using scoring.
 
@@ -2687,24 +2806,37 @@ async def _select_metadata_candidate(
     if not candidates:
         return None
 
-    scored: list[tuple[int, TrackMetadata]] = []
+    scored: list[tuple[_CandidateScore, TrackMetadata]] = []
     for candidate in candidates:
         if not _candidate_fills_required(existing, candidate, required):
             continue
-        score = await _metadata_match_score(existing, candidate, artist_service=artist_service)
-        scored.append((score.total, candidate))
+        score = await _candidate_match_score(
+            existing,
+            candidate,
+            artist_service=artist_service,
+            reference_file=reference_file,
+        )
+        if score.base.total < _MATCH_SCORE_THRESHOLD:
+            continue
+        if track_version_control and (
+            not score.variants_match or not score.collaboration_matches
+        ):
+            continue
+        scored.append((score, candidate))
 
     if not scored:
         return None
 
-    # Sort by score descending, then pick the best
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best_total, best_candidate = scored[0]
-
-    if best_total < _MATCH_SCORE_THRESHOLD:
-        return None
-
-    return best_candidate
+    scored.sort(
+        key=lambda item: (
+            item[0].ranking_total,
+            item[0].base.total,
+            item[0].base.title,
+            item[0].base.artist,
+        ),
+        reverse=True,
+    )
+    return scored[0][1]
 
 
 async def _select_identity_candidate(
@@ -2712,19 +2844,31 @@ async def _select_identity_candidate(
     candidates: tuple[TrackMetadata, ...],
     *,
     artist_service: ArtistService | None = None,
+    track_version_control: bool = False,
+    reference_file: Path | None = None,
 ) -> TrackMetadata | None:
-    best: tuple[int, TrackMetadata] | None = None
+    best: tuple[_CandidateScore, TrackMetadata] | None = None
     for candidate in candidates:
-        score = await _metadata_match_score(
+        score = await _candidate_match_score(
             reference,
             candidate,
             artist_service=artist_service,
+            reference_file=reference_file,
         )
-        if not _identity_score_is_trusted(reference, candidate, score):
+        if not _identity_score_is_trusted(reference, candidate, score.base):
             continue
-        total = score.total
-        if best is None or total > best[0]:
-            best = (total, candidate)
+        if track_version_control and (
+            not score.variants_match or not score.collaboration_matches
+        ):
+            continue
+        if best is None or (
+            score.ranking_total,
+            score.base.total,
+        ) > (
+            best[0].ranking_total,
+            best[0].base.total,
+        ):
+            best = (score, candidate)
     return best[1] if best is not None else None
 
 
@@ -2767,18 +2911,33 @@ async def _candidate_failure_message(
     candidates: tuple[TrackMetadata, ...],
     *,
     artist_service: ArtistService | None = None,
+    track_version_control: bool = False,
+    reference_file: Path | None = None,
 ) -> str:
+    if track_version_control:
+        version_failure = await _version_control_failure_text(
+            metadata,
+            required,
+            candidates,
+            artist_service=artist_service,
+            reference_file=reference_file,
+        )
+        if version_failure is not None:
+            return version_failure
     required_text = ", ".join(required) if required else "none"
     score_text = await _best_candidate_score_text(
         metadata,
         candidates,
         artist_service=artist_service,
+        reference_file=reference_file,
     )
     diagnostics_text = await _candidate_diagnostics_text(
         metadata,
         required,
         candidates,
         artist_service=artist_service,
+        track_version_control=track_version_control,
+        reference_file=reference_file,
     )
     return (
         "未找到可信的刮削候选。"
@@ -2793,17 +2952,33 @@ async def _identity_verification_failure_message(
     candidates: tuple[TrackMetadata, ...],
     *,
     artist_service: ArtistService | None = None,
+    track_version_control: bool = False,
+    reference_file: Path | None = None,
 ) -> str:
+    if track_version_control:
+        version_failure = await _version_control_failure_text(
+            metadata,
+            (),
+            candidates,
+            artist_service=artist_service,
+            reference_file=reference_file,
+            identity_verification=True,
+        )
+        if version_failure is not None:
+            return version_failure
     score_text = await _best_candidate_score_text(
         metadata,
         candidates,
         artist_service=artist_service,
+        reference_file=reference_file,
     )
     diagnostics_text = await _candidate_diagnostics_text(
         metadata,
         (),
         candidates,
         artist_service=artist_service,
+        track_version_control=track_version_control,
+        reference_file=reference_file,
     )
     return (
         "本地推断元数据未通过联网校验。"
@@ -2813,25 +2988,91 @@ async def _identity_verification_failure_message(
     )
 
 
+async def _version_control_failure_text(
+    metadata: TrackMetadata,
+    required: tuple[RequiredMetadata, ...],
+    candidates: tuple[TrackMetadata, ...],
+    *,
+    artist_service: ArtistService | None,
+    reference_file: Path | None,
+    identity_verification: bool = False,
+) -> str | None:
+    rejected: list[tuple[_CandidateScore, TrackMetadata]] = []
+    for candidate in candidates:
+        if not _candidate_fills_required(metadata, candidate, required):
+            continue
+        score = await _candidate_match_score(
+            metadata,
+            candidate,
+            artist_service=artist_service,
+            reference_file=reference_file,
+        )
+        trusted = (
+            _identity_score_is_trusted(metadata, candidate, score.base)
+            if identity_verification
+            else score.base.total >= _MATCH_SCORE_THRESHOLD
+        )
+        if not trusted:
+            continue
+        if score.variants_match and score.collaboration_matches:
+            return None
+        rejected.append((score, candidate))
+    if not rejected:
+        return None
+    rejected.sort(key=lambda item: item[0].base.total, reverse=True)
+    best_score, best_candidate = rejected[0]
+    reference_signature = _metadata_variant_signature(metadata, source_file=reference_file)
+    candidate_signature = _metadata_variant_signature(best_candidate)
+    if all(score.variants_match for score, _candidate in rejected):
+        return (
+            "未找到合作艺人一致的刮削候选。"
+            f"参考版本={_variant_signature_text(reference_signature)}，"
+            f"参考证据={_variant_evidence_text(reference_signature)}，"
+            f"最佳候选={best_candidate.title!r}/{best_candidate.artist!r}，"
+            f"候选版本={_variant_signature_text(candidate_signature)}，"
+            f"已排除候选={len(rejected)}。"
+        )
+    return (
+        "未找到版本一致的刮削候选。"
+        f"参考版本={_variant_signature_text(reference_signature)}，"
+        f"参考证据={_variant_evidence_text(reference_signature)}，"
+        f"最佳候选={best_candidate.title!r}/{best_candidate.artist!r}/"
+        f"{best_candidate.album!r}，"
+        f"候选版本={_variant_signature_text(candidate_signature)}，"
+        f"已排除候选={len(rejected)}，base_score={best_score.base.total}。"
+    )
+
+
 async def _best_candidate_score_text(
     metadata: TrackMetadata,
     candidates: tuple[TrackMetadata, ...],
     *,
     artist_service: ArtistService | None = None,
+    reference_file: Path | None = None,
 ) -> str:
     best_candidate = None
-    best_score = _MatchScore()
+    best_score: _CandidateScore | None = None
     for candidate in candidates:
-        score = await _metadata_match_score(metadata, candidate, artist_service=artist_service)
-        if score.total > best_score.total:
+        score = await _candidate_match_score(
+            metadata,
+            candidate,
+            artist_service=artist_service,
+            reference_file=reference_file,
+        )
+        if best_score is None or score.ranking_total > best_score.ranking_total:
             best_candidate = candidate
             best_score = score
-    if best_candidate is None:
+    if best_candidate is None or best_score is None:
         return ""
+    candidate_signature = _metadata_variant_signature(best_candidate)
     return (
         f", best={best_candidate.title!r}/{best_candidate.artist!r}/"
-        f"{best_candidate.album!r}, score={best_score.total}"
-        f"(title={best_score.title}, artist={best_score.artist}, album={best_score.album})"
+        f"{best_candidate.album!r}, score={best_score.ranking_total}"
+        f"(base={best_score.base.total}, title={best_score.base.title}, "
+        f"artist={best_score.base.artist}, album={best_score.base.album}, "
+        f"variant={best_score.variant}, collaboration={best_score.collaboration}, "
+        f"candidate_version={_variant_signature_text(candidate_signature)}, "
+        f"candidate_evidence={_variant_evidence_text(candidate_signature)})"
     )
 
 
@@ -2841,12 +3082,19 @@ async def _candidate_diagnostics_text(
     candidates: tuple[TrackMetadata, ...],
     *,
     artist_service: ArtistService | None = None,
+    track_version_control: bool = False,
+    reference_file: Path | None = None,
 ) -> str:
     if not candidates:
         return ""
     items: list[str] = []
     for index, candidate in enumerate(candidates[:5], start=1):
-        score = await _metadata_match_score(metadata, candidate, artist_service=artist_service)
+        score = await _candidate_match_score(
+            metadata,
+            candidate,
+            artist_service=artist_service,
+            reference_file=reference_file,
+        )
         missing = _candidate_missing_required(metadata, candidate, required)
         album_mismatch = _candidate_has_conflicting_album(metadata, candidate)
         reasons: list[str] = []
@@ -2854,13 +3102,21 @@ async def _candidate_diagnostics_text(
             reasons.append(f"missing={','.join(missing)}")
         if album_mismatch:
             reasons.append("album_mismatch")
-        if score.total < _MATCH_SCORE_THRESHOLD:
+        if score.base.total < _MATCH_SCORE_THRESHOLD:
             reasons.append(f"score_below_threshold={_MATCH_SCORE_THRESHOLD}")
+        if track_version_control and not score.variants_match:
+            reasons.append("version_mismatch")
+        if track_version_control and not score.collaboration_matches:
+            reasons.append("collaboration_mismatch")
         reason_text = ";".join(reasons) if reasons else "eligible"
+        candidate_signature = _metadata_variant_signature(candidate)
         items.append(
             f"#{index}:{candidate.title!r}/{candidate.artist!r}/{candidate.album!r} "
-            f"score={score.total}(title={score.title},artist={score.artist},album={score.album}) "
-            f"{reason_text}"
+            f"score={score.ranking_total}(base={score.base.total},title={score.base.title},"
+            f"artist={score.base.artist},album={score.base.album},variant={score.variant},"
+            f"collaboration={score.collaboration},"
+            f"version={_variant_signature_text(candidate_signature)},"
+            f"evidence={_variant_evidence_text(candidate_signature)}) {reason_text}"
         )
     suffix = "" if len(candidates) <= 5 else f"; ... +{len(candidates) - 5} more"
     return f", diagnostics=[{'; '.join(items)}{suffix}]"
@@ -2880,13 +3136,175 @@ def _candidate_missing_required(
     return tuple(missing)
 
 
+async def _candidate_match_score(
+    existing: TrackMetadata,
+    candidate: TrackMetadata,
+    *,
+    artist_service: ArtistService | None = None,
+    reference_file: Path | None = None,
+) -> _CandidateScore:
+    base_score = await _metadata_match_score(
+        existing,
+        candidate,
+        artist_service=artist_service,
+    )
+    reference_signature = _metadata_variant_signature(existing, source_file=reference_file)
+    candidate_signature = _metadata_variant_signature(candidate)
+    collaboration_matches = await _collaboration_signatures_match(
+        reference_signature,
+        candidate_signature,
+        artist_service=artist_service,
+    )
+    collaboration_score = (
+        1
+        if not reference_signature.collaboration and not candidate_signature.collaboration
+        else 3
+        if collaboration_matches
+        else -3
+    )
+    return _CandidateScore(
+        base=base_score,
+        variant=variant_sort_score(reference_signature, candidate_signature),
+        collaboration=collaboration_score,
+        variants_match=strong_variants_match(reference_signature, candidate_signature),
+        collaboration_matches=collaboration_matches,
+    )
+
+
+async def _collaboration_signatures_match(
+    left: TrackVariantSignature,
+    right: TrackVariantSignature,
+    *,
+    artist_service: ArtistService | None = None,
+) -> bool:
+    if left.collaboration != right.collaboration:
+        return False
+    if not left.collaboration:
+        return True
+    if (
+        len(left.artist_credits) < 2
+        or len(right.artist_credits) < 2
+        or len(left.artist_credits) != len(right.artist_credits)
+    ):
+        return False
+    unmatched = list(right.artist_credits)
+    for left_artist in left.artist_credits:
+        match_index = None
+        for index, right_artist in enumerate(unmatched):
+            if await _artist_credit_exact_match(
+                left_artist,
+                right_artist,
+                artist_service=artist_service,
+            ):
+                match_index = index
+                break
+        if match_index is None:
+            return False
+        unmatched.pop(match_index)
+    return not unmatched
+
+
+async def _artist_credit_exact_match(
+    left: str,
+    right: str,
+    *,
+    artist_service: ArtistService | None,
+) -> bool:
+    left_values = {_normalize_match_text(left)}
+    right_values = {_normalize_match_text(right)}
+    if artist_service is not None:
+        left_canonical, right_canonical = await asyncio.gather(
+            artist_service.get_canonical_name(left),
+            artist_service.get_canonical_name(right),
+        )
+        left_aliases, right_aliases = await asyncio.gather(
+            artist_service.get_aliases(left),
+            artist_service.get_aliases(right),
+        )
+        left_values.update(
+            _normalize_match_text(item)
+            for item in (*left_aliases, left_canonical)
+            if item
+        )
+        right_values.update(
+            _normalize_match_text(item)
+            for item in (*right_aliases, right_canonical)
+            if item
+        )
+    left_values.discard("")
+    right_values.discard("")
+    return bool(left_values & right_values)
+
+
+def _metadata_variant_signature(
+    metadata: TrackMetadata,
+    *,
+    source_file: Path | None = None,
+) -> TrackVariantSignature:
+    directories: tuple[Path, ...] = ()
+    if source_file is not None:
+        directories = tuple(
+            path
+            for path in (source_file.parent, source_file.parent.parent)
+            if path.name
+        )
+    return build_track_variant_signature(
+        title=metadata.title,
+        artist=metadata.artist,
+        album=metadata.album,
+        file_name=source_file.name if source_file is not None else None,
+        directories=directories,
+    )
+
+
+def _metadata_candidate_key(metadata: TrackMetadata) -> tuple[object, ...]:
+    signature = _metadata_variant_signature(metadata)
+    return (
+        signature.normalized_base_title,
+        signature.artist_credit_keys
+        or ((_normalize_match_text(metadata.artist),) if metadata.artist else ()),
+        _normalize_match_text(metadata.album),
+        tuple(sorted(signature.strong_variants)),
+        signature.collaboration,
+    )
+
+
+def _variant_signature_text(signature: TrackVariantSignature) -> str:
+    labels = {
+        "live": "Live",
+        "remix": "Remix",
+        "acoustic": "Acoustic",
+        "instrumental": "Instrumental",
+        "karaoke": "Karaoke",
+        "demo": "Demo",
+    }
+    variants = "+".join(
+        labels[item] for item in sorted(signature.strong_variants)
+    ) or "普通版"
+    if not signature.collaboration:
+        return variants
+    artists = "/".join(signature.artist_credits) or "unknown"
+    return f"{variants};feat={artists}"
+
+
+def _variant_evidence_text(signature: TrackVariantSignature) -> str:
+    if not signature.evidence:
+        return "none"
+    return "|".join(
+        f"{item.source}:{item.strength}:{item.variant}:{item.raw_value}"
+        for item in signature.evidence
+    )
+
+
 async def _metadata_match_score(
     existing: TrackMetadata,
     scraped: TrackMetadata,
     *,
     artist_service: ArtistService | None = None,
 ) -> _MatchScore:
-    title_score = _match_score(existing.title, scraped.title)
+    existing_title = _metadata_variant_signature(existing).base_title
+    scraped_title = _metadata_variant_signature(scraped).base_title
+    title_score = _match_score(existing_title, scraped_title)
     artist_score = await _match_artist_with_aliases(
         existing.artist,
         scraped.artist,

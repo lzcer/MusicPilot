@@ -96,6 +96,11 @@ from musicpilot.core.task_queue import (
     TaskExecutorRegistry,
     TaskManager,
 )
+from musicpilot.core.track_variants import (
+    TrackVariantSignature,
+    build_track_variant_signature,
+    strong_variants_match,
+)
 from musicpilot.infra.api.schemas import (
     AboutResponse,
     AddArtistAliasRequest,
@@ -535,6 +540,11 @@ class SearchMediaExecutor:
         payload = getattr(task, "payload", {}) or {}
         query = str(payload.get("query") or "")
         artist = _optional_string(payload.get("artist"))
+        track_version_control = (
+            bool(payload.get("track_version_control"))
+            if "track_version_control" in payload
+            else await _track_version_control_enabled(self.state)
+        )
         limit = _optional_int(payload.get("limit")) or 10
         page_size = _optional_int(payload.get("page_size"))
         if page_size is not None:
@@ -545,6 +555,7 @@ class SearchMediaExecutor:
                 artist=artist,
                 page_size=page_size,
                 offset=offset,
+                track_version_control=track_version_control,
             )
             return TaskExecutionResult(
                 result={
@@ -553,7 +564,13 @@ class SearchMediaExecutor:
                     "has_more": has_more,
                 }
             )
-        aggregated = await _search_media_candidates_direct(self.state, query, limit, artist=artist)
+        aggregated = await _search_media_candidates_direct(
+            self.state,
+            query,
+            limit,
+            artist=artist,
+            track_version_control=track_version_control,
+        )
         return TaskExecutionResult(
             result={"candidates": [item.model_dump() for item in aggregated]}
         )
@@ -2058,9 +2075,34 @@ def create_app() -> FastAPI:
     async def _save_system_settings(
         payload: SystemSettingsRequest,
     ) -> SystemSettingsResponse:
+        previous_settings = await state.repository.get_system_settings()
+        previous_version_control = scraping_config_from_payload(
+            previous_settings
+        ).track_version_control
         settings_payload = await state.repository.update_system_settings(payload.model_dump())
         await state.reload_bots()
         await state.reload_notifiers()
+        current_version_control = scraping_config_from_payload(
+            settings_payload
+        ).track_version_control
+        if previous_version_control != current_version_control:
+            try:
+                updated = await _refresh_playlist_library_matches(
+                    state,
+                    track_version_control=current_version_control,
+                )
+                state.add_log(
+                    "playlist",
+                    "Playlist library matches refreshed after track version control change: "
+                    f"enabled={current_version_control}, updated={updated}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                state.add_log(
+                    "playlist",
+                    "Playlist library match refresh after track version control change failed: "
+                    f"{exc}",
+                    "WARNING",
+                )
         state.add_log("settings", "System settings saved")
         return SystemSettingsResponse(**settings_payload)
 
@@ -2550,15 +2592,35 @@ def create_app() -> FastAPI:
         if not title:
             raise HTTPException(status_code=422, detail="歌名不能为空。")
         artist = _optional_string(payload.artist)
+        album = _optional_string(payload.album)
         try:
+            track_version_control = await _track_version_control_enabled(state)
             library_tracks = await state.repository.list_music_library_tracks()
-            normalized_title = normalize_metadata_match_text(title)
+            normalized_title = _library_match_title_key(
+                title,
+                artist,
+                album,
+                track_version_control=track_version_control,
+            )
             candidates = [
                 item
                 for item in library_tracks
-                if normalize_metadata_match_text(item.title) == normalized_title
+                if _library_match_title_key(
+                    item.title,
+                    item.artist,
+                    item.album,
+                    track_version_control=track_version_control,
+                )
+                == normalized_title
             ]
-            match = await _match_library_track(state, title, artist, candidates)
+            match = await _match_library_track(
+                state,
+                title,
+                artist,
+                candidates,
+                album=album,
+                track_version_control=track_version_control,
+            )
         except Exception as exc:  # noqa: BLE001
             state.add_log(
                 "playlist",
@@ -2576,7 +2638,7 @@ def create_app() -> FastAPI:
             track_id,
             title=title,
             artist=artist,
-            album=_optional_string(payload.album),
+            album=album,
             exists_in_library=exists_in_library,
             matched_library_track_id=match.id if match is not None else None,
             download_status=download_status,
@@ -3860,23 +3922,36 @@ def _spotify_artists(value: object) -> str | None:
 async def _refresh_playlist_library_matches(
     state: AppState,
     playlist_id: int | None = None,
+    *,
+    track_version_control: bool | None = None,
 ) -> int:
+    if track_version_control is None:
+        track_version_control = await _track_version_control_enabled(state)
     library_tracks = await state.repository.list_music_library_tracks()
     playlist_tracks = (
         await state.repository.list_playlist_tracks(playlist_id)
         if playlist_id is not None
         else await state.repository.list_all_playlist_tracks()
     )
-    library_tracks_by_title = _music_library_tracks_by_normalized_title(library_tracks)
+    library_tracks_by_title = _music_library_tracks_by_normalized_title(
+        library_tracks,
+        track_version_control=track_version_control,
+    )
     artist_values_cache: dict[str, set[str]] = {}
     updated = 0
     for track in playlist_tracks:
-        normalized_title = normalize_metadata_match_text(track.title)
+        normalized_title = _library_match_title_key(
+            track.title,
+            track.artist,
+            track.album,
+            track_version_control=track_version_control,
+        )
         refreshed = await _apply_playlist_track_library_match(
             state,
             track,
             library_tracks_by_title.get(normalized_title, ()),
             artist_values_cache=artist_values_cache,
+            track_version_control=track_version_control,
         )
         updated += int(refreshed is not None)
     return updated
@@ -3887,15 +3962,26 @@ async def _refresh_playlist_matches_for_library_changes(
     *,
     changed_track_ids: Iterable[int],
     deleted_track_ids: Iterable[int],
+    track_version_control: bool | None = None,
 ) -> int:
+    if track_version_control is None:
+        track_version_control = await _track_version_control_enabled(state)
     changed_ids = set(changed_track_ids)
     deleted_ids = set(deleted_track_ids)
     if not changed_ids and not deleted_ids:
         return 0
     library_tracks = await state.repository.list_music_library_tracks()
-    library_tracks_by_title = _music_library_tracks_by_normalized_title(library_tracks)
+    library_tracks_by_title = _music_library_tracks_by_normalized_title(
+        library_tracks,
+        track_version_control=track_version_control,
+    )
     changed_title_values = {
-        normalize_metadata_match_text(track.title)
+        _library_match_title_key(
+            track.title,
+            track.artist,
+            track.album,
+            track_version_control=track_version_control,
+        )
         for track in library_tracks
         if track.id in changed_ids
     }
@@ -3904,17 +3990,29 @@ async def _refresh_playlist_matches_for_library_changes(
         track.id: track
         for track in playlist_tracks
         if track.matched_library_track_id in changed_ids | deleted_ids
-        or normalize_metadata_match_text(track.title) in changed_title_values
+        or _library_match_title_key(
+            track.title,
+            track.artist,
+            track.album,
+            track_version_control=track_version_control,
+        )
+        in changed_title_values
     }
     artist_values_cache: dict[str, set[str]] = {}
     updated = 0
     for track in affected_tracks.values():
-        normalized_title = normalize_metadata_match_text(track.title)
+        normalized_title = _library_match_title_key(
+            track.title,
+            track.artist,
+            track.album,
+            track_version_control=track_version_control,
+        )
         refreshed = await _apply_playlist_track_library_match(
             state,
             track,
             library_tracks_by_title.get(normalized_title, ()),
             artist_values_cache=artist_values_cache,
+            track_version_control=track_version_control,
         )
         updated += int(refreshed is not None)
     return updated
@@ -3922,10 +4020,17 @@ async def _refresh_playlist_matches_for_library_changes(
 
 def _music_library_tracks_by_normalized_title(
     library_tracks: Iterable[MusicLibraryTrack],
+    *,
+    track_version_control: bool = False,
 ) -> dict[str, tuple[MusicLibraryTrack, ...]]:
     grouped: dict[str, list[MusicLibraryTrack]] = {}
     for track in library_tracks:
-        normalized_title = normalize_metadata_match_text(track.title)
+        normalized_title = _library_match_title_key(
+            track.title,
+            track.artist,
+            track.album,
+            track_version_control=track_version_control,
+        )
         if normalized_title:
             grouped.setdefault(normalized_title, []).append(track)
     return {title: tuple(tracks) for title, tracks in grouped.items()}
@@ -3937,13 +4042,16 @@ async def _apply_playlist_track_library_match(
     library_tracks: Iterable[MusicLibraryTrack],
     *,
     artist_values_cache: dict[str, set[str]] | None = None,
+    track_version_control: bool = False,
 ) -> PlaylistTrack | None:
     match = await _match_library_track(
         state,
         track.title,
         track.artist,
         list(library_tracks),
+        album=track.album,
         artist_values_cache=artist_values_cache,
+        track_version_control=track_version_control,
     )
     exists = match is not None
     matched_library_track_id = match.id if match is not None else None
@@ -3989,23 +4097,130 @@ async def _match_library_track(
     artist: str | None,
     library_tracks: list[MusicLibraryTrack],
     *,
+    album: str | None = None,
     artist_values_cache: dict[str, set[str]] | None = None,
+    track_version_control: bool = False,
 ) -> MusicLibraryTrack | None:
-    normalized_title = normalize_metadata_match_text(title)
+    normalized_title = _library_match_title_key(
+        title,
+        artist,
+        album,
+        track_version_control=track_version_control,
+    )
+    target_signature = _library_match_signature(title, artist, album)
     target_artists = await _artist_credit_match_values_cached(state, artist, artist_values_cache)
     if not normalized_title:
         return None
     for item in library_tracks:
-        if normalize_metadata_match_text(item.title) != normalized_title:
+        if (
+            _library_match_title_key(
+                item.title,
+                item.artist,
+                item.album,
+                track_version_control=track_version_control,
+            )
+            != normalized_title
+        ):
             continue
         item_artists = await _artist_credit_match_values_cached(
             state,
             item.artist,
             artist_values_cache,
         )
-        if not target_artists or _artist_value_sets_match(item_artists, target_artists):
-            return item
+        if target_artists and not _artist_value_sets_match(item_artists, target_artists):
+            continue
+        if track_version_control:
+            item_signature = _library_match_signature(
+                item.title,
+                item.artist,
+                item.album,
+                path=item.path,
+            )
+            if not strong_variants_match(target_signature, item_signature):
+                continue
+            if not await _library_collaboration_signatures_match(
+                state,
+                target_signature,
+                item_signature,
+                artist_values_cache=artist_values_cache,
+            ):
+                continue
+        return item
     return None
+
+
+def _library_match_signature(
+    title: str | None,
+    artist: str | None,
+    album: str | None,
+    *,
+    path: str | None = None,
+) -> TrackVariantSignature:
+    library_path = Path(path) if path else None
+    return build_track_variant_signature(
+        title=title,
+        artist=artist,
+        album=album,
+        file_name=library_path.name if library_path is not None else None,
+        directories=(library_path.parent,) if library_path is not None else (),
+    )
+
+
+def _library_match_title_key(
+    title: str | None,
+    artist: str | None,
+    album: str | None,
+    *,
+    track_version_control: bool,
+) -> str:
+    if not track_version_control:
+        return normalize_metadata_match_text(title)
+    return _library_match_signature(title, artist, album).normalized_base_title
+
+
+async def _library_collaboration_signatures_match(
+    state: AppState,
+    left: TrackVariantSignature,
+    right: TrackVariantSignature,
+    *,
+    artist_values_cache: dict[str, set[str]] | None,
+) -> bool:
+    if left.collaboration != right.collaboration:
+        return False
+    if not left.collaboration:
+        return True
+    if (
+        len(left.artist_credits) < 2
+        or len(right.artist_credits) < 2
+        or len(left.artist_credits) != len(right.artist_credits)
+    ):
+        return False
+    unmatched = list(right.artist_credits)
+    for left_artist in left.artist_credits:
+        left_values = await _artist_credit_match_values_cached(
+            state,
+            left_artist,
+            artist_values_cache,
+        )
+        match_index = None
+        for index, right_artist in enumerate(unmatched):
+            right_values = await _artist_credit_match_values_cached(
+                state,
+                right_artist,
+                artist_values_cache,
+            )
+            if left_values & right_values:
+                match_index = index
+                break
+        if match_index is None:
+            return False
+        unmatched.pop(match_index)
+    return not unmatched
+
+
+async def _track_version_control_enabled(state: AppState) -> bool:
+    settings = await state.repository.get_system_settings()
+    return scraping_config_from_payload(settings).track_version_control
 
 
 async def _match_active_download_task_item(
@@ -4277,7 +4492,15 @@ async def _check_and_download_playlist_track(
     state.add_log("playlist", f"Playlist track processing: {_playlist_track_log_text(track)}")
 
     library_tracks = await state.repository.list_music_library_tracks()
-    match = await _match_library_track(state, track.title, track.artist, library_tracks)
+    track_version_control = await _track_version_control_enabled(state)
+    match = await _match_library_track(
+        state,
+        track.title,
+        track.artist,
+        library_tracks,
+        album=track.album,
+        track_version_control=track_version_control,
+    )
     if match is not None:
         await state.repository.update_playlist_track(
             track.id,
@@ -5115,6 +5338,7 @@ async def _search_media_candidate_page(
     log_category: str,
 ) -> tuple[list[MediaCandidateResponse], int | None, bool]:
     page_size = 100
+    track_version_control = await _track_version_control_enabled(state)
     task_id = await state.task_manager.enqueue(
         TaskCreate(
             task_type="SEARCH_MEDIA",
@@ -5125,6 +5349,7 @@ async def _search_media_candidate_page(
                 "page_size": page_size,
                 "offset": offset,
                 "log_category": log_category,
+                "track_version_control": track_version_control,
             },
         )
     )
@@ -5137,7 +5362,11 @@ async def _search_media_candidate_page(
         if not isinstance(item, dict):
             continue
         candidates.append(MediaCandidateResponse(**item))
-    candidates = await _add_media_candidate_library_status(state, candidates)
+    candidates = await _add_media_candidate_library_status(
+        state,
+        candidates,
+        track_version_control=track_version_control,
+    )
     next_offset = _optional_int(result.get("next_offset"))
     has_more = bool(result.get("has_more")) and next_offset is not None
     return candidates, next_offset, has_more
@@ -5150,6 +5379,7 @@ async def _search_media_candidate_page_direct(
     artist: str | None = None,
     page_size: int = 100,
     offset: int = 0,
+    track_version_control: bool = False,
 ) -> tuple[list[MediaCandidateResponse], int | None, bool]:
     for provider in state.metadata.providers:
         search_page = getattr(provider, "search_page", None)
@@ -5165,7 +5395,11 @@ async def _search_media_candidate_page_direct(
         except Exception as exc:  # noqa: BLE001
             state.add_log("metadata", f"Metadata provider failed: {exc}", "WARNING")
             continue
-        aggregated = _aggregate_media_candidates(list(page.candidates), limit=None)
+        aggregated = _aggregate_media_candidates(
+            list(page.candidates),
+            limit=None,
+            track_version_control=track_version_control,
+        )
         return aggregated, page.next_offset, page.has_more
     return [], None, False
 
@@ -5179,6 +5413,7 @@ async def _search_media_candidates(
     log_category: str,
     use_task_manager: bool = True,
 ) -> list[MediaCandidateResponse]:
+    track_version_control = await _track_version_control_enabled(state)
     if not use_task_manager:
         candidates = await state.task_manager.run_exclusive(
             task_type="SEARCH_MEDIA",
@@ -5189,10 +5424,20 @@ async def _search_media_candidates(
                 "limit": limit,
                 "log_category": log_category,
             },
-            runner=lambda: _search_media_candidates_direct(state, query, limit, artist=artist),
+            runner=lambda: _search_media_candidates_direct(
+                state,
+                query,
+                limit,
+                artist=artist,
+                track_version_control=track_version_control,
+            ),
             wait_log_message="Playlist metadata search waiting for media-search resource.",
         )
-        return await _add_media_candidate_library_status(state, candidates)
+        return await _add_media_candidate_library_status(
+            state,
+            candidates,
+            track_version_control=track_version_control,
+        )
     task_id = await state.task_manager.enqueue(
         TaskCreate(
             task_type="SEARCH_MEDIA",
@@ -5202,6 +5447,7 @@ async def _search_media_candidates(
                 "artist": artist,
                 "limit": limit,
                 "log_category": log_category,
+                "track_version_control": track_version_control,
             },
         )
     )
@@ -5213,7 +5459,11 @@ async def _search_media_candidates(
         if not isinstance(item, dict):
             continue
         candidates.append(MediaCandidateResponse(**item))
-    return await _add_media_candidate_library_status(state, candidates)
+    return await _add_media_candidate_library_status(
+        state,
+        candidates,
+        track_version_control=track_version_control,
+    )
 
 
 async def _search_media_candidates_direct(
@@ -5222,6 +5472,7 @@ async def _search_media_candidates_direct(
     limit: int,
     *,
     artist: str | None = None,
+    track_version_control: bool = False,
 ) -> list[MediaCandidateResponse]:
     candidates: list[MediaCandidate] = []
     for provider in state.metadata.providers:
@@ -5240,28 +5491,44 @@ async def _search_media_candidates_direct(
         candidates.extend(provider_candidates)
         if len(candidates) >= limit:
             break
-    return _aggregate_media_candidates(candidates, limit=limit)
+    return _aggregate_media_candidates(
+        candidates,
+        limit=limit,
+        track_version_control=track_version_control,
+    )
 
 
 async def _add_media_candidate_library_status(
     state: AppState,
     candidates: list[MediaCandidateResponse],
+    *,
+    track_version_control: bool = False,
 ) -> list[MediaCandidateResponse]:
     if not candidates:
         return candidates
     try:
         library_tracks = await state.repository.list_music_library_tracks()
-        tracks_by_title = _music_library_tracks_by_normalized_title(library_tracks)
+        tracks_by_title = _music_library_tracks_by_normalized_title(
+            library_tracks,
+            track_version_control=track_version_control,
+        )
         artist_values_cache: dict[str, set[str]] = {}
         enriched: list[MediaCandidateResponse] = []
         for candidate in candidates:
-            normalized_title = normalize_metadata_match_text(candidate.title)
+            normalized_title = _library_match_title_key(
+                candidate.title,
+                candidate.artist,
+                candidate.album,
+                track_version_control=track_version_control,
+            )
             match = await _match_library_track(
                 state,
                 candidate.title,
                 candidate.artist,
                 list(tracks_by_title.get(normalized_title, ())),
+                album=candidate.album,
                 artist_values_cache=artist_values_cache,
+                track_version_control=track_version_control,
             )
             enriched.append(
                 candidate.model_copy(update={"exists_in_library": match is not None})
@@ -5961,16 +6228,27 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> TorrentRe
         last_error=None,
     )
     try:
+        scraping_config = scraping_config_from_payload(
+            await state.repository.get_system_settings()
+        )
+        reference_file = Path(item.file_path) if item.file_path else None
         state.add_log(
             "metadata",
             f"Download item metadata scraping input: item_id={item_id}, "
             f"file={item.file_path}, reference={_track_metadata_log_text(reference)}",
         )
         candidates = await state.scraper.search_metadata_candidates(reference, reference)
-        metadata = await state.scraper.select_metadata_candidate(reference, candidates)
+        metadata = await state.scraper.select_metadata_candidate(
+            reference,
+            candidates,
+            track_version_control=scraping_config.track_version_control,
+            reference_file=reference_file,
+        )
         failure_message = await state.scraper.metadata_candidate_failure_message(
             reference,
             candidates,
+            track_version_control=scraping_config.track_version_control,
+            reference_file=reference_file,
         )
     except Exception as exc:  # noqa: BLE001
         error_message = f"{exc.__class__.__name__}: {exc}"
@@ -6475,7 +6753,11 @@ def _search_result_response(result: SearchResult) -> SearchResultResponse:
     )
 
 
-def _candidate_response(item: MediaCandidate) -> MediaCandidateResponse:
+def _candidate_response(
+    item: MediaCandidate,
+    *,
+    track_version_control: bool = False,
+) -> MediaCandidateResponse:
     return MediaCandidateResponse(
         title=item.title,
         artist=item.artist,
@@ -6485,7 +6767,12 @@ def _candidate_response(item: MediaCandidate) -> MediaCandidateResponse:
         cover_url=item.cover_url,
         source=item.source,
         external_id=item.external_id,
-        group_key=_media_candidate_group_key(item.title, item.artist),
+        group_key=_media_candidate_group_key(
+            item.title,
+            item.artist,
+            item.album,
+            track_version_control=track_version_control,
+        ),
     )
 
 
@@ -6533,16 +6820,33 @@ def _aggregate_media_candidates(
     candidates: list[MediaCandidate],
     *,
     limit: int | None,
+    track_version_control: bool = False,
 ) -> list[MediaCandidateResponse]:
-    by_key: dict[tuple[str, str], MediaCandidateResponse] = {}
+    by_key: dict[tuple[object, ...], MediaCandidateResponse] = {}
     for candidate in candidates:
-        key = (
-            normalize_search_text(candidate.title),
-            normalize_search_text(candidate.artist or ""),
-        )
+        if track_version_control:
+            signature = build_track_variant_signature(
+                title=candidate.title,
+                artist=candidate.artist,
+                album=candidate.album,
+            )
+            key = (
+                signature.normalized_base_title,
+                signature.artist_credit_keys,
+                tuple(sorted(signature.strong_variants)),
+                signature.collaboration,
+            )
+        else:
+            key = (
+                normalize_search_text(candidate.title),
+                normalize_search_text(candidate.artist or ""),
+            )
         current = by_key.get(key)
         if current is None:
-            current = _candidate_response(candidate)
+            current = _candidate_response(
+                candidate,
+                track_version_control=track_version_control,
+            )
             by_key[key] = current
         elif not current.cover_url and candidate.cover_url:
             current.cover_url = candidate.cover_url
@@ -6557,13 +6861,31 @@ def _aggregate_media_candidates(
     return aggregated if limit is None else aggregated[:limit]
 
 
-def _media_candidate_group_key(title: str, artist: str | None) -> str:
-    normalized = "\n".join(
-        (
+def _media_candidate_group_key(
+    title: str,
+    artist: str | None,
+    album: str | None = None,
+    *,
+    track_version_control: bool = False,
+) -> str:
+    if track_version_control:
+        signature = build_track_variant_signature(
+            title=title,
+            artist=artist,
+            album=album,
+        )
+        values = [
+            signature.normalized_base_title,
+            "+".join(signature.artist_credit_keys),
+            "+".join(sorted(signature.strong_variants)),
+            "collaboration" if signature.collaboration else "single",
+        ]
+    else:
+        values = [
             normalize_search_text(title),
             normalize_search_text(artist or ""),
-        )
-    )
+        ]
+    normalized = "\n".join(values)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
 
 

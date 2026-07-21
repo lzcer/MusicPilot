@@ -546,6 +546,7 @@ type SystemSettings = {
     auto_classify: boolean
     classify_by: 'artist' | 'album' | 'artist_album'
     duplicate_handling: 'ignore' | 'overwrite' | 'keep_largest'
+    track_version_control: boolean
   }
   search: {
     exclude_keywords: string
@@ -988,7 +989,8 @@ const systemForm = ref<SystemSettings>({
     auto_rename: false,
     auto_classify: false,
     classify_by: 'artist',
-    duplicate_handling: 'ignore'
+    duplicate_handling: 'ignore',
+    track_version_control: false
   },
   search: {
     exclude_keywords: '整轨|整軌|WAV|wav',
@@ -6201,6 +6203,43 @@ onUnmounted(() => {
                         inset
                         label="自动分类"
                       />
+                      <div class="track-version-control-setting">
+                        <v-switch
+                          v-model="systemForm.scraping.track_version_control"
+                          class="compact-switch"
+                          color="primary"
+                          density="compact"
+                          hide-details
+                          inset
+                          label="歌曲版本控制"
+                        />
+                        <v-tooltip location="top" max-width="520" open-on-click>
+                          <template #activator="{ props }">
+                            <v-icon
+                              v-bind="props"
+                              class="track-version-control-help"
+                              icon="mdi-information-outline"
+                              size="17"
+                              tabindex="0"
+                            />
+                          </template>
+                          <div class="track-version-control-tip">
+                            <div class="track-version-control-tip-summary">
+                              控制刮削、重复文件和“已在库”判断是否严格区分歌曲版本（如 live、demo、feat）。
+                            </div>
+                            <div class="track-version-control-tip-options">
+                              <div class="track-version-control-tip-row">
+                                <strong>开启时</strong>
+                                <span>版本不匹配会判定为刮削失败；重复文件和“已在库”状态判断也会严格区分版本。</span>
+                              </div>
+                              <div class="track-version-control-tip-row">
+                                <strong>关闭时</strong>
+                                <span>版本数据仅参与候选评分，优先选择正确版本；没有对应版本时，会选择其他匹配度较高的版本。</span>
+                              </div>
+                            </div>
+                          </div>
+                        </v-tooltip>
+                      </div>
                       <v-select
                         v-if="systemForm.scraping.auto_classify"
                         v-model="systemForm.scraping.classify_by"
@@ -9011,5 +9050,45 @@ button.dashboard-health-card:hover {
 .compact-switch :deep(.v-switch__thumb) {
   height: 14px;
   width: 14px;
+}
+
+.track-version-control-setting {
+  align-items: center;
+  display: flex;
+  gap: 4px;
+}
+
+.track-version-control-help {
+  color: rgba(var(--v-theme-on-surface), 0.54);
+  cursor: help;
+}
+
+.track-version-control-tip {
+  display: grid;
+  gap: 10px;
+  line-height: 1.55;
+  text-align: left;
+}
+
+.track-version-control-tip-summary {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+  padding-bottom: 8px;
+}
+
+.track-version-control-tip-options {
+  display: grid;
+  gap: 8px;
+}
+
+.track-version-control-tip-row {
+  align-items: start;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 52px minmax(0, 1fr);
+}
+
+.track-version-control-tip-row strong {
+  font-weight: 600;
+  white-space: nowrap;
 }
 </style>

@@ -40,6 +40,9 @@ from musicpilot.ports.metadata import TrackMetadata
 
 DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "proxy": {},
+    "scraping": {
+        "track_version_control": False,
+    },
     "search": {
         "exclude_keywords": DEFAULT_SEARCH_EXCLUDE_KEYWORDS,
         "minimum_seeders": 1,

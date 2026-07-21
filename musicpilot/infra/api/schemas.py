@@ -728,6 +728,7 @@ class ScrapingSettings(BaseModel):
     auto_classify: bool = False
     classify_by: Literal["artist", "album", "artist_album"] = "artist"
     duplicate_handling: Literal["ignore", "overwrite", "keep_largest"] = "ignore"
+    track_version_control: bool = False
 
 
 class SearchSettings(BaseModel):

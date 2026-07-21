@@ -164,10 +164,18 @@ Scraping completes metadata, lyrics, tags, and target paths after downloads fini
 | Mapped directory / copied directory | Directory picker | Required when "mapped file" or "copied file" is selected. Available directories come from the filesystem visible to the MusicPilot runtime. |
 | Try scraping when missing | Album, artist, lyrics | Try online completion when these fields are missing. |
 | Fail when missing | Album, artist, lyrics | If these fields are still missing, the organization task is treated as failed. |
+| Track version control | On / off, off by default | Controls whether scraping, duplicate detection, and "in library" checks distinguish track versions strictly. |
 | Auto rename | On / off | Rename files according to metadata. |
 | Auto classify | On / off | Create classification directories by artist, album, or artist-album. |
 | Classify by | Artist, album, artist-album | Applies when auto classify is enabled; artist-album saves files as `Artist/Album/Track`, using `Artist/Unknown Album/Track` when album metadata is missing. |
 | Duplicate handling | Ignore, always overwrite, keep largest file | Decides what happens when the target file already exists. |
+
+"Track version control" recognizes regular, Live, Remix, Acoustic, Instrumental, Karaoke, Demo, and featured/collaboration credits:
+
+1. Scraping: when enabled, only candidates with the same version and collaboration credits are accepted; when disabled, versions only affect candidate ranking.
+2. Duplicate detection: when enabled, different track versions can be stored separately; when disabled, the existing rules remain in effect.
+3. In library: when enabled, a result is marked as in the library only when the same version exists; when disabled, the existing rules remain in effect.
+4. Re-scraping: the same source file always replaces its previous result and does not keep two versions.
 
 When "mapped file" is selected and no tags need to be written, MusicPilot tries to create a hardlink. The source and mapped directories must be under the same `/media` mount, and their host directories must not cross filesystems or Btrfs subvolumes. Otherwise MusicPilot falls back to copying and consumes additional disk space.
 
