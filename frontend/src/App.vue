@@ -51,6 +51,7 @@ type MediaCandidate = {
   source: string
   external_id: string
   group_key?: string | null
+  exists_in_library?: boolean
 }
 
 type MetadataCandidatePageResponse = {
@@ -4797,9 +4798,19 @@ onUnmounted(() => {
               <article
                 v-for="candidate in metadataCandidates"
                 :key="`${candidate.source}-${candidate.external_id}-${candidate.title}-${candidate.artist}`"
+                :class="{ 'media-card--in-library': candidate.exists_in_library }"
                 class="media-card"
                 @click="openSiteConfirm(candidate)"
               >
+                <span
+                  v-if="candidate.exists_in_library"
+                  class="media-card-library-mark"
+                  role="img"
+                  aria-label="已在库"
+                  title="已在库"
+                >
+                  <v-icon color="success" icon="mdi-check-circle" size="30" />
+                </span>
                 <img
                   v-if="candidate.cover_url"
                   :src="candidate.cover_url"

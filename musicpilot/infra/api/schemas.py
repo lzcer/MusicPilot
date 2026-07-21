@@ -90,6 +90,7 @@ class MediaCandidateResponse(BaseModel):
     source: str
     external_id: str
     group_key: str | None = None
+    exists_in_library: bool = False
 
 
 class MetadataSearchResponse(BaseModel):

@@ -5137,6 +5137,7 @@ async def _search_media_candidate_page(
         if not isinstance(item, dict):
             continue
         candidates.append(MediaCandidateResponse(**item))
+    candidates = await _add_media_candidate_library_status(state, candidates)
     next_offset = _optional_int(result.get("next_offset"))
     has_more = bool(result.get("has_more")) and next_offset is not None
     return candidates, next_offset, has_more
@@ -5179,7 +5180,7 @@ async def _search_media_candidates(
     use_task_manager: bool = True,
 ) -> list[MediaCandidateResponse]:
     if not use_task_manager:
-        return await state.task_manager.run_exclusive(
+        candidates = await state.task_manager.run_exclusive(
             task_type="SEARCH_MEDIA",
             resource_keys=[await _media_search_resource_key(state)],
             payload={
@@ -5191,6 +5192,7 @@ async def _search_media_candidates(
             runner=lambda: _search_media_candidates_direct(state, query, limit, artist=artist),
             wait_log_message="Playlist metadata search waiting for media-search resource.",
         )
+        return await _add_media_candidate_library_status(state, candidates)
     task_id = await state.task_manager.enqueue(
         TaskCreate(
             task_type="SEARCH_MEDIA",
@@ -5211,7 +5213,7 @@ async def _search_media_candidates(
         if not isinstance(item, dict):
             continue
         candidates.append(MediaCandidateResponse(**item))
-    return candidates
+    return await _add_media_candidate_library_status(state, candidates)
 
 
 async def _search_media_candidates_direct(
@@ -5239,6 +5241,39 @@ async def _search_media_candidates_direct(
         if len(candidates) >= limit:
             break
     return _aggregate_media_candidates(candidates, limit=limit)
+
+
+async def _add_media_candidate_library_status(
+    state: AppState,
+    candidates: list[MediaCandidateResponse],
+) -> list[MediaCandidateResponse]:
+    if not candidates:
+        return candidates
+    try:
+        library_tracks = await state.repository.list_music_library_tracks()
+        tracks_by_title = _music_library_tracks_by_normalized_title(library_tracks)
+        artist_values_cache: dict[str, set[str]] = {}
+        enriched: list[MediaCandidateResponse] = []
+        for candidate in candidates:
+            normalized_title = normalize_metadata_match_text(candidate.title)
+            match = await _match_library_track(
+                state,
+                candidate.title,
+                candidate.artist,
+                list(tracks_by_title.get(normalized_title, ())),
+                artist_values_cache=artist_values_cache,
+            )
+            enriched.append(
+                candidate.model_copy(update={"exists_in_library": match is not None})
+            )
+        return enriched
+    except Exception as exc:  # noqa: BLE001
+        state.add_log(
+            "library",
+            f"Media candidate library status failed: {exc}",
+            "WARNING",
+        )
+        return candidates
 
 
 async def _submit_download_request(state: AppState, payload: DownloadRequest) -> DownloadResponse:

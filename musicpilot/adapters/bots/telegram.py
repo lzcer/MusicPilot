@@ -799,6 +799,8 @@ class TelegramBotAdapter:
                     f"专辑：{escape(album_text)}",
                 )
             )
+            if item.exists_in_library:
+                lines.append("【已在库】")
         await message.edit_text(
             "\n".join(lines),
             parse_mode="HTML",
