@@ -1,0 +1,90 @@
+name: 🐛 Bug 反馈
+description: 报告可以稳定复现的程序问题
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请尽量完整填写以下信息。
+        提交日志前，请删除密码、Token、Cookie、站点密钥等敏感信息。
+
+  - type: input
+    id: version
+    attributes:
+      label: MusicPilot 版本
+      placeholder: 例如 v1.2.3 或 Commit ID
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: 部署方式
+      options:
+        - Docker
+        - Docker Compose
+        - 源码运行
+        - 其他
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: 操作系统
+      placeholder: 例如 Windows 11、Ubuntu 24.04、群晖 DSM 7
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 请说明发生了什么问题。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 进入……
+        2. 点击……
+        3. 配置……
+        4. 出现……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+      description: 正常情况下应该发生什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: 请粘贴与问题发生时间对应的日志，并删除敏感信息。
+      render: shell
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: 补充信息
+      description: 可以提供截图、相关配置和其他线索。
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已经搜索过现有 Issue，没有发现相同问题。
+          required: true
+        - label: 我提供的日志和截图中不包含密码、Token、Cookie 等敏感信息。
+          required: true
