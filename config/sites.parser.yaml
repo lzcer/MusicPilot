@@ -4,6 +4,16 @@ sites:
         base_url: https://kp.m-team.cc
     adapter: mteam
   - targets:
+      - name: Redacted
+        base_url: https://redacted.sh
+      - name: DicMusic
+        base_url: https://dicmusic.com
+      - name: Orpheus
+        base_url: https://orpheus.network
+      - name: DesiGaane
+        base_url: https://desigaane.rocks
+    adapter: gazelle
+  - targets:
       - name: OpenCD
         base_url: https://open.cd
       - name: HDFans
