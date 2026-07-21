@@ -827,6 +827,8 @@ class TelegramBotAdapter:
                     ),
                 )
             )
+            if item.promotion:
+                lines.append(f"促销：{escape(_short(item.promotion, 80))}")
         await message.edit_text(
             "\n".join(lines),
             parse_mode="HTML",
