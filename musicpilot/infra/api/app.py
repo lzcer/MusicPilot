@@ -6242,12 +6242,13 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> TorrentRe
             f"file={item.file_path}, reference={_track_metadata_log_text(reference)}",
         )
         candidates = await state.scraper.search_metadata_candidates(reference, reference)
-        metadata = await state.scraper.select_metadata_candidate(
+        ranked_candidates = await state.scraper.rank_metadata_candidates(
             reference,
             candidates,
             track_version_control=scraping_config.track_version_control,
             reference_file=reference_file,
         )
+        metadata = ranked_candidates[0] if ranked_candidates else None
         failure_message = await state.scraper.metadata_candidate_failure_message(
             reference,
             candidates,
@@ -6293,7 +6294,7 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> TorrentRe
         metadata_title=metadata.title,
         metadata_artist=metadata.artist,
         metadata_album=metadata.album,
-        metadata_payload=_track_metadata_payload(metadata),
+        metadata_payload=_download_item_metadata_payload(metadata, ranked_candidates),
         last_error=None,
     )
     state.add_log(
@@ -6301,13 +6302,67 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> TorrentRe
         f"Download item metadata scraping result: item_id={item_id}, status=metadata_found, "
         f"reference={_track_metadata_log_text(reference)}, "
         f"metadata={_track_metadata_log_text(metadata)}, "
-        f"candidates={len(candidates)}",
+        f"candidates={len(candidates)}, "
+        f"cached_candidates={min(len(ranked_candidates), _DOWNLOAD_ITEM_CANDIDATE_POOL_LIMIT)}",
     )
     return await state.repository.get_download_task_item(item_id)
 
 
 def _track_metadata_payload(metadata: TrackMetadata) -> dict[str, object]:
     return dataclasses.asdict(metadata)
+
+
+_DOWNLOAD_ITEM_CANDIDATE_POOL_KEY = "_candidate_pool"
+_DOWNLOAD_ITEM_CANDIDATE_POOL_VERSION = 1
+_DOWNLOAD_ITEM_CANDIDATE_POOL_LIMIT = 10
+
+
+def _download_item_metadata_payload(
+    selected: TrackMetadata,
+    candidates: tuple[TrackMetadata, ...],
+) -> dict[str, object]:
+    payload = _track_metadata_payload(selected)
+    payload[_DOWNLOAD_ITEM_CANDIDATE_POOL_KEY] = {
+        "version": _DOWNLOAD_ITEM_CANDIDATE_POOL_VERSION,
+        "items": [
+            _track_metadata_payload(candidate)
+            for candidate in candidates[:_DOWNLOAD_ITEM_CANDIDATE_POOL_LIMIT]
+        ],
+    }
+    return payload
+
+
+def _download_item_metadata_candidates(
+    payload: dict[str, Any] | None,
+) -> tuple[TrackMetadata, ...]:
+    selected = _track_metadata_from_payload(payload)
+    if isinstance(payload, dict):
+        pool = payload.get(_DOWNLOAD_ITEM_CANDIDATE_POOL_KEY)
+        if (
+            isinstance(pool, dict)
+            and pool.get("version") == _DOWNLOAD_ITEM_CANDIDATE_POOL_VERSION
+        ):
+            candidates = _metadata_candidates_from_payload(pool.get("items"))
+            if candidates:
+                return candidates[:_DOWNLOAD_ITEM_CANDIDATE_POOL_LIMIT]
+    return (selected,) if selected is not None else ()
+
+
+def _download_item_metadata_payload_preserving_candidates(
+    metadata: TrackMetadata,
+    original_payload: dict[str, Any] | None,
+) -> dict[str, object]:
+    candidates = _download_item_metadata_candidates(original_payload)
+    if not candidates:
+        return _track_metadata_payload(metadata)
+    return _download_item_metadata_payload(metadata, candidates)
+
+
+def _public_download_item_metadata_payload(
+    payload: dict[str, Any] | None,
+) -> dict[str, object]:
+    metadata = _track_metadata_from_payload(payload)
+    return _track_metadata_payload(metadata) if metadata is not None else {}
 
 
 def _metadata_candidates_from_payload(payload: object) -> tuple[TrackMetadata, ...]:
@@ -7097,7 +7152,7 @@ def _download_task_item_response(item: TorrentRecordItem) -> DownloadTaskItemRes
         playlist_track_id=item.playlist_track_id,
         status=item.status,
         last_error=item.last_error,
-        metadata_payload=item.metadata_payload,
+        metadata_payload=_public_download_item_metadata_payload(item.metadata_payload),
         created_at=item.created_at,
         updated_at=item.updated_at,
     )
@@ -9140,7 +9195,6 @@ async def _organize_manual_source_file(
         inferred_metadata=(
             {source_file: inferred_metadata} if inferred_metadata is not None else None
         ),
-        use_directory_album_context=True,
     )
     state.add_log(
         "metadata",
@@ -9188,8 +9242,8 @@ async def _organize_download_task_item(
             last_error="Source file is missing.",
         )
     library_tracks, media_history = await _scraping_library_snapshots(state)
-    metadata = _track_metadata_from_payload(item.metadata_payload)
-    cached_metadata = {source_file: (metadata,)} if metadata is not None else {}
+    candidates = _download_item_metadata_candidates(item.metadata_payload)
+    cached_metadata = {source_file: candidates} if candidates else {}
 
     async def record_file_result(result: ScrapingFileResult) -> None:
         if result.status in {"success", "skipped"}:
@@ -9224,8 +9278,6 @@ async def _organize_download_task_item(
             media_history=media_history,
             cached_metadata=cached_metadata,
             on_file_result=record_file_result,
-            preload_metadata=False,
-            metadata_lookup_completed_files={source_file},
         )
     except Exception as exc:  # noqa: BLE001
         state.add_log(
@@ -9251,13 +9303,21 @@ async def _organize_download_task_item(
         "skipped": "organize_skipped",
         "failed": "organize_failed",
     }.get(result.status, "organize_failed")
+    metadata_payload = (
+        _track_metadata_payload(result.metadata)
+        if result.status in {"success", "skipped"}
+        else _download_item_metadata_payload_preserving_candidates(
+            result.metadata,
+            item.metadata_payload,
+        )
+    )
     updated = await state.repository.update_download_task_item(
         item_id,
         status=status,
         metadata_title=result.metadata.title,
         metadata_artist=result.metadata.artist,
         metadata_album=result.metadata.album,
-        metadata_payload=_track_metadata_payload(result.metadata),
+        metadata_payload=metadata_payload,
         last_error=result.error_message if result.status != "success" else None,
     )
     if result.stage == ArtistDirectoryResolutionError.__name__:
@@ -9460,9 +9520,9 @@ async def _cached_metadata_for_task_source_files(
 ) -> dict[Path, tuple[TrackMetadata, ...]]:
     items = await state.repository.list_download_task_items(task.id)
     candidates_by_item = [
-        (item, metadata)
+        (item, candidates)
         for item in items
-        if (metadata := _track_metadata_from_payload(item.metadata_payload)) is not None
+        if (candidates := _download_item_metadata_candidates(item.metadata_payload))
     ]
     if not candidates_by_item:
         return {}
@@ -9471,11 +9531,11 @@ async def _cached_metadata_for_task_source_files(
     used_item_ids: set[int] = set()
     for source_file in source_files:
         matched: list[TrackMetadata] = []
-        for item, metadata in candidates_by_item:
+        for item, candidates in candidates_by_item:
             if item.id in used_item_ids:
                 continue
             if _source_file_matches_torrent_item(source_file, item):
-                matched.append(metadata)
+                matched.extend(candidates)
                 used_item_ids.add(item.id)
         if matched:
             result[source_file] = tuple(matched)
@@ -9484,15 +9544,15 @@ async def _cached_metadata_for_task_source_files(
         if source_file in result:
             continue
         same_name = [
-            (item, metadata)
-            for item, metadata in candidates_by_item
+            (item, candidates)
+            for item, candidates in candidates_by_item
             if item.id not in used_item_ids
             and item.file_name.casefold() == source_file.name.casefold()
         ]
         if len(same_name) == 1:
-            item, metadata = same_name[0]
+            item, candidates = same_name[0]
             used_item_ids.add(item.id)
-            result[source_file] = (metadata,)
+            result[source_file] = candidates
     return result
 
 

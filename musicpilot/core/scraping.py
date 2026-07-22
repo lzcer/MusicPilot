@@ -7,7 +7,7 @@ import re
 import shutil
 import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from weakref import WeakValueDictionary
@@ -267,13 +267,6 @@ class _CandidateScore:
         return self.base.total + self.variant + self.collaboration
 
 
-@dataclass(frozen=True, slots=True)
-class _DirectoryAlbumMerge:
-    metadata: TrackMetadata
-    decision: str
-    score: _MatchScore | None = None
-
-
 class LocalMusicScraper:
     def __init__(
         self,
@@ -305,7 +298,6 @@ class LocalMusicScraper:
         preload_metadata: bool = True,
         metadata_lookup_completed_files: set[Path] | None = None,
         inferred_metadata: dict[Path, TrackMetadata] | None = None,
-        use_directory_album_context: bool = False,
     ) -> ScrapingSummary:
         if not config.enabled:
             return ScrapingSummary()
@@ -373,7 +365,6 @@ class LocalMusicScraper:
                         library_snapshot_loader=library_snapshot_loader,
                         transfer_runner=transfer_runner,
                         metadata_lookup_completed=source_file in lookup_completed_paths,
-                        use_directory_album_context=use_directory_album_context,
                     )
 
                 if transfer_runner is not None:
@@ -623,7 +614,8 @@ class LocalMusicScraper:
             config.scrape_when_missing,
             config.required_metadata,
         )
-        needs_scrape = bool(_missing_metadata_fields(source_metadata, scrape_fields))
+        trigger_fields = _missing_metadata_fields(source_metadata, scrape_fields)
+        needs_scrape = bool(trigger_fields)
         if not needs_scrape and not requires_identity_verification:
             return None
         if requires_identity_verification:
@@ -634,8 +626,22 @@ class LocalMusicScraper:
                 track_version_control=config.track_version_control,
                 reference_file=source_file,
             )
+            enriching = (
+                await _select_identity_candidate(
+                    verification_reference,
+                    cached_candidates,
+                    artist_service=self.artist_service,
+                    track_version_control=config.track_version_control,
+                    reference_file=source_file,
+                    required=config.required_metadata,
+                    trigger_fields=trigger_fields,
+                    require_trigger_gain=True,
+                )
+                if needs_scrape
+                else verified
+            )
             candidates = cached_candidates
-            if verified is None:
+            if verified is None or (needs_scrape and enriching is None):
                 candidates = _merge_metadata_candidates(
                     candidates,
                     await self._search_metadata_candidates(
@@ -651,7 +657,21 @@ class LocalMusicScraper:
                     track_version_control=config.track_version_control,
                     reference_file=source_file,
                 )
-            return source_file, candidates, verified
+                enriching = (
+                    await _select_identity_candidate(
+                        verification_reference,
+                        candidates,
+                        artist_service=self.artist_service,
+                        track_version_control=config.track_version_control,
+                        reference_file=source_file,
+                        required=config.required_metadata,
+                        trigger_fields=trigger_fields,
+                        require_trigger_gain=True,
+                    )
+                    if needs_scrape
+                    else verified
+                )
+            return source_file, candidates, enriching or verified
         looked_up = await _select_metadata_candidate(
             match_metadata,
             cached_candidates,
@@ -659,6 +679,8 @@ class LocalMusicScraper:
             artist_service=self.artist_service,
             track_version_control=config.track_version_control,
             reference_file=source_file,
+            trigger_fields=trigger_fields,
+            require_trigger_gain=needs_scrape,
         )
         candidates = cached_candidates
         if looked_up is None:
@@ -675,6 +697,8 @@ class LocalMusicScraper:
                 artist_service=self.artist_service,
                 track_version_control=config.track_version_control,
                 reference_file=source_file,
+                trigger_fields=trigger_fields,
+                require_trigger_gain=needs_scrape,
             )
         if looked_up is None and not _same_metadata_match_key(
             match_metadata,
@@ -693,6 +717,8 @@ class LocalMusicScraper:
                 artist_service=self.artist_service,
                 track_version_control=config.track_version_control,
                 reference_file=source_file,
+                trigger_fields=trigger_fields,
+                require_trigger_gain=needs_scrape,
             )
         return source_file, candidates, looked_up
 
@@ -709,7 +735,6 @@ class LocalMusicScraper:
         library_snapshot_loader: LibrarySnapshotLoader | None = None,
         transfer_runner: TransferRunner | None = None,
         metadata_lookup_completed: bool = False,
-        use_directory_album_context: bool = False,
     ) -> ScrapingFileOutcome:
         working_file = source_file
         mapped_files = 0
@@ -721,15 +746,6 @@ class LocalMusicScraper:
             source_file,
         )
         dir_meta = await self._resolve_known_artist_directory(source_metadata, raw_dir_meta)
-        default_album: str | None = None
-        default_album_source: str | None = None
-        if use_directory_album_context:
-            if _metadata_has_value(source_metadata, "album"):
-                default_album = source_metadata.album
-                default_album_source = "file_tag"
-            elif dir_meta is not None and _metadata_has_value(dir_meta, "album"):
-                default_album = dir_meta.album
-                default_album_source = "directory"
         match_metadata = _metadata_for_matching(source_metadata, source_file, dir_meta=dir_meta)
         fallback_metadata = _path_only_metadata_for_matching(source_file, raw_dir_meta)
         fallback_available = not _same_metadata_match_key(match_metadata, fallback_metadata)
@@ -851,10 +867,18 @@ class LocalMusicScraper:
                     reference_file=source_file,
                 )
             else:
-                verified, candidates = await self._verify_metadata_identity(
+                _online_verified, online_candidates = await self._verify_metadata_identity(
                     verification_reference,
                     source_file=source_file,
                     track_version_control=config.track_version_control,
+                )
+                candidates = _merge_metadata_candidates(cached_candidates, online_candidates)
+                verified = await _select_identity_candidate(
+                    verification_reference,
+                    candidates,
+                    artist_service=self.artist_service,
+                    track_version_control=config.track_version_control,
+                    reference_file=source_file,
                 )
             candidate_count = len(candidates)
             if verified is None:
@@ -890,31 +914,35 @@ class LocalMusicScraper:
                     0,
                 )
             if needs_scrape:
-                if contextual_metadata is not None:
+                adopted = await _select_identity_candidate(
+                    verification_reference,
+                    candidates,
+                    artist_service=self.artist_service,
+                    track_version_control=config.track_version_control,
+                    reference_file=source_file,
+                    required=config.required_metadata,
+                    trigger_fields=missing_before,
+                    require_trigger_gain=True,
+                )
+                logger.info(
+                    "Scraping identity candidate adoption: source=%s, "
+                    "trigger_fields=%s, verified=%s, adopted=%s, trigger_gain=%s",
+                    source_file,
+                    missing_before,
+                    _metadata_log_text(verified),
+                    _metadata_log_text(adopted),
+                    _candidate_trigger_gain(adopted, missing_before) if adopted else (),
+                )
+                if adopted is not None:
                     metadata = _merge_missing_metadata(
                         metadata,
-                        verified,
-                        missing_before,
-                        preserve_artist_album=contextual_metadata.preserve_artist_album,
+                        adopted,
+                        preserve_artist_album=(
+                            contextual_metadata.preserve_artist_album
+                            if contextual_metadata is not None
+                            else False
+                        ),
                     )
-                elif use_directory_album_context:
-                    album_merge = await _merge_metadata_with_directory_album_context(
-                        metadata,
-                        verified,
-                        reference=verification_reference,
-                        default_album=default_album,
-                        artist_service=self.artist_service,
-                    )
-                    metadata = album_merge.metadata
-                    _log_directory_album_merge(
-                        source_file,
-                        default_album=default_album,
-                        default_source=default_album_source,
-                        candidate_album=verified.album,
-                        result=album_merge,
-                    )
-                else:
-                    metadata = _merge_metadata(metadata, verified)
                 missing_required = _missing_metadata_fields(metadata, config.required_metadata)
                 if missing_required:
                     error_message = await _candidate_failure_message(
@@ -924,6 +952,8 @@ class LocalMusicScraper:
                         artist_service=self.artist_service,
                         track_version_control=config.track_version_control,
                         reference_file=source_file,
+                        trigger_fields=missing_before,
+                        require_trigger_gain=True,
                     )
                     logger.info(
                         "Scraping file result: source=%s, status=failed, "
@@ -931,7 +961,7 @@ class LocalMusicScraper:
                         "missing_required=%s, error=%s",
                         source_file,
                         _metadata_log_text(verification_reference),
-                        _metadata_log_text(verified),
+                        _metadata_log_text(adopted),
                         missing_required,
                         error_message,
                     )
@@ -966,11 +996,16 @@ class LocalMusicScraper:
                 artist_service=self.artist_service,
                 track_version_control=config.track_version_control,
                 reference_file=source_file,
+                trigger_fields=missing_before,
+                require_trigger_gain=True,
             )
             logger.info(
-                "Scraping cached candidate result: source=%s, selected=%s",
+                "Scraping cached candidate result: source=%s, trigger_fields=%s, "
+                "selected=%s, trigger_gain=%s",
                 source_file,
+                missing_before,
                 _metadata_log_text(looked_up),
+                _candidate_trigger_gain(looked_up, missing_before) if looked_up else (),
             )
             if looked_up is None and not metadata_lookup_completed:
                 online_candidates = await self._search_metadata_candidates(
@@ -978,7 +1013,7 @@ class LocalMusicScraper:
                     match_metadata,
                     config.required_metadata,
                 )
-                candidates = (*cached_candidates, *online_candidates)
+                candidates = _merge_metadata_candidates(cached_candidates, online_candidates)
                 looked_up = await _select_metadata_candidate(
                     match_metadata,
                     online_candidates,
@@ -986,6 +1021,8 @@ class LocalMusicScraper:
                     artist_service=self.artist_service,
                     track_version_control=config.track_version_control,
                     reference_file=source_file,
+                    trigger_fields=missing_before,
+                    require_trigger_gain=True,
                 )
                 logger.info(
                     "Scraping online candidate result: source=%s, "
@@ -1007,8 +1044,10 @@ class LocalMusicScraper:
                     artist_service=self.artist_service,
                     track_version_control=config.track_version_control,
                     reference_file=source_file,
+                    trigger_fields=missing_before,
+                    require_trigger_gain=True,
                 )
-                candidates = (*candidates, *fallback_candidates)
+                candidates = _merge_metadata_candidates(candidates, fallback_candidates)
                 candidate_reference = fallback_metadata
                 candidate_stage = "metadata_candidate_fallback"
                 logger.info(
@@ -1023,24 +1062,10 @@ class LocalMusicScraper:
                     looked_up = fallback_lookup
             candidate_count = len(candidates)
             if looked_up is not None:
-                if use_directory_album_context:
-                    album_merge = await _merge_metadata_with_directory_album_context(
-                        metadata,
-                        looked_up,
-                        reference=candidate_reference,
-                        default_album=default_album,
-                        artist_service=self.artist_service,
-                    )
-                    metadata = album_merge.metadata
-                    _log_directory_album_merge(
-                        source_file,
-                        default_album=default_album,
-                        default_source=default_album_source,
-                        candidate_album=looked_up.album,
-                        result=album_merge,
-                    )
-                else:
-                    metadata = _merge_metadata(metadata, looked_up)
+                metadata = _merge_missing_metadata(
+                    metadata,
+                    looked_up,
+                )
             missing_required = _missing_metadata_fields(metadata, config.required_metadata)
             version_error = (
                 await _version_control_failure_text(
@@ -1070,6 +1095,8 @@ class LocalMusicScraper:
                             artist_service=self.artist_service,
                             track_version_control=config.track_version_control,
                             reference_file=source_file,
+                            trigger_fields=missing_before,
+                            require_trigger_gain=True,
                         )
                     logger.info(
                         "Scraping file result: source=%s, status=failed, stage=%s, "
@@ -1104,6 +1131,8 @@ class LocalMusicScraper:
                     artist_service=self.artist_service,
                     track_version_control=config.track_version_control,
                     reference_file=source_file,
+                    trigger_fields=missing_before,
+                    require_trigger_gain=True,
                 )
                 logger.info(
                     "Scraping file result: source=%s, status=failed, stage=%s, "
@@ -1390,6 +1419,24 @@ class LocalMusicScraper:
         reference_file: Path | None = None,
     ) -> TrackMetadata | None:
         return await _select_metadata_candidate(
+            reference,
+            candidates,
+            required,
+            artist_service=self.artist_service,
+            track_version_control=track_version_control,
+            reference_file=reference_file,
+        )
+
+    async def rank_metadata_candidates(
+        self,
+        reference: TrackMetadata,
+        candidates: tuple[TrackMetadata, ...],
+        required: tuple[RequiredMetadata, ...] = (),
+        *,
+        track_version_control: bool = False,
+        reference_file: Path | None = None,
+    ) -> tuple[TrackMetadata, ...]:
+        return await _rank_metadata_candidates(
             reference,
             candidates,
             required,
@@ -2796,6 +2843,8 @@ async def _select_metadata_candidate(
     artist_service: ArtistService | None = None,
     track_version_control: bool = False,
     reference_file: Path | None = None,
+    trigger_fields: tuple[RequiredMetadata, ...] = (),
+    require_trigger_gain: bool = False,
 ) -> TrackMetadata | None:
     """Select the best metadata candidate using scoring.
 
@@ -2803,12 +2852,37 @@ async def _select_metadata_candidate(
     metadata. Returns the highest-scoring candidate that fills required
     fields, if its score meets the minimum threshold.
     """
-    if not candidates:
-        return None
+    ranked = await _rank_metadata_candidates(
+        existing,
+        candidates,
+        required,
+        artist_service=artist_service,
+        track_version_control=track_version_control,
+        reference_file=reference_file,
+        trigger_fields=trigger_fields,
+        require_trigger_gain=require_trigger_gain,
+    )
+    return ranked[0] if ranked else None
 
-    scored: list[tuple[_CandidateScore, TrackMetadata]] = []
+
+async def _rank_metadata_candidates(
+    existing: TrackMetadata,
+    candidates: tuple[TrackMetadata, ...],
+    required: tuple[RequiredMetadata, ...],
+    *,
+    artist_service: ArtistService | None = None,
+    track_version_control: bool = False,
+    reference_file: Path | None = None,
+    trigger_fields: tuple[RequiredMetadata, ...] = (),
+    require_trigger_gain: bool = False,
+    identity_verification: bool = False,
+) -> tuple[TrackMetadata, ...]:
+    scored: list[tuple[_CandidateScore, int, TrackMetadata]] = []
     for candidate in candidates:
         if not _candidate_fills_required(existing, candidate, required):
+            continue
+        trigger_gain = _candidate_trigger_gain(candidate, trigger_fields)
+        if require_trigger_gain and not trigger_gain:
             continue
         score = await _candidate_match_score(
             existing,
@@ -2816,27 +2890,28 @@ async def _select_metadata_candidate(
             artist_service=artist_service,
             reference_file=reference_file,
         )
-        if score.base.total < _MATCH_SCORE_THRESHOLD:
+        if identity_verification:
+            if not _identity_score_is_trusted(existing, candidate, score.base):
+                continue
+        elif score.base.total < _MATCH_SCORE_THRESHOLD:
             continue
         if track_version_control and (
             not score.variants_match or not score.collaboration_matches
         ):
             continue
-        scored.append((score, candidate))
-
-    if not scored:
-        return None
+        scored.append((score, len(trigger_gain), candidate))
 
     scored.sort(
         key=lambda item: (
             item[0].ranking_total,
+            item[1],
             item[0].base.total,
             item[0].base.title,
             item[0].base.artist,
         ),
         reverse=True,
     )
-    return scored[0][1]
+    return tuple(item[2] for item in scored)
 
 
 async def _select_identity_candidate(
@@ -2846,30 +2921,22 @@ async def _select_identity_candidate(
     artist_service: ArtistService | None = None,
     track_version_control: bool = False,
     reference_file: Path | None = None,
+    required: tuple[RequiredMetadata, ...] = (),
+    trigger_fields: tuple[RequiredMetadata, ...] = (),
+    require_trigger_gain: bool = False,
 ) -> TrackMetadata | None:
-    best: tuple[_CandidateScore, TrackMetadata] | None = None
-    for candidate in candidates:
-        score = await _candidate_match_score(
-            reference,
-            candidate,
-            artist_service=artist_service,
-            reference_file=reference_file,
-        )
-        if not _identity_score_is_trusted(reference, candidate, score.base):
-            continue
-        if track_version_control and (
-            not score.variants_match or not score.collaboration_matches
-        ):
-            continue
-        if best is None or (
-            score.ranking_total,
-            score.base.total,
-        ) > (
-            best[0].ranking_total,
-            best[0].base.total,
-        ):
-            best = (score, candidate)
-    return best[1] if best is not None else None
+    ranked = await _rank_metadata_candidates(
+        reference,
+        candidates,
+        required,
+        artist_service=artist_service,
+        track_version_control=track_version_control,
+        reference_file=reference_file,
+        trigger_fields=trigger_fields,
+        require_trigger_gain=require_trigger_gain,
+        identity_verification=True,
+    )
+    return ranked[0] if ranked else None
 
 
 def _identity_score_is_trusted(
@@ -2897,6 +2964,13 @@ def _candidate_fills_required(
     return True
 
 
+def _candidate_trigger_gain(
+    candidate: TrackMetadata,
+    trigger_fields: tuple[RequiredMetadata, ...],
+) -> tuple[RequiredMetadata, ...]:
+    return tuple(field for field in trigger_fields if _metadata_has_value(candidate, field))
+
+
 def _candidate_has_conflicting_album(existing: TrackMetadata, candidate: TrackMetadata) -> bool:
     return bool(
         _metadata_has_value(existing, "album")
@@ -2913,6 +2987,8 @@ async def _candidate_failure_message(
     artist_service: ArtistService | None = None,
     track_version_control: bool = False,
     reference_file: Path | None = None,
+    trigger_fields: tuple[RequiredMetadata, ...] = (),
+    require_trigger_gain: bool = False,
 ) -> str:
     if track_version_control:
         version_failure = await _version_control_failure_text(
@@ -2938,6 +3014,8 @@ async def _candidate_failure_message(
         artist_service=artist_service,
         track_version_control=track_version_control,
         reference_file=reference_file,
+        trigger_fields=trigger_fields,
+        require_trigger_gain=require_trigger_gain,
     )
     return (
         "未找到可信的刮削候选。"
@@ -3084,6 +3162,8 @@ async def _candidate_diagnostics_text(
     artist_service: ArtistService | None = None,
     track_version_control: bool = False,
     reference_file: Path | None = None,
+    trigger_fields: tuple[RequiredMetadata, ...] = (),
+    require_trigger_gain: bool = False,
 ) -> str:
     if not candidates:
         return ""
@@ -3096,12 +3176,15 @@ async def _candidate_diagnostics_text(
             reference_file=reference_file,
         )
         missing = _candidate_missing_required(metadata, candidate, required)
+        trigger_gain = _candidate_trigger_gain(candidate, trigger_fields)
         album_mismatch = _candidate_has_conflicting_album(metadata, candidate)
         reasons: list[str] = []
         if missing:
             reasons.append(f"missing={','.join(missing)}")
         if album_mismatch:
             reasons.append("album_mismatch")
+        if require_trigger_gain and not trigger_gain:
+            reasons.append("no_trigger_gain")
         if score.base.total < _MATCH_SCORE_THRESHOLD:
             reasons.append(f"score_below_threshold={_MATCH_SCORE_THRESHOLD}")
         if track_version_control and not score.variants_match:
@@ -3114,7 +3197,7 @@ async def _candidate_diagnostics_text(
             f"#{index}:{candidate.title!r}/{candidate.artist!r}/{candidate.album!r} "
             f"score={score.ranking_total}(base={score.base.total},title={score.base.title},"
             f"artist={score.base.artist},album={score.base.album},variant={score.variant},"
-            f"collaboration={score.collaboration},"
+            f"collaboration={score.collaboration},trigger_gain={trigger_gain},"
             f"version={_variant_signature_text(candidate_signature)},"
             f"evidence={_variant_evidence_text(candidate_signature)}) {reason_text}"
         )
@@ -3266,6 +3349,7 @@ def _metadata_candidate_key(metadata: TrackMetadata) -> tuple[object, ...]:
         _normalize_match_text(metadata.album),
         tuple(sorted(signature.strong_variants)),
         signature.collaboration,
+        _metadata_has_value(metadata, "lyrics"),
     )
 
 
@@ -3428,97 +3512,25 @@ def _merge_metadata(existing: TrackMetadata, scraped: TrackMetadata) -> TrackMet
     )
 
 
-async def _merge_metadata_with_directory_album_context(
-    existing: TrackMetadata,
-    scraped: TrackMetadata,
-    *,
-    reference: TrackMetadata,
-    default_album: str | None,
-    artist_service: ArtistService | None,
-) -> _DirectoryAlbumMerge:
-    merged = _merge_metadata(existing, scraped)
-    score = await _metadata_match_score(
-        reference,
-        scraped,
-        artist_service=artist_service,
-    )
-    if not default_album:
-        return _DirectoryAlbumMerge(
-            metadata=merged,
-            decision="no_default_album",
-            score=score,
-        )
-    if not _metadata_has_value(scraped, "album"):
-        return _DirectoryAlbumMerge(
-            metadata=replace(merged, album=default_album),
-            decision="candidate_album_missing",
-            score=score,
-        )
-    if _normalize_match_text(default_album) == _normalize_match_text(scraped.album):
-        return _DirectoryAlbumMerge(
-            metadata=merged,
-            decision="normalized_album_match",
-            score=score,
-        )
-    if score.title == 2 and score.artist == 2:
-        return _DirectoryAlbumMerge(
-            metadata=merged,
-            decision="high_confidence_override",
-            score=score,
-        )
-    return _DirectoryAlbumMerge(
-        metadata=replace(merged, album=default_album),
-        decision="preserve_default_album",
-        score=score,
-    )
-
-
-def _log_directory_album_merge(
-    source_file: Path,
-    *,
-    default_album: str | None,
-    default_source: str | None,
-    candidate_album: str | None,
-    result: _DirectoryAlbumMerge,
-) -> None:
-    score = result.score
-    logger.info(
-        "Scraping directory album context: source=%s, default_album=%r, "
-        "default_source=%s, candidate_album=%r, final_album=%r, "
-        "title_score=%s, artist_score=%s, decision=%s",
-        source_file,
-        default_album,
-        default_source or "none",
-        candidate_album,
-        result.metadata.album,
-        score.title if score is not None else None,
-        score.artist if score is not None else None,
-        result.decision,
-    )
-
-
 def _merge_missing_metadata(
     existing: TrackMetadata,
     scraped: TrackMetadata,
-    missing_fields: tuple[RequiredMetadata, ...],
     *,
     preserve_artist_album: bool = False,
 ) -> TrackMetadata:
     artist = existing.artist
     album = existing.album
     if not preserve_artist_album:
-        if "artist" in missing_fields and scraped.artist:
-            artist = scraped.artist
-        if "album" in missing_fields and scraped.album:
-            album = scraped.album
+        artist = existing.artist or scraped.artist
+        album = existing.album or scraped.album
     return TrackMetadata(
-        title=existing.title,
+        title=existing.title or scraped.title,
         artist=artist,
         album=album,
         album_artist=existing.album_artist or scraped.album_artist,
         year=existing.year or scraped.year,
-        track_number=existing.track_number,
-        lyrics=scraped.lyrics if "lyrics" in missing_fields and scraped.lyrics else existing.lyrics,
+        track_number=existing.track_number or scraped.track_number,
+        lyrics=existing.lyrics or scraped.lyrics,
         cover_url=existing.cover_url or scraped.cover_url,
         extra={**existing.extra, **scraped.extra},
     )
