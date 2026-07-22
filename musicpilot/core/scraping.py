@@ -7,7 +7,7 @@ import re
 import shutil
 import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 from weakref import WeakValueDictionary
@@ -1194,21 +1194,15 @@ class LocalMusicScraper:
                 0,
             )
 
-        # Resolve artist to canonical name
-        if self.artist_service is not None:
+        if writes_tags:
+            metadata = await _normalize_metadata_for_tag_write(
+                metadata,
+                self.artist_service,
+            )
+        elif self.artist_service is not None:
             canonical = await self.artist_service.get_canonical_name(metadata.artist)
             if canonical is not None:
-                metadata = TrackMetadata(
-                    title=metadata.title,
-                    artist=canonical,
-                    album=metadata.album,
-                    album_artist=metadata.album_artist,
-                    year=metadata.year,
-                    track_number=metadata.track_number,
-                    lyrics=metadata.lyrics,
-                    cover_url=metadata.cover_url,
-                    extra=metadata.extra,
-                )
+                metadata = replace(metadata, artist=canonical)
 
         duplicate_match = await _find_duplicate_media(
             _duplicate_metadata_candidates(source_metadata, match_metadata, metadata),
@@ -1343,7 +1337,7 @@ class LocalMusicScraper:
             completed=True,
         )
 
-        if should_write_tags or metadata_gain:
+        if writes_tags:
             assert tag_writer is not None
             await tag_writer.write(working_file, metadata)
             updated_files += 1
@@ -3496,6 +3490,54 @@ def normalize_metadata_match_text(value: str | None) -> str:
 
 def _normalize_match_text(value: str | None) -> str:
     return normalize_metadata_match_text(value)
+
+
+async def _normalize_metadata_for_tag_write(
+    metadata: TrackMetadata,
+    artist_service: ArtistService | None,
+) -> TrackMetadata:
+    artist = await _canonicalize_artist_credit(metadata.artist, artist_service)
+    album_artist = await _canonicalize_artist_credit(
+        metadata.album_artist,
+        artist_service,
+    )
+    return replace(
+        metadata,
+        title=_t2s.convert(metadata.title),
+        artist=artist,
+        album=_to_simplified(metadata.album),
+        album_artist=album_artist,
+        lyrics=_to_simplified(metadata.lyrics),
+    )
+
+
+async def _canonicalize_artist_credit(
+    value: str | None,
+    artist_service: ArtistService | None,
+) -> str | None:
+    if not value or artist_service is None:
+        return value
+    names = split_artist_credit(value)
+    if not names:
+        return value
+    try:
+        canonical_names: list[str] = []
+        for name in names:
+            canonical = await artist_service.get_canonical_name(name) or name
+            if canonical not in canonical_names:
+                canonical_names.append(canonical)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Artist credit canonicalization failed: value=%r, error=%s",
+            value,
+            exc,
+        )
+        return value
+    return ", ".join(canonical_names)
+
+
+def _to_simplified(value: str | None) -> str | None:
+    return _t2s.convert(value) if value else value
 
 
 def _merge_metadata(existing: TrackMetadata, scraped: TrackMetadata) -> TrackMetadata:
