@@ -14,6 +14,7 @@ class TrackMetadata:
     track_number: int | None = None
     lyrics: str | None = None
     cover_url: str | None = None
+    has_cover: bool = False
     extra: dict[str, str] = field(default_factory=dict)
 
 

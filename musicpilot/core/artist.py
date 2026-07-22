@@ -519,6 +519,7 @@ class ArtistService:
             track_number=metadata.track_number,
             lyrics=metadata.lyrics,
             cover_url=metadata.cover_url,
+            has_cover=metadata.has_cover,
             extra=metadata.extra,
         )
 

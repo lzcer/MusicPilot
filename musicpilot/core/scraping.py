@@ -30,7 +30,7 @@ logger = logging.getLogger("musicpilot.metadata.scraping")
 _t2s = OpenCC("t2s")  # Traditional → Simplified
 
 ScrapingMode = Literal["source", "mapped", "copy"]
-RequiredMetadata = Literal["album", "artist", "lyrics"]
+RequiredMetadata = Literal["album", "artist", "lyrics", "cover"]
 ClassifyBy = Literal["artist", "album", "artist_album"]
 DuplicateHandling = Literal["ignore", "overwrite", "keep_largest"]
 PathOperationCause = Literal[
@@ -1337,19 +1337,97 @@ class LocalMusicScraper:
             completed=True,
         )
 
-        if writes_tags:
-            assert tag_writer is not None
-            await tag_writer.write(working_file, metadata)
-            updated_files += 1
+        async def rollback_working_file(stage: str) -> bool:
+            try:
+                removed = await asyncio.to_thread(
+                    _rollback_created_working_file,
+                    source_file,
+                    path_result,
+                    config,
+                )
+            except OSError:
+                logger.warning(
+                    "Scraping working file rollback failed: source=%s, path=%s, stage=%s",
+                    source_file,
+                    working_file,
+                    stage,
+                    exc_info=True,
+                )
+                return False
+            if removed:
+                logger.info(
+                    "Scraping working file rolled back: source=%s, path=%s, stage=%s",
+                    source_file,
+                    working_file,
+                    stage,
+                )
+            return removed
 
-        final_result = await asyncio.to_thread(
-            _classify_or_rename,
-            working_file,
-            metadata,
-            config,
-            classification_artist=classification_artist,
-            overwrite=not config.track_version_control or overwrite_duplicate,
-        )
+        try:
+            if writes_tags:
+                assert tag_writer is not None
+                await tag_writer.write(working_file, metadata)
+                updated_files += 1
+                validate_cover = (
+                    "cover" in config.required_metadata or "cover" in metadata_gain
+                )
+                if validate_cover:
+                    try:
+                        written_metadata = await asyncio.to_thread(
+                            read_track_metadata,
+                            working_file,
+                        )
+                        has_written_cover = written_metadata.has_cover
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "Written cover validation failed: path=%s",
+                            working_file,
+                            exc_info=True,
+                        )
+                        has_written_cover = False
+                    metadata = replace(metadata, has_cover=has_written_cover)
+                    if not has_written_cover:
+                        logger.warning(
+                            "Scraped cover is still missing after tag write: "
+                            "source=%s, path=%s",
+                            source_file,
+                            working_file,
+                        )
+                        if "cover" in config.required_metadata:
+                            error_message = "写入后的音频文件仍缺少内嵌封面。"
+                            rolled_back = await rollback_working_file("cover_validation")
+                            if rolled_back:
+                                mapped_files = 0
+                                updated_files = 0
+                            return (
+                                ScrapingFileResult(
+                                    source_path=source_file,
+                                    library_path=None,
+                                    metadata=metadata,
+                                    status="failed",
+                                    operation_type=operation_type,
+                                    operation_reason=operation_reason,
+                                    error_message=error_message,
+                                    stage="cover_validation",
+                                    needs_metadata_update=True,
+                                    candidate_count=candidate_count,
+                                ),
+                                mapped_files,
+                                updated_files,
+                                moved_files,
+                            )
+
+            final_result = await asyncio.to_thread(
+                _classify_or_rename,
+                working_file,
+                metadata,
+                config,
+                classification_artist=classification_artist,
+                overwrite=not config.track_version_control or overwrite_duplicate,
+            )
+        except Exception:
+            await rollback_working_file("post_transfer_exception")
+            raise
         final_file = final_result.path
         overwritten_existing_target = (
             overwritten_existing_target or final_result.overwritten_existing
@@ -1556,6 +1634,7 @@ class LocalMusicScraper:
             track_number=dir_meta.track_number,
             lyrics=dir_meta.lyrics,
             cover_url=dir_meta.cover_url,
+            has_cover=dir_meta.has_cover,
             extra=dir_meta.extra,
         )
 
@@ -1587,6 +1666,7 @@ class LocalMusicScraper:
             track_number=dir_meta.track_number,
             lyrics=dir_meta.lyrics,
             cover_url=dir_meta.cover_url,
+            has_cover=dir_meta.has_cover,
             extra=dir_meta.extra,
         )
 
@@ -1667,6 +1747,7 @@ def read_track_metadata(path: Path) -> TrackMetadata:
     year = None
     track_number = None
     lyrics = None
+    has_cover = False
     if audio is not None and audio.tags:
         title = _first_tag(audio.tags.get("title")) or title
         artist = _first_tag(audio.tags.get("artist"))
@@ -1675,6 +1756,11 @@ def read_track_metadata(path: Path) -> TrackMetadata:
         year = _parse_year(_first_tag(audio.tags.get("date")))
         track_number = _parse_track_number(_first_tag(audio.tags.get("tracknumber")))
         lyrics = _first_tag(audio.tags.get("lyrics"))
+    try:
+        raw_audio = MutagenFile(path)
+        has_cover = raw_audio is not None and _audio_has_embedded_cover(raw_audio)
+    except Exception:  # noqa: BLE001
+        logger.debug("Embedded cover detection failed: path=%s", path, exc_info=True)
     return TrackMetadata(
         title=title,
         artist=artist,
@@ -1683,6 +1769,47 @@ def read_track_metadata(path: Path) -> TrackMetadata:
         year=year,
         track_number=track_number,
         lyrics=lyrics,
+        has_cover=has_cover,
+    )
+
+
+def _audio_has_embedded_cover(audio: object) -> bool:
+    from mutagen.aiff import AIFF
+    from mutagen.flac import FLAC
+    from mutagen.mp3 import MP3
+    from mutagen.mp4 import MP4
+    from mutagen.oggopus import OggOpus
+    from mutagen.oggvorbis import OggVorbis
+    from mutagen.wave import WAVE
+
+    tags = getattr(audio, "tags", None)
+    if isinstance(audio, MP3 | AIFF | WAVE):
+        getall = getattr(tags, "getall", None)
+        return (
+            any(bool(getattr(frame, "data", None)) for frame in getall("APIC"))
+            if callable(getall)
+            else False
+        )
+    if isinstance(audio, FLAC):
+        return any(
+            bool(getattr(picture, "data", None))
+            for picture in (getattr(audio, "pictures", None) or ())
+        )
+    if isinstance(audio, OggVorbis | OggOpus):
+        if tags is None:
+            return False
+        return bool(tags.get("METADATA_BLOCK_PICTURE") or tags.get("COVERART"))
+    if isinstance(audio, MP4):
+        return bool(tags is not None and any(tags.get("covr") or ()))
+    if tags is None:
+        return False
+    keys = getattr(tags, "keys", None)
+    if not callable(keys):
+        return False
+    cover_keys = {"cover art (front)", "wm/picture"}
+    return any(
+        str(key).casefold() in cover_keys and bool(tags.get(key))
+        for key in keys()
     )
 
 
@@ -2090,6 +2217,7 @@ def _metadata_field_text(field: RequiredMetadata) -> str:
         "album": "专辑",
         "artist": "艺术家",
         "lyrics": "歌词",
+        "cover": "封面",
     }[field]
 
 
@@ -2328,7 +2456,15 @@ def _classification_artist(
 def _remove_empty_parents(source_dir: Path, config: ScrapingConfig) -> None:
     """Remove empty ancestor directories up to the configured root."""
     parent = source_dir
+    root = (
+        config.mapped_directory
+        if config.mode in {"mapped", "copy"}
+        else config.source_directory
+    )
     while parent != parent.parent:  # stop at filesystem root
+        # Stop at the mapped/source root directory — don't remove it
+        if root and parent == root:
+            break
         if not parent.is_dir():
             break
         try:
@@ -2337,15 +2473,25 @@ def _remove_empty_parents(source_dir: Path, config: ScrapingConfig) -> None:
             parent.rmdir()
         except (OSError, PermissionError):
             break
-        # Stop at the mapped/source root directory — don't remove it
-        root = (
-            config.mapped_directory
-            if config.mode in {"mapped", "copy"}
-            else config.source_directory
-        )
-        if root and parent == root:
-            break
         parent = parent.parent
+
+
+def _rollback_created_working_file(
+    source_file: Path,
+    path_result: _PathOperationResult | None,
+    config: ScrapingConfig,
+) -> bool:
+    if (
+        path_result is None
+        or path_result.overwritten_existing
+        or path_result.cause in {None, "already_mapped"}
+        or path_result.path == source_file
+        or not path_result.path.is_file()
+    ):
+        return False
+    path_result.path.unlink()
+    _remove_empty_parents(path_result.path.parent, config)
+    return True
 
 
 def _remove_existing_target(target: Path) -> None:
@@ -2583,6 +2729,7 @@ def _metadata_log_text(metadata: TrackMetadata | None) -> str:
         f"title={metadata.title!r}, artist={metadata.artist!r}, album={metadata.album!r}, "
         f"year={metadata.year!r}, track_number={metadata.track_number!r}, "
         f"lyrics={bool(metadata.lyrics)}, cover_url={metadata.cover_url!r}, "
+        f"has_cover={metadata.has_cover}, "
         f"version={_variant_signature_text(signature)!r}, "
         f"version_evidence={_variant_evidence_text(signature)!r}, "
         f"extra_keys={sorted(metadata.extra.keys()) if metadata.extra else []}"
@@ -2599,11 +2746,7 @@ def _metadata_candidates_log_text(candidates: tuple[TrackMetadata, ...]) -> str:
 
 
 def _metadata_missing(metadata: TrackMetadata, required: tuple[RequiredMetadata, ...]) -> bool:
-    for field in required:
-        value = getattr(metadata, field)
-        if not isinstance(value, str) or not value.strip():
-            return True
-    return False
+    return any(not _metadata_has_value(metadata, field) for field in required)
 
 
 def _metadata_for_matching(
@@ -2630,6 +2773,7 @@ def _metadata_for_matching(
             track_number=metadata.track_number,
             lyrics=metadata.lyrics,
             cover_url=metadata.cover_url,
+            has_cover=metadata.has_cover,
             extra=metadata.extra,
         )
 
@@ -2661,6 +2805,7 @@ def _metadata_for_matching(
             track_number=metadata.track_number,
             lyrics=metadata.lyrics,
             cover_url=metadata.cover_url,
+            has_cover=metadata.has_cover,
             extra=metadata.extra,
         )
 
@@ -2678,6 +2823,7 @@ def _metadata_for_matching(
             track_number=metadata.track_number,
             lyrics=metadata.lyrics,
             cover_url=metadata.cover_url,
+            has_cover=metadata.has_cover,
             extra=metadata.extra,
         )
 
@@ -2760,6 +2906,7 @@ def _identity_verification_reference(metadata: TrackMetadata) -> TrackMetadata:
         track_number=metadata.track_number,
         lyrics=metadata.lyrics,
         cover_url=metadata.cover_url,
+        has_cover=metadata.has_cover,
         extra=metadata.extra,
     )
 
@@ -3344,6 +3491,7 @@ def _metadata_candidate_key(metadata: TrackMetadata) -> tuple[object, ...]:
         tuple(sorted(signature.strong_variants)),
         signature.collaboration,
         _metadata_has_value(metadata, "lyrics"),
+        _metadata_has_value(metadata, "cover"),
     )
 
 
@@ -3541,6 +3689,9 @@ def _to_simplified(value: str | None) -> str | None:
 
 
 def _merge_metadata(existing: TrackMetadata, scraped: TrackMetadata) -> TrackMetadata:
+    cover_url = existing.cover_url
+    if not existing.has_cover:
+        cover_url = scraped.cover_url or cover_url
     return TrackMetadata(
         title=scraped.title or existing.title,
         artist=scraped.artist or existing.artist,
@@ -3549,7 +3700,8 @@ def _merge_metadata(existing: TrackMetadata, scraped: TrackMetadata) -> TrackMet
         year=scraped.year or existing.year,
         track_number=scraped.track_number or existing.track_number,
         lyrics=scraped.lyrics or existing.lyrics,
-        cover_url=scraped.cover_url or existing.cover_url,
+        cover_url=cover_url,
+        has_cover=existing.has_cover,
         extra={**existing.extra, **scraped.extra},
     )
 
@@ -3565,6 +3717,9 @@ def _merge_missing_metadata(
     if not preserve_artist_album:
         artist = existing.artist or scraped.artist
         album = existing.album or scraped.album
+    cover_url = existing.cover_url
+    if not existing.has_cover:
+        cover_url = cover_url or scraped.cover_url
     return TrackMetadata(
         title=existing.title or scraped.title,
         artist=artist,
@@ -3573,7 +3728,8 @@ def _merge_missing_metadata(
         year=existing.year or scraped.year,
         track_number=existing.track_number or scraped.track_number,
         lyrics=existing.lyrics or scraped.lyrics,
-        cover_url=existing.cover_url or scraped.cover_url,
+        cover_url=cover_url,
+        has_cover=existing.has_cover,
         extra={**existing.extra, **scraped.extra},
     )
 
@@ -3609,6 +3765,8 @@ def _filled_metadata_fields(
 
 
 def _metadata_has_value(metadata: TrackMetadata, field: RequiredMetadata) -> bool:
+    if field == "cover":
+        return metadata.has_cover or bool(metadata.cover_url and metadata.cover_url.strip())
     value = getattr(metadata, field)
     if not isinstance(value, str) or not value.strip():
         return False
@@ -3631,7 +3789,7 @@ def _optional_path(value: object) -> Path | None:
 def _required_metadata(value: object) -> tuple[RequiredMetadata, ...]:
     if not isinstance(value, list):
         return ()
-    allowed = {"album", "artist", "lyrics"}
+    allowed = {"album", "artist", "lyrics", "cover"}
     return tuple(item for item in value if item in allowed)
 
 

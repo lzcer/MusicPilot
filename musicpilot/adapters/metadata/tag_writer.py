@@ -83,11 +83,13 @@ async def _fetch_cover(cover_url: str | None) -> tuple[bytes, str] | None:
     except Exception:
         return None
     content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    if content_type not in {"image/jpeg", "image/png"}:
+    if content_type not in {"image/jpeg", "image/png", "image/webp"}:
         if response.content.startswith(b"\xff\xd8"):
             content_type = "image/jpeg"
         elif response.content.startswith(b"\x89PNG"):
             content_type = "image/png"
+        elif response.content.startswith(b"RIFF") and response.content[8:12] == b"WEBP":
+            content_type = "image/webp"
         else:
             return None
     if not response.content or len(response.content) > 10 * 1024 * 1024:
@@ -120,6 +122,8 @@ def _write_cover_sync(path: Path, cover_data: bytes, mime: str) -> None:
             audio.clear_pictures()
             audio.add_picture(picture)
         elif isinstance(audio, MP4):
+            if mime not in {"image/jpeg", "image/png"}:
+                return
             image_format = MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
             audio["covr"] = [MP4Cover(cover_data, imageformat=image_format)]
         audio.save()

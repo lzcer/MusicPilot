@@ -540,8 +540,8 @@ type SystemSettings = {
     mode: 'source' | 'mapped' | 'copy'
     source_directory: string
     mapped_directory: string
-    scrape_when_missing: Array<'album' | 'artist' | 'lyrics'>
-    required_metadata: Array<'album' | 'artist' | 'lyrics'>
+    scrape_when_missing: Array<'album' | 'artist' | 'lyrics' | 'cover'>
+    required_metadata: Array<'album' | 'artist' | 'lyrics' | 'cover'>
     auto_rename: boolean
     auto_classify: boolean
     classify_by: 'artist' | 'album' | 'artist_album'
@@ -1019,7 +1019,8 @@ const scrapingModeDescription = computed(() => {
 const scrapingRequiredMetadataOptions = [
   { title: '专辑', value: 'album' },
   { title: '艺术家', value: 'artist' },
-  { title: '歌词', value: 'lyrics' }
+  { title: '歌词', value: 'lyrics' },
+  { title: '封面', value: 'cover' }
 ]
 
 const scrapingClassifyOptions = [

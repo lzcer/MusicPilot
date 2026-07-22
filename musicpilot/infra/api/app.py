@@ -6570,6 +6570,7 @@ def _track_metadata_log_text(metadata: TrackMetadata | None) -> str:
         f"album_artist={metadata.album_artist!r}, "
         f"year={metadata.year!r}, track_number={metadata.track_number!r}, "
         f"lyrics={bool(metadata.lyrics)}, cover_url={metadata.cover_url!r}, "
+        f"has_cover={metadata.has_cover}, "
         f"extra_keys={sorted(metadata.extra.keys()) if metadata.extra else []}"
         "}"
     )
@@ -9632,6 +9633,7 @@ def _track_metadata_from_payload(payload: dict[str, Any] | None) -> TrackMetadat
         track_number=_optional_int(payload.get("track_number")),
         lyrics=_optional_string(payload.get("lyrics")),
         cover_url=_optional_string(payload.get("cover_url")),
+        has_cover=bool(payload.get("has_cover")),
         extra=dict(extra) if isinstance(extra, dict) else {},
     )
 
