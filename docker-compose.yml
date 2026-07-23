@@ -23,8 +23,6 @@ services:
       MP_SUBSCRIPTIONS_ENABLED: ${MP_SUBSCRIPTIONS_ENABLED:-true}
       MP_SUBSCRIPTION_CHECK_INTERVAL_MINUTES: ${MP_SUBSCRIPTION_CHECK_INTERVAL_MINUTES:-1440}
     restart: unless-stopped
-    mem_limit: 512m
-    mem_reservation: 256m
     ports:
       - "${MP_HTTP_PORT:-8000}:8000"
     volumes:
