@@ -68,6 +68,7 @@ class MusicBrainzProvider:
                             "source": self.name,
                             "musicbrainz_recording_id": str(item.get("id") or ""),
                             "musicbrainz_release_id": str(release.get("id") or ""),
+                            "release_date": str(release.get("date") or ""),
                         },
                     )
                 )

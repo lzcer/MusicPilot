@@ -5,19 +5,31 @@ from pathlib import Path
 
 import httpx
 
-from musicpilot.ports.metadata import TrackMetadata
+from musicpilot.ports.metadata import AlbumIdentity, TrackMetadata
 
 
 class MutagenTagWriter:
-    async def write(self, path: Path, metadata: TrackMetadata) -> None:
+    async def write(
+        self,
+        path: Path,
+        metadata: TrackMetadata,
+        album_identity: AlbumIdentity | None = None,
+    ) -> None:
         cover = await _fetch_cover(metadata.cover_url)
-        await asyncio.to_thread(_write_tags_sync, path, metadata, cover)
+        await asyncio.to_thread(
+            _write_tags_sync,
+            path,
+            metadata,
+            cover,
+            album_identity,
+        )
 
 
 def _write_tags_sync(
     path: Path,
     metadata: TrackMetadata,
     cover: tuple[bytes, str] | None = None,
+    album_identity: AlbumIdentity | None = None,
 ) -> None:
     from mutagen import File as MutagenFile
 
@@ -35,7 +47,15 @@ def _write_tags_sync(
     _set_tag(audio, "title", metadata.title)
     _set_tag(audio, "artist", metadata.artist, split_commas=True)
     _set_tag(audio, "album", metadata.album)
-    _set_tag(audio, "albumartist", metadata.album_artist)
+    if album_identity is None:
+        _set_tag(audio, "albumartist", metadata.album_artist)
+    else:
+        _set_or_clear_tag(audio, "albumartist", album_identity.album_artist)
+        _set_or_clear_tag(
+            audio,
+            "musicbrainz_albumid",
+            album_identity.musicbrainz_album_id,
+        )
     year = str(metadata.year) if metadata.year is not None else None
     _set_tag(audio, "date", year)
     _set_tag(audio, "year", year)
@@ -48,6 +68,8 @@ def _write_tags_sync(
         _set_tag(audio, "lyrics", metadata.lyrics)
     audio.save()
     _close_audio(audio)
+    if album_identity is not None:
+        _write_album_identity_sync(path, album_identity)
     if metadata.lyrics:
         _write_lyrics_sync(path, metadata.lyrics)
     if cover is not None:
@@ -71,6 +93,89 @@ def _set_tag(
             audio[key] = values
         except Exception:
             return
+
+
+def _set_or_clear_tag(audio: object, key: str, value: str | None) -> None:
+    try:
+        if value:
+            audio[key] = [value]
+        else:
+            del audio[key]
+    except (KeyError, TypeError, ValueError):
+        return
+
+
+def _write_album_identity_sync(path: Path, identity: AlbumIdentity) -> None:
+    from mutagen import File as MutagenFile
+    from mutagen.flac import FLAC
+    from mutagen.id3 import TDRL, TXXX
+    from mutagen.mp3 import MP3
+    from mutagen.mp4 import MP4
+    from mutagen.oggopus import OggOpus
+    from mutagen.oggvorbis import OggVorbis
+
+    audio = MutagenFile(path)
+    if audio is None:
+        return
+    try:
+        if isinstance(audio, MP3):
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags.delall("TXXX:ALBUMVERSION")
+            if identity.album_version:
+                audio.tags.add(
+                    TXXX(
+                        encoding=3,
+                        desc="ALBUMVERSION",
+                        text=[identity.album_version],
+                    )
+                )
+            audio.tags.delall("TDRL")
+            if identity.release_date:
+                audio.tags.add(
+                    TDRL(
+                        encoding=3,
+                        text=[identity.release_date],
+                    )
+                )
+        elif isinstance(audio, FLAC | OggVorbis | OggOpus):
+            _set_or_clear_native_tag(audio, "ALBUMVERSION", identity.album_version)
+            _set_or_clear_native_tag(audio, "RELEASEDATE", identity.release_date)
+        elif isinstance(audio, MP4):
+            _set_or_clear_mp4_freeform(
+                audio,
+                "----:com.apple.iTunes:ALBUMVERSION",
+                identity.album_version,
+            )
+            _set_or_clear_native_tag(audio, "\xa9day", identity.release_date)
+            _set_or_clear_mp4_freeform(
+                audio,
+                "----:com.apple.iTunes:RELEASEDATE",
+                None,
+            )
+        audio.save()
+    finally:
+        _close_audio(audio)
+
+
+def _set_or_clear_native_tag(audio: object, key: str, value: str | None) -> None:
+    if value:
+        audio[key] = [value]
+        return
+    try:
+        del audio[key]
+    except KeyError:
+        return
+
+
+def _set_or_clear_mp4_freeform(audio: object, key: str, value: str | None) -> None:
+    if value:
+        audio[key] = [value.encode("utf-8")]
+        return
+    try:
+        del audio[key]
+    except KeyError:
+        return
 
 
 async def _fetch_cover(cover_url: str | None) -> tuple[bytes, str] | None:

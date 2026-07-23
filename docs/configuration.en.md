@@ -162,8 +162,8 @@ Scraping completes metadata, lyrics, tags, and target paths after downloads fini
 | Scraping mode | Source file, mapped file, copied file | Controls where processed files come from and where they are written. |
 | Source directory | Directory picker | Source directory used for manual organization. Available directories come from the filesystem visible to the MusicPilot runtime. |
 | Mapped directory / copied directory | Directory picker | Required when "mapped file" or "copied file" is selected. Available directories come from the filesystem visible to the MusicPilot runtime. |
-| Try scraping when missing | Album, artist, lyrics | Try online completion when these fields are missing. |
-| Fail when missing | Album, artist, lyrics | If these fields are still missing, the organization task is treated as failed. |
+| Try scraping when missing | Album, artist, lyrics, cover | Try online completion when these fields are missing. A cover is present only when the audio file contains embedded artwork. |
+| Fail when missing | Album, artist, lyrics, cover | If these fields are still missing, the organization task is treated as failed. Required cover artwork is checked again after tags are written. |
 | Track version control | On / off, off by default | Controls whether scraping, duplicate detection, and "in library" checks distinguish track versions strictly. |
 | Auto rename | On / off | Rename files according to metadata. |
 | Auto classify | On / off | Create classification directories by artist, album, or artist-album. |
@@ -384,9 +384,9 @@ After saving the system proxy, you still need to enable "use system proxy" on ea
 
 Confirm that the Navidrome URL is reachable from the MusicPilot environment and that the username and password are correct. In container deployments, also confirm that the MusicPilot container can reach the Navidrome container or host network.
 
-### 4.6. Scraping Results Are Missing Album, Artist, Or Lyrics
+### 4.6. Scraping Results Are Missing Album, Artist, Lyrics, Or Cover Artwork
 
-Check "try scraping when missing" and "fail when missing". If a field is set to "fail when missing" and online sources still do not provide it, the organization task will fail and record the reason.
+Check "try scraping when missing" and "fail when missing". If a field is set to "fail when missing" and online sources still do not provide it, the organization task will fail and record the reason. Cover availability is based on embedded artwork in the final audio file, so cover download or tag-writing failures are also treated as missing artwork. MP3 and FLAC accept JPEG, PNG, and WebP artwork; MP4 accepts JPEG or PNG.
 
 ### 4.7. Configuration Is Missing After Database Migration Or Moving Hosts
 

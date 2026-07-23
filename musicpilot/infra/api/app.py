@@ -15,7 +15,7 @@ import tempfile
 import time
 import tomllib
 import unicodedata
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -76,6 +76,7 @@ from musicpilot.core.metadata import MetadataCascade
 from musicpilot.core.pipeline import MusicPipeline
 from musicpilot.core.processor import MediaProcessor
 from musicpilot.core.scraping import (
+    AlbumIdentityLease,
     ArtistDirectoryResolutionError,
     ContextualMetadata,
     LibraryTrackSnapshot,
@@ -212,6 +213,7 @@ from musicpilot.infra.config import Settings
 from musicpilot.infra.db import Database, SqlAlchemyMediaRepository
 from musicpilot.infra.db.migration import DatabaseMigrationError, DatabaseMigrationService
 from musicpilot.infra.db.models import (
+    AlbumIdentityAnchor,
     Artist,
     DownloaderConfig,
     IndexerSite,
@@ -228,7 +230,7 @@ from musicpilot.infra.db.models import (
 )
 from musicpilot.infra.scheduler import SubscriptionScheduler
 from musicpilot.ports.downloader import Downloader, DownloadState, DownloadStatus
-from musicpilot.ports.metadata import MediaCandidate, TrackMetadata
+from musicpilot.ports.metadata import AlbumIdentity, MediaCandidate, TrackMetadata
 
 _OPENCC_T2S = OpenCC("t2s")
 _TORRENT_AUDIO_EXTENSIONS = {
@@ -8565,6 +8567,497 @@ def _scraping_batch_resource_key(prefix: str, source_files: Iterable[Path]) -> s
     return f"{prefix}:{digest}"
 
 
+async def _album_identity_lease_acquirer(
+    state: AppState,
+    config: ScrapingConfig,
+) -> Callable[[Path, TrackMetadata, Path], Awaitable[AlbumIdentityLease]] | None:
+    server = await state.repository.default_media_server()
+    if server is None:
+        return None
+    client = build_media_server_client(server)
+    roots = tuple(
+        path
+        for path in (config.mapped_directory, config.source_directory)
+        if path is not None
+    )
+
+    async def acquire(
+        source_file: Path,
+        metadata: TrackMetadata,
+        planned_directory: Path,
+    ) -> AlbumIdentityLease:
+        normalized_album = _normalize_album_identity_text(metadata.album)
+        lock_identity = normalized_album or _normalized_path_key(planned_directory)
+        digest = hashlib.sha1(
+            lock_identity.encode("utf-8", errors="ignore")
+        ).hexdigest()[:16]
+        resource_key = f"album:{server.id}:{digest}"
+        ready: asyncio.Future[AlbumIdentity] = asyncio.get_running_loop().create_future()
+        release_event = asyncio.Event()
+
+        async def hold_lease() -> None:
+            try:
+                identity = await _resolve_album_identity(
+                    state,
+                    media_server_id=server.id,
+                    media_server_client=client,
+                    metadata=metadata,
+                    planned_directory=planned_directory,
+                    roots=roots,
+                )
+            except BaseException as exc:
+                if not ready.done():
+                    ready.set_exception(exc)
+                raise
+            if not ready.done():
+                ready.set_result(identity)
+            await release_event.wait()
+
+        lease_task = asyncio.create_task(
+            state.task_manager.run_exclusive(
+                task_type="ALBUM_ORGANIZE",
+                resource_keys=[resource_key],
+                payload={
+                    "album": metadata.album or "",
+                    "source_file": str(source_file),
+                    "planned_directory": str(planned_directory),
+                },
+                wait_log_message=(
+                    "File organization waiting for album resource: "
+                    f"{metadata.album or planned_directory.name}"
+                ),
+                runner=hold_lease,
+            ),
+            name=f"musicpilot-album-identity-{digest}",
+        )
+        try:
+            identity = await ready
+        except BaseException:
+            release_event.set()
+            with contextlib.suppress(BaseException):
+                await lease_task
+            raise
+
+        released = False
+
+        async def release() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            release_event.set()
+            await lease_task
+
+        return AlbumIdentityLease(identity=identity, release=release)
+
+    return acquire
+
+
+async def _resolve_album_identity(
+    state: AppState,
+    *,
+    media_server_id: str,
+    media_server_client: object,
+    metadata: TrackMetadata,
+    planned_directory: Path,
+    roots: tuple[Path, ...],
+) -> AlbumIdentity:
+    album_name = (metadata.album or planned_directory.name or "未知专辑").strip()
+    normalized_album_name = _normalize_album_identity_text(album_name)
+    directory_key = _album_identity_location_key(
+        planned_directory,
+        normalized_album_name,
+    )
+    proposed = _album_identity_from_metadata(metadata)
+    location_anchor = await state.repository.get_album_identity_anchor_by_location(
+        media_server_id=media_server_id,
+        library_directory_key=directory_key,
+    )
+    physical_identity = await asyncio.to_thread(
+        _physical_album_identity_for_directory,
+        planned_directory,
+        normalized_album_name,
+        proposed,
+    )
+    navidrome_identity = await _navidrome_album_identity_for_directory(
+        state,
+        media_server_client=media_server_client,
+        album_name=album_name,
+        normalized_album_name=normalized_album_name,
+        planned_directory=planned_directory,
+        roots=roots,
+        fallback=(
+            _album_identity_from_anchor(location_anchor)
+            if location_anchor is not None
+            else physical_identity
+        ),
+    )
+    if navidrome_identity is not None:
+        if location_anchor is not None:
+            updated = await state.repository.update_album_identity_anchor(
+                location_anchor.id,
+                album_name=album_name,
+                normalized_album_name=normalized_album_name,
+                album_artist=(
+                    navidrome_identity.album_artist or location_anchor.album_artist
+                ),
+                normalized_album_artist=normalize_artist_name(
+                    navidrome_identity.album_artist or location_anchor.album_artist
+                )
+                or None,
+                musicbrainz_album_id=navidrome_identity.musicbrainz_album_id,
+                album_version=navidrome_identity.album_version,
+                release_date=navidrome_identity.release_date,
+                source="navidrome",
+            )
+            if updated is not None:
+                return _album_identity_from_anchor(updated)
+        anchor = await _find_safe_album_identity_anchor(
+            state,
+            media_server_id=media_server_id,
+            normalized_album_name=normalized_album_name,
+            identity=navidrome_identity,
+        )
+        if anchor is not None:
+            bound = await state.repository.bind_album_identity_location(
+                anchor_id=anchor.id,
+                media_server_id=media_server_id,
+                library_directory_key=directory_key,
+            )
+            return _album_identity_from_anchor(bound)
+        created = await _create_album_identity_anchor(
+            state,
+            media_server_id=media_server_id,
+            directory_key=directory_key,
+            album_name=album_name,
+            normalized_album_name=normalized_album_name,
+            identity=navidrome_identity,
+            source="navidrome",
+        )
+        return _album_identity_from_anchor(created)
+
+    if location_anchor is not None:
+        return _album_identity_from_anchor(location_anchor)
+    anchor = await _find_safe_album_identity_anchor(
+        state,
+        media_server_id=media_server_id,
+        normalized_album_name=normalized_album_name,
+        identity=physical_identity,
+    )
+    if anchor is not None:
+        bound = await state.repository.bind_album_identity_location(
+            anchor_id=anchor.id,
+            media_server_id=media_server_id,
+            library_directory_key=directory_key,
+        )
+        return _album_identity_from_anchor(bound)
+    created = await _create_album_identity_anchor(
+        state,
+        media_server_id=media_server_id,
+        directory_key=directory_key,
+        album_name=album_name,
+        normalized_album_name=normalized_album_name,
+        identity=physical_identity,
+        source="scraping",
+    )
+    return _album_identity_from_anchor(created)
+
+
+async def _navidrome_album_identity_for_directory(
+    state: AppState,
+    *,
+    media_server_client: object,
+    album_name: str,
+    normalized_album_name: str,
+    planned_directory: Path,
+    roots: tuple[Path, ...],
+    fallback: AlbumIdentity,
+) -> AlbumIdentity | None:
+    groups: dict[str, list[MusicLibraryTrack]] = {}
+    for track in await state.repository.list_music_library_tracks():
+        if _normalize_album_identity_text(track.album) != normalized_album_name:
+            continue
+        if not _library_track_matches_directory(
+            track.path,
+            planned_directory,
+            roots,
+        ):
+            continue
+        raw_payload = track.raw_payload if isinstance(track.raw_payload, dict) else {}
+        album_id = _optional_string(raw_payload.get("albumId"))
+        if album_id:
+            groups.setdefault(album_id, []).append(track)
+    if not groups:
+        return None
+
+    albums: list[tuple[str, list[MusicLibraryTrack], object | None]] = []
+    get_album = getattr(media_server_client, "get_album", None)
+    for album_id, tracks in groups.items():
+        album = None
+        if callable(get_album):
+            try:
+                album = await get_album(album_id)
+            except Exception as exc:  # noqa: BLE001
+                state.add_log(
+                    "library",
+                    "Existing album identity lookup failed: "
+                    f"album={album_name}, error={exc}",
+                    "WARNING",
+                )
+        albums.append((album_id, tracks, album))
+    albums.sort(
+        key=lambda item: (
+            -len(getattr(item[2], "songs", ()) or item[1]),
+            hashlib.sha1(item[0].encode("utf-8", errors="ignore")).hexdigest(),
+        )
+    )
+    baseline_tracks = albums[0][1]
+    baseline_album = albums[0][2]
+    baseline_raw = (
+        baseline_tracks[0].raw_payload
+        if baseline_tracks and isinstance(baseline_tracks[0].raw_payload, dict)
+        else {}
+    )
+    album_artist = (
+        _optional_string(getattr(baseline_album, "album_artist", None))
+        or _optional_string(baseline_raw.get("displayAlbumArtist"))
+        or _optional_string(baseline_raw.get("albumArtist"))
+        or fallback.album_artist
+    )
+    if len(albums) == 1:
+        return AlbumIdentity(
+            album_artist=album_artist,
+            musicbrainz_album_id=(
+                _optional_string(getattr(baseline_album, "musicbrainz_album_id", None))
+                or fallback.musicbrainz_album_id
+            ),
+            album_version=(
+                _optional_string(getattr(baseline_album, "album_version", None))
+                or fallback.album_version
+            ),
+            release_date=(
+                _optional_string(getattr(baseline_album, "release_date", None))
+                or fallback.release_date
+            ),
+        )
+
+    loaded_albums = [item[2] for item in albums]
+    return AlbumIdentity(
+        album_artist=album_artist,
+        musicbrainz_album_id=(
+            _common_album_identity_value(loaded_albums, "musicbrainz_album_id")
+            or fallback.musicbrainz_album_id
+        ),
+        album_version=(
+            _common_album_identity_value(loaded_albums, "album_version")
+            or fallback.album_version
+        ),
+        release_date=(
+            _common_album_identity_value(loaded_albums, "release_date")
+            or fallback.release_date
+        ),
+    )
+
+
+async def _find_safe_album_identity_anchor(
+    state: AppState,
+    *,
+    media_server_id: str,
+    normalized_album_name: str,
+    identity: AlbumIdentity,
+) -> AlbumIdentityAnchor | None:
+    normalized_artist = normalize_artist_name(identity.album_artist)
+    if not normalized_artist:
+        return None
+    anchors = await state.repository.list_album_identity_anchors(
+        media_server_id=media_server_id,
+        normalized_album_name=normalized_album_name,
+    )
+    compatible = [
+        anchor
+        for anchor in anchors
+        if anchor.normalized_album_artist == normalized_artist
+        and _album_identity_values_compatible(
+            anchor.musicbrainz_album_id,
+            identity.musicbrainz_album_id,
+        )
+        and _album_identity_values_compatible(
+            anchor.album_version,
+            identity.album_version,
+        )
+        and _album_identity_values_compatible(
+            anchor.release_date,
+            identity.release_date,
+        )
+    ]
+    if identity.musicbrainz_album_id:
+        exact = [
+            anchor
+            for anchor in compatible
+            if anchor.musicbrainz_album_id == identity.musicbrainz_album_id
+        ]
+        if len(exact) == 1:
+            return exact[0]
+    return compatible[0] if len(compatible) == 1 else None
+
+
+async def _create_album_identity_anchor(
+    state: AppState,
+    *,
+    media_server_id: str,
+    directory_key: str,
+    album_name: str,
+    normalized_album_name: str,
+    identity: AlbumIdentity,
+    source: str,
+) -> AlbumIdentityAnchor:
+    return await state.repository.create_album_identity_anchor(
+        media_server_id=media_server_id,
+        library_directory_key=directory_key,
+        album_name=album_name,
+        normalized_album_name=normalized_album_name,
+        album_artist=identity.album_artist,
+        normalized_album_artist=normalize_artist_name(identity.album_artist) or None,
+        musicbrainz_album_id=identity.musicbrainz_album_id,
+        album_version=identity.album_version,
+        release_date=identity.release_date,
+        source=source,
+    )
+
+
+def _album_identity_from_metadata(metadata: TrackMetadata) -> AlbumIdentity:
+    album_artists = split_artist_credit(metadata.album_artist)
+    primary_artists = split_artist_credit(metadata.artist)
+    album_artist = (
+        album_artists[0]
+        if album_artists
+        else primary_artists[0]
+        if primary_artists
+        else None
+    )
+    extra = metadata.extra if isinstance(metadata.extra, dict) else {}
+    return AlbumIdentity(
+        album_artist=album_artist,
+        musicbrainz_album_id=(
+            _optional_string(extra.get("musicbrainz_album_id"))
+            or _optional_string(extra.get("musicbrainz_albumid"))
+            or _optional_string(extra.get("musicbrainz_release_id"))
+        ),
+        album_version=(
+            _optional_string(extra.get("album_version"))
+            or _optional_string(extra.get("albumversion"))
+        ),
+        release_date=(
+            _optional_string(extra.get("release_date"))
+            or _optional_string(extra.get("releasedate"))
+        ),
+    )
+
+
+def _physical_album_identity_for_directory(
+    directory: Path,
+    normalized_album_name: str,
+    fallback: AlbumIdentity,
+) -> AlbumIdentity:
+    if not directory.is_dir():
+        return fallback
+    identities: list[AlbumIdentity] = []
+    for path in sorted(directory.iterdir(), key=lambda item: item.name.casefold()):
+        if not path.is_file() or path.suffix.casefold() not in _TORRENT_AUDIO_EXTENSIONS:
+            continue
+        try:
+            metadata = read_track_metadata(path)
+        except Exception:  # noqa: BLE001
+            continue
+        if _normalize_album_identity_text(metadata.album) != normalized_album_name:
+            continue
+        identities.append(_album_identity_from_metadata(metadata))
+    if not identities:
+        return fallback
+    artist_counts = Counter(
+        identity.album_artist for identity in identities if identity.album_artist
+    )
+    album_artist = fallback.album_artist
+    if artist_counts:
+        album_artist = sorted(
+            artist_counts,
+            key=lambda value: (-artist_counts[value], normalize_artist_name(value), value),
+        )[0]
+    return AlbumIdentity(
+        album_artist=album_artist,
+        musicbrainz_album_id=_common_identity_value(
+            identities,
+            "musicbrainz_album_id",
+        ),
+        album_version=_common_identity_value(identities, "album_version"),
+        release_date=_common_identity_value(identities, "release_date"),
+    )
+
+
+def _album_identity_from_anchor(anchor: AlbumIdentityAnchor) -> AlbumIdentity:
+    return AlbumIdentity(
+        album_artist=anchor.album_artist,
+        musicbrainz_album_id=anchor.musicbrainz_album_id,
+        album_version=anchor.album_version,
+        release_date=anchor.release_date,
+    )
+
+
+def _normalize_album_identity_text(value: str | None) -> str:
+    text = unicodedata.normalize("NFKC", value or "")
+    text = _OPENCC_T2S.convert(text).casefold()
+    text = "".join(
+        " " if unicodedata.category(character)[0] in {"P", "Z"} else character
+        for character in text
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _album_identity_location_key(directory: Path, normalized_album_name: str) -> str:
+    try:
+        resolved = directory.expanduser().resolve(strict=False)
+    except OSError:
+        resolved = directory.expanduser().absolute()
+    path_key = unicodedata.normalize("NFKC", resolved.as_posix()).casefold().rstrip("/")
+    return f"{path_key}|album:{normalized_album_name or '-'}"
+
+
+def _library_track_matches_directory(
+    track_path: str | None,
+    planned_directory: Path,
+    roots: tuple[Path, ...],
+) -> bool:
+    if not track_path:
+        return False
+    track_parent = Path(track_path).parent
+    track_keys = _path_match_keys(track_parent, roots)
+    planned_keys = _path_match_keys(planned_directory, roots)
+    return any(
+        _path_key_suffix_matches(left.casefold(), right.casefold())
+        for left in track_keys
+        for right in planned_keys
+    )
+
+
+def _album_identity_values_compatible(left: str | None, right: str | None) -> bool:
+    return not left or not right or left.casefold() == right.casefold()
+
+
+def _common_album_identity_value(albums: list[object | None], field: str) -> str | None:
+    values = [_optional_string(getattr(album, field, None)) for album in albums]
+    if not values or any(value is None for value in values):
+        return None
+    normalized = {value.casefold() for value in values if value is not None}
+    return values[0] if len(normalized) == 1 else None
+
+
+def _common_identity_value(
+    identities: list[AlbumIdentity],
+    field: str,
+) -> str | None:
+    return _common_album_identity_value(list(identities), field)
+
+
 def _scraping_file_transfer_runner(
     state: AppState,
 ) -> Callable[[Path, Callable[[], Awaitable[ScrapingFileOutcome]]], Awaitable[ScrapingFileOutcome]]:
@@ -8683,6 +9176,8 @@ async def _scrape_manual_source_files(
             "WARNING" if item.status == "failed" else "INFO",
         )
 
+    album_identity_acquirer = await _album_identity_lease_acquirer(state, config)
+
     async def run_scrape() -> ScrapingSummary:
         forced_metadata = {
             source_file: candidates[0]
@@ -8700,6 +9195,7 @@ async def _scrape_manual_source_files(
             contextual_metadata=contextual_metadata,
             on_file_result=record_file_result,
             transfer_runner=_scraping_file_transfer_runner(state),
+            album_identity_lease_acquirer=album_identity_acquirer,
         )
 
     if use_task_manager:
@@ -9070,6 +9566,7 @@ async def _scrape_download_for_task(
             task,
             source_files,
         )
+        album_identity_acquirer = await _album_identity_lease_acquirer(state, config)
 
         async def run_scrape() -> ScrapingSummary:
             return await state.scraper.process_download(
@@ -9081,6 +9578,7 @@ async def _scrape_download_for_task(
                 media_history=media_history,
                 cached_metadata=cached_metadata,
                 transfer_runner=_scraping_file_transfer_runner(state),
+                album_identity_lease_acquirer=album_identity_acquirer,
             )
 
         if use_task_manager:

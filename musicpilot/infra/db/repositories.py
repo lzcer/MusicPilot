@@ -17,6 +17,8 @@ from sqlalchemy.exc import IntegrityError
 
 from musicpilot.core.defaults import DEFAULT_SEARCH_EXCLUDE_KEYWORDS
 from musicpilot.infra.db.models import (
+    AlbumIdentityAnchor,
+    AlbumIdentityLocation,
     Artist,
     ArtistAlias,
     DownloaderConfig,
@@ -85,6 +87,168 @@ def _log_slow_db_operation(operation: str, started_at: float, **fields: Any) -> 
 class SqlAlchemyMediaRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
+
+    async def get_album_identity_anchor_by_location(
+        self,
+        *,
+        media_server_id: str,
+        library_directory_key: str,
+    ) -> AlbumIdentityAnchor | None:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(AlbumIdentityAnchor)
+                .join(
+                    AlbumIdentityLocation,
+                    AlbumIdentityLocation.anchor_id == AlbumIdentityAnchor.id,
+                )
+                .where(
+                    AlbumIdentityLocation.media_server_id == media_server_id,
+                    AlbumIdentityLocation.library_directory_key == library_directory_key,
+                )
+                .limit(1)
+            )
+            return result.scalars().first()
+
+    async def list_album_identity_anchors(
+        self,
+        *,
+        media_server_id: str,
+        normalized_album_name: str,
+    ) -> list[AlbumIdentityAnchor]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(AlbumIdentityAnchor)
+                .where(
+                    AlbumIdentityAnchor.media_server_id == media_server_id,
+                    AlbumIdentityAnchor.normalized_album_name == normalized_album_name,
+                )
+                .order_by(AlbumIdentityAnchor.id)
+            )
+            return list(result.scalars().all())
+
+    async def create_album_identity_anchor(
+        self,
+        *,
+        media_server_id: str,
+        library_directory_key: str,
+        album_name: str,
+        normalized_album_name: str,
+        album_artist: str | None,
+        normalized_album_artist: str | None,
+        musicbrainz_album_id: str | None,
+        album_version: str | None,
+        release_date: str | None,
+        source: str,
+    ) -> AlbumIdentityAnchor:
+        async with self.database.session() as session:
+            anchor = AlbumIdentityAnchor(
+                media_server_id=media_server_id,
+                album_name=album_name,
+                normalized_album_name=normalized_album_name,
+                album_artist=album_artist,
+                normalized_album_artist=normalized_album_artist,
+                musicbrainz_album_id=musicbrainz_album_id,
+                album_version=album_version,
+                release_date=release_date,
+                source=source,
+            )
+            session.add(anchor)
+            await session.flush()
+            session.add(
+                AlbumIdentityLocation(
+                    anchor_id=anchor.id,
+                    media_server_id=media_server_id,
+                    library_directory_key=library_directory_key,
+                )
+            )
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                result = await session.execute(
+                    select(AlbumIdentityAnchor)
+                    .join(
+                        AlbumIdentityLocation,
+                        AlbumIdentityLocation.anchor_id == AlbumIdentityAnchor.id,
+                    )
+                    .where(
+                        AlbumIdentityLocation.media_server_id == media_server_id,
+                        AlbumIdentityLocation.library_directory_key
+                        == library_directory_key,
+                    )
+                    .limit(1)
+                )
+                existing = result.scalars().first()
+                if existing is not None:
+                    return existing
+                raise
+            await session.refresh(anchor)
+            return anchor
+
+    async def bind_album_identity_location(
+        self,
+        *,
+        anchor_id: int,
+        media_server_id: str,
+        library_directory_key: str,
+    ) -> AlbumIdentityAnchor:
+        async with self.database.session() as session:
+            session.add(
+                AlbumIdentityLocation(
+                    anchor_id=anchor_id,
+                    media_server_id=media_server_id,
+                    library_directory_key=library_directory_key,
+                )
+            )
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+            result = await session.execute(
+                select(AlbumIdentityAnchor)
+                .join(
+                    AlbumIdentityLocation,
+                    AlbumIdentityLocation.anchor_id == AlbumIdentityAnchor.id,
+                )
+                .where(
+                    AlbumIdentityLocation.media_server_id == media_server_id,
+                    AlbumIdentityLocation.library_directory_key == library_directory_key,
+                )
+                .limit(1)
+            )
+            anchor = result.scalars().first()
+            if anchor is None:
+                raise RuntimeError("Album identity location could not be persisted.")
+            return anchor
+
+    async def update_album_identity_anchor(
+        self,
+        anchor_id: int,
+        *,
+        album_name: str,
+        normalized_album_name: str,
+        album_artist: str | None,
+        normalized_album_artist: str | None,
+        musicbrainz_album_id: str | None,
+        album_version: str | None,
+        release_date: str | None,
+        source: str,
+    ) -> AlbumIdentityAnchor | None:
+        async with self.database.session() as session:
+            anchor = await session.get(AlbumIdentityAnchor, anchor_id)
+            if anchor is None:
+                return None
+            anchor.album_name = album_name
+            anchor.normalized_album_name = normalized_album_name
+            anchor.album_artist = album_artist
+            anchor.normalized_album_artist = normalized_album_artist
+            anchor.musicbrainz_album_id = musicbrainz_album_id
+            anchor.album_version = album_version
+            anchor.release_date = release_date
+            anchor.source = source
+            await session.commit()
+            await session.refresh(anchor)
+            return anchor
 
     async def record_processed_media(
         self,

@@ -76,7 +76,7 @@ def split_artist_credit(value: str | None) -> list[str]:
     if not value:
         return []
     pattern = re.compile(
-        r"\s*(?:/|、|,|，|&|＆|\+|•|\bfeat\.?|\bft\.?|\bfeaturing\b|\bwith\b)\s*",
+        r"\s*(?:/|、|,|，|&|＆|\+|•|×|\bfeat\.?|\bft\.?|\bfeaturing\b|\bwith\b)\s*",
         re.IGNORECASE,
     )
     names: list[str] = []

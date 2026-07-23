@@ -5,6 +5,14 @@ from typing import Protocol
 
 
 @dataclass(frozen=True, slots=True)
+class AlbumIdentity:
+    album_artist: str | None = None
+    musicbrainz_album_id: str | None = None
+    album_version: str | None = None
+    release_date: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class TrackMetadata:
     title: str
     artist: str | None = None

@@ -22,7 +22,7 @@ from musicpilot.core.track_variants import (
     strong_variants_match,
     variant_sort_score,
 )
-from musicpilot.ports.metadata import TrackMetadata
+from musicpilot.ports.metadata import AlbumIdentity, TrackMetadata
 from musicpilot.ports.tag_writer import TagWriter
 
 logger = logging.getLogger("musicpilot.metadata.scraping")
@@ -217,6 +217,18 @@ TransferRunner = Callable[
 ]
 
 
+@dataclass(slots=True)
+class AlbumIdentityLease:
+    identity: AlbumIdentity
+    release: Callable[[], Awaitable[None]]
+
+
+AlbumIdentityLeaseAcquirer = Callable[
+    [Path, TrackMetadata, Path],
+    Awaitable[AlbumIdentityLease],
+]
+
+
 @dataclass(frozen=True, slots=True)
 class ContextualMetadata:
     metadata: TrackMetadata
@@ -295,6 +307,7 @@ class LocalMusicScraper:
         on_file_result: Callable[[ScrapingFileResult], Awaitable[None]] | None = None,
         library_snapshot_loader: LibrarySnapshotLoader | None = None,
         transfer_runner: TransferRunner | None = None,
+        album_identity_lease_acquirer: AlbumIdentityLeaseAcquirer | None = None,
         preload_metadata: bool = True,
         metadata_lookup_completed_files: set[Path] | None = None,
         inferred_metadata: dict[Path, TrackMetadata] | None = None,
@@ -349,9 +362,11 @@ class LocalMusicScraper:
             )
 
         for source_file in audio_files:
+            album_leases: list[AlbumIdentityLease] = []
             try:
                 async def run_file(
                     source_file: Path = source_file,
+                    album_leases: list[AlbumIdentityLease] = album_leases,
                 ) -> ScrapingFileOutcome:
                     return await self._process_file(
                         source_file,
@@ -364,6 +379,8 @@ class LocalMusicScraper:
                         contextual_metadata=(contextual_metadata or {}).get(source_file),
                         library_snapshot_loader=library_snapshot_loader,
                         transfer_runner=transfer_runner,
+                        album_identity_lease_acquirer=album_identity_lease_acquirer,
+                        album_lease_holder=album_leases,
                         metadata_lookup_completed=source_file in lookup_completed_paths,
                     )
 
@@ -393,12 +410,16 @@ class LocalMusicScraper:
                     stage=exc.__class__.__name__,
                 )
                 mapped = updated = moved = 0
-            results.append(result)
-            mapped_files += mapped
-            updated_files += updated
-            moved_files += moved
-            if on_file_result is not None:
-                await on_file_result(result)
+            try:
+                results.append(result)
+                mapped_files += mapped
+                updated_files += updated
+                moved_files += moved
+                if on_file_result is not None:
+                    await on_file_result(result)
+            finally:
+                for lease in reversed(album_leases):
+                    await lease.release()
 
         await self._organize_album_covers(config, tuple(results))
 
@@ -734,6 +755,8 @@ class LocalMusicScraper:
         contextual_metadata: ContextualMetadata | None = None,
         library_snapshot_loader: LibrarySnapshotLoader | None = None,
         transfer_runner: TransferRunner | None = None,
+        album_identity_lease_acquirer: AlbumIdentityLeaseAcquirer | None = None,
+        album_lease_holder: list[AlbumIdentityLease] | None = None,
         metadata_lookup_completed: bool = False,
     ) -> ScrapingFileOutcome:
         working_file = source_file
@@ -1167,7 +1190,11 @@ class LocalMusicScraper:
                     metadata,
                     missing_before,
                 )
-        writes_tags = should_write_tags or bool(metadata_gain)
+        writes_tags = (
+            should_write_tags
+            or bool(metadata_gain)
+            or album_identity_lease_acquirer is not None
+        )
         if tag_writer is None and writes_tags:
             logger.info(
                 "Scraping file result: source=%s, status=failed, stage=tag_writer, "
@@ -1203,6 +1230,41 @@ class LocalMusicScraper:
             canonical = await self.artist_service.get_canonical_name(metadata.artist)
             if canonical is not None:
                 metadata = replace(metadata, artist=canonical)
+
+        classification_artist = _classification_artist(metadata, config)
+        if classification_artist is not None and self.artist_service is not None:
+            try:
+                classification_artist = await self.artist_service.get_or_create_canonical_name(
+                    classification_artist,
+                    source="scraping",
+                )
+            except Exception as exc:
+                raise ArtistDirectoryResolutionError(
+                    f"歌手权威名查询或创建失败：{classification_artist}：{exc}"
+                ) from exc
+
+        album_identity: AlbumIdentity | None = None
+        if album_identity_lease_acquirer is not None:
+            planned_directory = _planned_library_directory(
+                source_file,
+                metadata,
+                config,
+                classification_artist=classification_artist,
+            )
+            lease = await album_identity_lease_acquirer(
+                source_file,
+                metadata,
+                planned_directory,
+            )
+            if album_lease_holder is None:
+                await lease.release()
+                raise RuntimeError("Album identity lease holder is unavailable.")
+            album_lease_holder.append(lease)
+            album_identity = lease.identity
+            metadata = replace(
+                metadata,
+                album_artist=album_identity.album_artist or metadata.album_artist,
+            )
 
         duplicate_match = await _find_duplicate_media(
             _duplicate_metadata_candidates(source_metadata, match_metadata, metadata),
@@ -1291,18 +1353,6 @@ class LocalMusicScraper:
             elif config.duplicate_handling in {"overwrite", "keep_largest"}:
                 overwrite_duplicate = True
 
-        classification_artist = _classification_artist(metadata, config)
-        if classification_artist is not None and self.artist_service is not None:
-            try:
-                classification_artist = await self.artist_service.get_or_create_canonical_name(
-                    classification_artist,
-                    source="scraping",
-                )
-            except Exception as exc:
-                raise ArtistDirectoryResolutionError(
-                    f"歌手权威名查询或创建失败：{classification_artist}：{exc}"
-                ) from exc
-
         overwritten_existing_target = False
         operation_type = config.mode
         path_result: _PathOperationResult | None = None
@@ -1366,7 +1416,11 @@ class LocalMusicScraper:
         try:
             if writes_tags:
                 assert tag_writer is not None
-                await tag_writer.write(working_file, metadata)
+                await tag_writer.write(
+                    working_file,
+                    metadata,
+                    album_identity=album_identity,
+                )
                 updated_files += 1
                 validate_cover = (
                     "cover" in config.required_metadata or "cover" in metadata_gain
@@ -1748,6 +1802,7 @@ def read_track_metadata(path: Path) -> TrackMetadata:
     track_number = None
     lyrics = None
     has_cover = False
+    extra: dict[str, str] = {}
     if audio is not None and audio.tags:
         title = _first_tag(audio.tags.get("title")) or title
         artist = _first_tag(audio.tags.get("artist"))
@@ -1756,9 +1811,14 @@ def read_track_metadata(path: Path) -> TrackMetadata:
         year = _parse_year(_first_tag(audio.tags.get("date")))
         track_number = _parse_track_number(_first_tag(audio.tags.get("tracknumber")))
         lyrics = _first_tag(audio.tags.get("lyrics"))
+        musicbrainz_album_id = _first_tag(audio.tags.get("musicbrainz_albumid"))
+        if musicbrainz_album_id:
+            extra["musicbrainz_album_id"] = musicbrainz_album_id
     try:
         raw_audio = MutagenFile(path)
         has_cover = raw_audio is not None and _audio_has_embedded_cover(raw_audio)
+        if raw_audio is not None:
+            extra.update(_read_album_identity_tags(raw_audio))
     except Exception:  # noqa: BLE001
         logger.debug("Embedded cover detection failed: path=%s", path, exc_info=True)
     return TrackMetadata(
@@ -1770,7 +1830,63 @@ def read_track_metadata(path: Path) -> TrackMetadata:
         track_number=track_number,
         lyrics=lyrics,
         has_cover=has_cover,
+        extra=extra,
     )
+
+
+def _read_album_identity_tags(audio: object) -> dict[str, str]:
+    from mutagen.flac import FLAC
+    from mutagen.mp3 import MP3
+    from mutagen.mp4 import MP4
+    from mutagen.oggopus import OggOpus
+    from mutagen.oggvorbis import OggVorbis
+
+    result: dict[str, str] = {}
+    tags = getattr(audio, "tags", None)
+    if tags is None:
+        return result
+    if isinstance(audio, MP3):
+        version_frames = tags.getall("TXXX:ALBUMVERSION")
+        release_frames = tags.getall("TDRL")
+        album_version = _first_frame_text(version_frames)
+        release_date = _first_frame_text(release_frames)
+    elif isinstance(audio, FLAC | OggVorbis | OggOpus):
+        album_version = _first_tag(tags.get("ALBUMVERSION"))
+        release_date = _first_tag(tags.get("RELEASEDATE"))
+    elif isinstance(audio, MP4):
+        album_version = _first_mp4_freeform(
+            tags.get("----:com.apple.iTunes:ALBUMVERSION")
+        )
+        release_date = _first_tag(tags.get("\xa9day")) or _first_mp4_freeform(
+            tags.get("----:com.apple.iTunes:RELEASEDATE")
+        )
+    else:
+        return result
+    if album_version:
+        result["album_version"] = album_version
+    if release_date:
+        result["release_date"] = release_date
+    return result
+
+
+def _first_frame_text(frames: object) -> str | None:
+    if not isinstance(frames, list) or not frames:
+        return None
+    text = getattr(frames[0], "text", None)
+    if isinstance(text, (list, tuple)) and text:
+        text = text[0]
+    if text is None:
+        return None
+    return str(text).strip() or None
+
+
+def _first_mp4_freeform(values: object) -> str | None:
+    if not isinstance(values, list) or not values:
+        return None
+    value = values[0]
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip() or None
+    return str(value).strip() or None
 
 
 def _audio_has_embedded_cover(audio: object) -> bool:
@@ -2381,6 +2497,52 @@ def _copy_to_mapping(
         overwritten_existing=overwritten_existing,
         cause="hardlink_failed" if hardlink_failed else "copy_requested",
     )
+
+
+def _planned_library_directory(
+    source_file: Path,
+    metadata: TrackMetadata,
+    config: ScrapingConfig,
+    *,
+    classification_artist: str | None = None,
+) -> Path:
+    if config.mode in {"mapped", "copy"} and config.mapped_directory is not None:
+        relative_parent = Path()
+        if config.source_directory is not None:
+            try:
+                relative_parent = source_file.relative_to(config.source_directory).parent
+            except ValueError:
+                pass
+        target_dir = config.mapped_directory / relative_parent
+    else:
+        target_dir = source_file.parent
+    if not config.auto_classify:
+        return target_dir
+
+    primary_artist = _primary_artist(metadata.artist)
+    if config.classify_by == "artist_album":
+        groups = (
+            classification_artist or metadata.album_artist or primary_artist,
+            metadata.album or "未知专辑",
+        )
+    else:
+        groups = (
+            (
+                classification_artist or primary_artist
+                if config.classify_by == "artist"
+                else metadata.album
+            ),
+        )
+    classify_root = (
+        config.mapped_directory
+        if config.mode in {"mapped", "copy"}
+        else config.source_directory
+    )
+    target_dir = classify_root or target_dir
+    for group in groups:
+        if group:
+            target_dir /= _safe_path_part(group)
+    return target_dir
 
 
 def _classify_or_rename(

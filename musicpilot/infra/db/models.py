@@ -4,7 +4,17 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -118,6 +128,49 @@ class MusicLibraryTrack(TimestampMixin, Base):
     content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     last_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class AlbumIdentityAnchor(TimestampMixin, Base):
+    __tablename__ = "album_identity_anchors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    media_server_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("media_servers.id", ondelete="CASCADE"),
+        index=True,
+    )
+    album_name: Mapped[str] = mapped_column(String(512))
+    normalized_album_name: Mapped[str] = mapped_column(String(512), index=True)
+    album_artist: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    normalized_album_artist: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    musicbrainz_album_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    album_version: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    release_date: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str] = mapped_column(String(32), default="scraping")
+
+
+class AlbumIdentityLocation(TimestampMixin, Base):
+    __tablename__ = "album_identity_locations"
+    __table_args__ = (
+        UniqueConstraint(
+            "media_server_id",
+            "library_directory_key",
+            name="uq_album_identity_location_server_directory",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    anchor_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("album_identity_anchors.id", ondelete="CASCADE"),
+        index=True,
+    )
+    media_server_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("media_servers.id", ondelete="CASCADE"),
+        index=True,
+    )
+    library_directory_key: Mapped[str] = mapped_column(Text)
 
 
 class MusicPlatformConnection(TimestampMixin, Base):

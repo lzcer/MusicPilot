@@ -20,6 +20,18 @@ class MediaServerTrack:
 
 
 @dataclass(frozen=True, slots=True)
+class MediaServerAlbum:
+    id: str
+    name: str
+    album_artist: str | None = None
+    musicbrainz_album_id: str | None = None
+    album_version: str | None = None
+    release_date: str | None = None
+    songs: tuple[MediaServerTrack, ...] = ()
+    raw_payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class MediaServerPlaylistSyncResult:
     playlist_id: str | None
     synced_count: int
@@ -33,6 +45,8 @@ class MediaServerClient(Protocol):
     async def ping(self) -> None: ...
 
     async def list_tracks(self) -> list[MediaServerTrack]: ...
+
+    async def get_album(self, album_id: str) -> MediaServerAlbum | None: ...
 
     async def start_scan(self) -> None: ...
 

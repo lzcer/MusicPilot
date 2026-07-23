@@ -7,6 +7,7 @@ from uuid import uuid4
 import httpx
 
 from musicpilot.ports.media_server import (
+    MediaServerAlbum,
     MediaServerPlaylistSyncResult,
     MediaServerTrack,
 )
@@ -64,6 +65,48 @@ class NavidromeMediaServerClient:
                     break
                 offset += page_size
         return tracks
+
+    async def get_album(self, album_id: str) -> MediaServerAlbum | None:
+        if not album_id.strip():
+            return None
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=20) as client:
+            response = await client.get(
+                "/rest/getAlbum.view",
+                params={**self._params(), "id": album_id},
+            )
+            body = _validate_navidrome_json_response(response)
+        payload = body.get("album")
+        if not isinstance(payload, dict):
+            return None
+        songs_payload = payload.get("song")
+        if isinstance(songs_payload, dict):
+            songs_payload = [songs_payload]
+        songs = tuple(
+            _track_from_payload(item)
+            for item in songs_payload or []
+            if isinstance(item, dict)
+        )
+        return MediaServerAlbum(
+            id=str(payload.get("id") or album_id).strip(),
+            name=str(payload.get("name") or payload.get("album") or "").strip(),
+            album_artist=(
+                _optional_string(payload.get("displayArtist"))
+                or _optional_string(payload.get("displayAlbumArtist"))
+                or _optional_string(payload.get("artist"))
+            ),
+            musicbrainz_album_id=(
+                _optional_string(payload.get("musicBrainzId"))
+                or _optional_string(payload.get("musicbrainzAlbumId"))
+                or _optional_string(payload.get("mbzAlbumId"))
+            ),
+            album_version=(
+                _optional_string(payload.get("albumVersion"))
+                or _optional_string(payload.get("version"))
+            ),
+            release_date=_release_date_from_payload(payload),
+            songs=songs,
+            raw_payload=payload,
+        )
 
     async def start_scan(self) -> None:
         async with httpx.AsyncClient(base_url=self.base_url, timeout=30) as client:
@@ -211,6 +254,24 @@ def _track_from_payload(payload: dict[str, Any]) -> MediaServerTrack:
         content_type=_optional_string(payload.get("contentType")),
         raw_payload=payload,
     )
+
+
+def _release_date_from_payload(payload: dict[str, Any]) -> str | None:
+    value = payload.get("releaseDate") or payload.get("originalReleaseDate")
+    if isinstance(value, str):
+        return _optional_string(value)
+    if not isinstance(value, dict):
+        return None
+    year = _optional_int(value.get("year"))
+    month = _optional_int(value.get("month"))
+    day = _optional_int(value.get("day"))
+    if year is None:
+        return None
+    if month is None:
+        return str(year)
+    if day is None:
+        return f"{year:04d}-{month:02d}"
+    return f"{year:04d}-{month:02d}-{day:02d}"
 
 
 def _playlist_id_from_body(body: dict[str, object]) -> str | None:
