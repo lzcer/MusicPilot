@@ -9656,6 +9656,7 @@ async def _organize_manual_source_file(
         str(source_path),
     )
     library_tracks, media_history = await _scraping_library_snapshots(state)
+    album_identity_acquirer = await _album_identity_lease_acquirer(state, config)
 
     async def record_file_result(result: ScrapingFileResult) -> None:
         if result.status in {"success", "skipped"}:
@@ -9689,6 +9690,7 @@ async def _organize_manual_source_file(
         media_history=media_history,
         cached_metadata={source_file: candidates} if candidates else {},
         on_file_result=record_file_result,
+        album_identity_lease_acquirer=album_identity_acquirer,
         preload_metadata=False,
         metadata_lookup_completed_files={source_file},
         inferred_metadata=(
@@ -9743,6 +9745,7 @@ async def _organize_download_task_item(
     library_tracks, media_history = await _scraping_library_snapshots(state)
     candidates = _download_item_metadata_candidates(item.metadata_payload)
     cached_metadata = {source_file: candidates} if candidates else {}
+    album_identity_acquirer = await _album_identity_lease_acquirer(state, config)
 
     async def record_file_result(result: ScrapingFileResult) -> None:
         if result.status in {"success", "skipped"}:
@@ -9777,6 +9780,7 @@ async def _organize_download_task_item(
             media_history=media_history,
             cached_metadata=cached_metadata,
             on_file_result=record_file_result,
+            album_identity_lease_acquirer=album_identity_acquirer,
         )
     except Exception as exc:  # noqa: BLE001
         state.add_log(

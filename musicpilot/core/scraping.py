@@ -1190,11 +1190,7 @@ class LocalMusicScraper:
                     metadata,
                     missing_before,
                 )
-        writes_tags = (
-            should_write_tags
-            or bool(metadata_gain)
-            or album_identity_lease_acquirer is not None
-        )
+        writes_tags = should_write_tags or bool(metadata_gain)
         if tag_writer is None and writes_tags:
             logger.info(
                 "Scraping file result: source=%s, status=failed, stage=tag_writer, "
@@ -1244,7 +1240,7 @@ class LocalMusicScraper:
                 ) from exc
 
         album_identity: AlbumIdentity | None = None
-        if album_identity_lease_acquirer is not None:
+        if writes_tags and album_identity_lease_acquirer is not None:
             planned_directory = _planned_library_directory(
                 source_file,
                 metadata,
