@@ -230,6 +230,7 @@ from musicpilot.infra.db.models import (
 )
 from musicpilot.infra.scheduler import SubscriptionScheduler
 from musicpilot.ports.downloader import Downloader, DownloadState, DownloadStatus
+from musicpilot.ports.media_server import MEDIA_SERVER_TRACK_PAGE_SIZE, MediaServerTrack
 from musicpilot.ports.metadata import AlbumIdentity, MediaCandidate, TrackMetadata
 
 _OPENCC_T2S = OpenCC("t2s")
@@ -254,6 +255,7 @@ TAGGED_DOWNLOAD_MONITOR_INTERVAL_SECONDS = 30
 MUSIC_LIBRARY_SYNC_INTERVAL_SECONDS = 3600
 LIBRARY_STORAGE_REFRESH_INTERVAL_SECONDS = 30 * 60
 MUSIC_LIBRARY_SYNC_AFTER_REFRESH_DELAY_SECONDS = 5
+MUSIC_LIBRARY_SYNC_MAX_PAGES = 10_000
 SLOW_API_OPERATION_SECONDS = float(os.getenv("MP_SLOW_API_OPERATION_SECONDS", "0.5"))
 PLAYLIST_TRACK_RETRYABLE_STATUSES = {
     "failed",
@@ -899,6 +901,7 @@ class AppState:
         self.artist_build_started_at: datetime | None = None
         self.artist_build_finished_at: datetime | None = None
         self.artist_build_last_error: str | None = None
+        self.music_library_sync_lock = asyncio.Lock()
         self.library_storage_lock = asyncio.Lock()
         self.audio_detail_cache = AudioDetailCache(
             max_entries=_AUDIO_DETAIL_CACHE_MAX_ENTRIES,
@@ -7644,43 +7647,207 @@ async def _sync_music_library_from_media_server(
     *,
     refresh_all_playlist_matches: bool = False,
 ) -> int:
-    sync_started_at = time.perf_counter()
-    server = await state.repository.default_media_server()
-    if server is None:
-        state.add_log("library", "Music library sync skipped: no media server", "WARNING")
-        return 0
-    client = build_media_server_client(server)
-    fetch_started_at = time.perf_counter()
-    tracks = await client.list_tracks()
-    fetch_ms = _elapsed_ms(fetch_started_at)
-    database_started_at = time.perf_counter()
-    result = await state.repository.sync_music_library_tracks(
-        [_media_server_track_payload(track) for track in tracks]
-    )
-    database_ms = _elapsed_ms(database_started_at)
-    matching_started_at = time.perf_counter()
-    if refresh_all_playlist_matches:
-        matched = await _refresh_playlist_library_matches(state)
-    else:
-        matched = await _refresh_playlist_matches_for_library_changes(
-            state,
-            changed_track_ids=result.changed_track_ids,
-            deleted_track_ids=result.deleted_track_ids,
+    async with state.music_library_sync_lock:
+        sync_started_at = time.perf_counter()
+        server = await state.repository.default_media_server()
+        if server is None:
+            state.add_log("library", "Music library sync skipped: no media server", "WARNING")
+            return 0
+
+        baseline_rss_kib = _current_process_rss_kib()
+        state.add_log(
+            "library",
+            "Music library sync started: "
+            f"rss_kib={_rss_log_value(baseline_rss_kib)}, "
+            f"refresh_all_playlist_matches={refresh_all_playlist_matches}",
         )
-    matching_ms = _elapsed_ms(matching_started_at)
-    state.add_log(
-        "library",
-        f"Music library synced: {result.total} track(s), "
-        f"written={result.written}, unchanged={result.unchanged}, "
-        f"changed={len(result.changed_track_ids)}, deleted={len(result.deleted_track_ids)}, "
-        f"playlist_matches={matched}, fetch_ms={fetch_ms:.1f}, "
-        f"database_ms={database_ms:.1f}, matching_ms={matching_ms:.1f}, "
-        f"total_ms={_elapsed_ms(sync_started_at):.1f}",
-    )
-    return result.total
+        recover_full_playlist_matches = (
+            await state.repository.get_music_library_sync_recovery()
+        )
+        await state.repository.set_music_library_sync_recovery(incomplete=True)
+
+        client = build_media_server_client(server)
+        synced_at = datetime.now(UTC)
+        seen_ids: set[str] = set()
+        changed_track_ids: list[int] = []
+        deleted_track_ids: list[int] = []
+        page_count = 0
+        written = 0
+        unchanged = 0
+        fetch_ms = 0.0
+        database_ms = 0.0
+        page_rss_peak_kib = baseline_rss_kib
+
+        async with contextlib.aclosing(client.iter_track_pages()) as pages:
+            while True:
+                page_started_at = time.perf_counter()
+                fetch_started_at = time.perf_counter()
+                try:
+                    page = await anext(pages)
+                except StopAsyncIteration:
+                    fetch_ms += _elapsed_ms(fetch_started_at)
+                    break
+                fetch_ms += _elapsed_ms(fetch_started_at)
+                page_count += 1
+                if page_count > MUSIC_LIBRARY_SYNC_MAX_PAGES:
+                    raise RuntimeError(
+                        "Music library sync exceeded the 10000-page safety limit."
+                    )
+
+                page_ids: set[str] = set()
+                page_tracks: list[MediaServerTrack] = []
+                duplicate_page_ids = 0
+                duplicate_previous_ids = 0
+                for track in page.tracks:
+                    if track.id in page_ids:
+                        duplicate_page_ids += 1
+                        continue
+                    page_ids.add(track.id)
+                    if track.id in seen_ids:
+                        duplicate_previous_ids += 1
+                        continue
+                    seen_ids.add(track.id)
+                    page_tracks.append(track)
+                if duplicate_page_ids:
+                    state.add_log(
+                        "library",
+                        "Music library sync page contained duplicate IDs: "
+                        f"page={page_count}, duplicates={duplicate_page_ids}",
+                        "WARNING",
+                    )
+                if duplicate_previous_ids:
+                    state.add_log(
+                        "library",
+                        "Music library sync page repeated IDs from previous pages: "
+                        f"page={page_count}, duplicates={duplicate_previous_ids}",
+                        "WARNING",
+                    )
+                if not page_tracks:
+                    raise RuntimeError(
+                        "Music library pagination did not advance: "
+                        f"page {page_count} contained no new track IDs."
+                    )
+
+                payloads = [_media_server_track_payload(track) for track in page_tracks]
+                database_started_at = time.perf_counter()
+                page_result = await state.repository.sync_music_library_track_page(
+                    payloads,
+                    synced_at=synced_at,
+                )
+                page_database_ms = _elapsed_ms(database_started_at)
+                database_ms += page_database_ms
+                written += page_result.written
+                unchanged += page_result.unchanged
+                changed_track_ids.extend(page_result.changed_track_ids)
+
+                page_rss_kib = _current_process_rss_kib()
+                if page_rss_kib is not None:
+                    page_rss_peak_kib = max(page_rss_peak_kib or 0, page_rss_kib)
+                state.add_log(
+                    "library",
+                    "Music library sync page completed: "
+                    f"page={page_count}, raw={page.raw_count}, "
+                    f"tracks={page_result.total}, total={len(seen_ids)}, "
+                    f"written={page_result.written}, unchanged={page_result.unchanged}, "
+                    f"database_ms={page_database_ms:.1f}, "
+                    f"page_ms={_elapsed_ms(page_started_at):.1f}, "
+                    f"rss_kib={_rss_log_value(page_rss_kib)}, "
+                    f"page_rss_peak_kib={_rss_log_value(page_rss_peak_kib)}",
+                )
+                del page_result, payloads, page_tracks, page_ids, page
+        del pages
+
+        total = len(seen_ids)
+        enumeration_rss_kib = _current_process_rss_kib()
+        state.add_log(
+            "library",
+            "Music library enumeration completed: "
+            f"pages={page_count}, tracks={total}, written={written}, "
+            f"unchanged={unchanged}, fetch_ms={fetch_ms:.1f}, "
+            f"database_ms={database_ms:.1f}, "
+            f"rss_kib={_rss_log_value(enumeration_rss_kib)}, "
+            f"page_rss_peak_kib={_rss_log_value(page_rss_peak_kib)}",
+        )
+
+        deletion_started_at = time.perf_counter()
+        deleted_track_ids.extend(
+            await state.repository.delete_music_library_tracks_missing_from(
+                seen_ids,
+                page_size=MEDIA_SERVER_TRACK_PAGE_SIZE,
+            )
+        )
+        deletion_ms = _elapsed_ms(deletion_started_at)
+        seen_ids.clear()
+        del seen_ids
+        deletion_rss_kib = _current_process_rss_kib()
+        state.add_log(
+            "library",
+            "Music library deletion completed: "
+            f"deleted={len(deleted_track_ids)}, deletion_ms={deletion_ms:.1f}, "
+            f"rss_kib={_rss_log_value(deletion_rss_kib)}",
+        )
+
+        matching_started_at = time.perf_counter()
+        refresh_all = recover_full_playlist_matches or refresh_all_playlist_matches
+        if refresh_all:
+            matched = await _refresh_playlist_library_matches(state)
+        else:
+            matched = await _refresh_playlist_matches_for_library_changes(
+                state,
+                changed_track_ids=changed_track_ids,
+                deleted_track_ids=deleted_track_ids,
+            )
+        matching_ms = _elapsed_ms(matching_started_at)
+        matching_rss_kib = _current_process_rss_kib()
+        state.add_log(
+            "library",
+            "Music library playlist matching completed: "
+            f"mode={'full' if refresh_all else 'incremental'}, matched={matched}, "
+            f"matching_ms={matching_ms:.1f}, "
+            f"rss_kib={_rss_log_value(matching_rss_kib)}",
+        )
+
+        await state.repository.set_music_library_sync_recovery(incomplete=False)
+        final_rss_kib = _current_process_rss_kib()
+        state.add_log(
+            "library",
+            f"Music library synced: {total} track(s), "
+            f"pages={page_count}, written={written}, unchanged={unchanged}, "
+            f"changed={len(changed_track_ids)}, deleted={len(deleted_track_ids)}, "
+            f"playlist_matches={matched}, fetch_ms={fetch_ms:.1f}, "
+            f"database_ms={database_ms:.1f}, deletion_ms={deletion_ms:.1f}, "
+            f"matching_ms={matching_ms:.1f}, total_ms={_elapsed_ms(sync_started_at):.1f}, "
+            f"baseline_rss_kib={_rss_log_value(baseline_rss_kib)}, "
+            f"final_rss_kib={_rss_log_value(final_rss_kib)}, "
+            f"page_rss_peak_kib={_rss_log_value(page_rss_peak_kib)}",
+        )
+        return total
 
 
-def _media_server_track_payload(track: object) -> dict[str, Any]:
+def _current_process_rss_kib() -> int | None:
+    status_path = Path("/proc/self/status")
+    try:
+        status = status_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    for line in status.splitlines():
+        if not line.startswith("VmRSS:"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            return None
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
+    return None
+
+
+def _rss_log_value(value: int | None) -> str:
+    return str(value) if value is not None else "unavailable"
+
+
+def _media_server_track_payload(track: MediaServerTrack) -> dict[str, Any]:
     return {
         "id": getattr(track, "id", ""),
         "title": getattr(track, "title", ""),

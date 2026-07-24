@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+from collections.abc import AsyncGenerator
 from typing import Any
 from uuid import uuid4
 
 import httpx
 
 from musicpilot.ports.media_server import (
+    MEDIA_SERVER_TRACK_PAGE_SIZE,
     MediaServerAlbum,
     MediaServerPlaylistSyncResult,
     MediaServerTrack,
+    MediaServerTrackPage,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class NavidromeAuthorizationError(RuntimeError):
@@ -40,9 +46,7 @@ class NavidromeMediaServerClient:
             response = await client.get("/rest/ping.view", params=self._params())
             _validate_navidrome_json_response(response)
 
-    async def list_tracks(self) -> list[MediaServerTrack]:
-        tracks: list[MediaServerTrack] = []
-        page_size = 500
+    async def iter_track_pages(self) -> AsyncGenerator[MediaServerTrackPage, None]:
         offset = 0
         async with httpx.AsyncClient(base_url=self.base_url, timeout=30) as client:
             while True:
@@ -51,20 +55,57 @@ class NavidromeMediaServerClient:
                     "query": "",
                     "artistCount": "0",
                     "albumCount": "0",
-                    "songCount": str(page_size),
+                    "songCount": str(MEDIA_SERVER_TRACK_PAGE_SIZE),
                     "songOffset": str(offset),
                 }
                 response = await client.get("/rest/search3.view", params=params)
                 payload = _validate_navidrome_json_response(response)
-                search_result = payload.get("searchResult3")
-                songs = search_result.get("song", []) if isinstance(search_result, dict) else []
-                if not isinstance(songs, list) or not songs:
-                    break
-                tracks.extend(_track_from_payload(item) for item in songs if isinstance(item, dict))
-                if len(songs) < page_size:
-                    break
-                offset += page_size
-        return tracks
+                if "searchResult3" not in payload:
+                    raise RuntimeError("Navidrome response is missing searchResult3.")
+                search_result = payload["searchResult3"]
+                if not isinstance(search_result, dict):
+                    raise RuntimeError("Navidrome returned an invalid searchResult3 response.")
+                if "song" not in search_result:
+                    return
+                songs = search_result["song"]
+                if not isinstance(songs, list):
+                    raise RuntimeError("Navidrome returned an invalid searchResult3.song response.")
+                if not songs:
+                    return
+                if len(songs) > MEDIA_SERVER_TRACK_PAGE_SIZE:
+                    raise RuntimeError(
+                        "Navidrome returned more tracks than the requested page size."
+                    )
+
+                tracks: list[MediaServerTrack] = []
+                invalid_items = 0
+                for item in songs:
+                    if not isinstance(item, dict):
+                        invalid_items += 1
+                        continue
+                    track = _track_from_payload(item)
+                    if not track.id:
+                        invalid_items += 1
+                        continue
+                    tracks.append(track)
+                if invalid_items:
+                    logger.warning(
+                        "Navidrome track page contained invalid items: offset=%s invalid=%s raw=%s",
+                        offset,
+                        invalid_items,
+                        len(songs),
+                    )
+                if not tracks:
+                    raise RuntimeError(
+                        "Navidrome returned a non-empty track page without valid IDs."
+                    )
+
+                raw_count = len(songs)
+                yield MediaServerTrackPage(tracks=tuple(tracks), raw_count=raw_count)
+                del response, payload, search_result, songs, tracks
+                if raw_count < MEDIA_SERVER_TRACK_PAGE_SIZE:
+                    return
+                offset += MEDIA_SERVER_TRACK_PAGE_SIZE
 
     async def get_album(self, album_id: str) -> MediaServerAlbum | None:
         if not album_id.strip():

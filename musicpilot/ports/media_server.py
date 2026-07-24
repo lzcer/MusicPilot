@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+MEDIA_SERVER_TRACK_PAGE_SIZE = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +20,12 @@ class MediaServerTrack:
     path: str | None = None
     content_type: str | None = None
     raw_payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class MediaServerTrackPage:
+    tracks: tuple[MediaServerTrack, ...]
+    raw_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +53,7 @@ class MediaServerClient(Protocol):
 
     async def ping(self) -> None: ...
 
-    async def list_tracks(self) -> list[MediaServerTrack]: ...
+    def iter_track_pages(self) -> AsyncGenerator[MediaServerTrackPage, None]: ...
 
     async def get_album(self, album_id: str) -> MediaServerAlbum | None: ...
 

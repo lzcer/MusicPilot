@@ -52,6 +52,7 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     },
 }
 LIBRARY_STORAGE_SNAPSHOT_KEY = "library_storage_snapshot"
+MUSIC_LIBRARY_SYNC_RECOVERY_KEY = "music_library_sync_recovery"
 
 logger = logging.getLogger(__name__)
 SLOW_DB_OPERATION_SECONDS = float(os.getenv("MP_SLOW_DB_OPERATION_SECONDS", "0.5"))
@@ -59,12 +60,11 @@ SLOW_SYSTEM_TASK_SECONDS = int(os.getenv("MP_SLOW_SYSTEM_TASK_SECONDS", "300"))
 
 
 @dataclass(frozen=True, slots=True)
-class MusicLibrarySyncResult:
+class MusicLibraryPageSyncResult:
     total: int
     written: int
     unchanged: int
     changed_track_ids: tuple[int, ...]
-    deleted_track_ids: tuple[int, ...]
 
 
 def _elapsed_ms(started_at: float) -> float:
@@ -559,6 +559,46 @@ class SqlAlchemyMediaRepository:
             await session.commit()
             await session.refresh(row)
             return _merge_system_settings_defaults(row.value)
+
+    async def get_music_library_sync_recovery(self) -> bool:
+        try:
+            async with self.database.session() as session:
+                row = await session.get(SystemSetting, MUSIC_LIBRARY_SYNC_RECOVERY_KEY)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Music library sync recovery state could not be read; "
+                "assuming incomplete: %s",
+                exc,
+            )
+            return True
+        if row is None:
+            return False
+        value = row.value
+        incomplete = value.get("incomplete") if isinstance(value, dict) else None
+        if not isinstance(incomplete, bool):
+            logger.warning(
+                "Music library sync recovery state is invalid; assuming incomplete."
+            )
+            return True
+        return incomplete
+
+    async def set_music_library_sync_recovery(self, *, incomplete: bool) -> None:
+        async with self.database.session() as session:
+            key = await session.scalar(
+                select(SystemSetting.key).where(
+                    SystemSetting.key == MUSIC_LIBRARY_SYNC_RECOVERY_KEY
+                )
+            )
+            value = {"incomplete": incomplete}
+            if key is None:
+                session.add(SystemSetting(key=MUSIC_LIBRARY_SYNC_RECOVERY_KEY, value=value))
+            else:
+                await session.execute(
+                    update(SystemSetting)
+                    .where(SystemSetting.key == MUSIC_LIBRARY_SYNC_RECOVERY_KEY)
+                    .values(value=value)
+                )
+            await session.commit()
 
     async def get_library_storage_snapshot(self) -> dict[str, Any] | None:
         async with self.database.session() as session:
@@ -2214,23 +2254,37 @@ class SqlAlchemyMediaRepository:
                 int(artist_result.scalar_one()),
             )
 
-    async def sync_music_library_tracks(
+    async def sync_music_library_track_page(
         self,
         tracks: list[dict[str, Any]],
-    ) -> MusicLibrarySyncResult:
-        synced_at = datetime.now(UTC)
-        seen_ids: set[str] = set()
-        changed_rows: list[MusicLibraryTrack] = []
+        *,
+        synced_at: datetime,
+    ) -> MusicLibraryPageSyncResult:
+        payloads_by_id: dict[str, dict[str, Any]] = {}
+        for payload in tracks:
+            navidrome_id = str(payload.get("id") or "").strip()
+            if navidrome_id and navidrome_id not in payloads_by_id:
+                payloads_by_id[navidrome_id] = payload
+        if not payloads_by_id:
+            return MusicLibraryPageSyncResult(
+                total=0,
+                written=0,
+                unchanged=0,
+                changed_track_ids=(),
+            )
+
         written = 0
         unchanged = 0
+        changed_track_ids: tuple[int, ...] = ()
         async with self.database.session() as session:
-            result = await session.execute(select(MusicLibraryTrack))
+            result = await session.execute(
+                select(MusicLibraryTrack).where(
+                    MusicLibraryTrack.navidrome_id.in_(tuple(payloads_by_id))
+                )
+            )
             existing = {item.navidrome_id: item for item in result.scalars().all()}
-            for payload in tracks:
-                navidrome_id = str(payload.get("id") or "").strip()
-                if not navidrome_id or navidrome_id in seen_ids:
-                    continue
-                seen_ids.add(navidrome_id)
+            changed_rows: list[MusicLibraryTrack] = []
+            for navidrome_id, payload in payloads_by_id.items():
                 row = existing.get(navidrome_id)
                 title = str(payload.get("title") or payload.get("name") or "-")
                 artist = _optional_string(payload.get("artist"))
@@ -2266,25 +2320,51 @@ class SqlAlchemyMediaRepository:
                     setattr(row, field, value)
                 row.last_synced_at = synced_at
                 written += 1
-            deleted_track_ids = tuple(
-                row.id for navidrome_id, row in existing.items() if navidrome_id not in seen_ids
-            )
-            for navidrome_id, row in existing.items():
-                if navidrome_id not in seen_ids:
-                    await session.delete(row)
-            if written or deleted_track_ids:
+            if written:
                 await session.flush()
                 changed_track_ids = tuple(row.id for row in changed_rows)
-                await session.commit()
-            else:
-                changed_track_ids = ()
-        return MusicLibrarySyncResult(
-            total=len(seen_ids),
+            await session.commit()
+        return MusicLibraryPageSyncResult(
+            total=len(payloads_by_id),
             written=written,
             unchanged=unchanged,
             changed_track_ids=changed_track_ids,
-            deleted_track_ids=deleted_track_ids,
         )
+
+    async def delete_music_library_tracks_missing_from(
+        self,
+        seen_ids: set[str],
+        *,
+        page_size: int = 500,
+    ) -> tuple[int, ...]:
+        deleted_track_ids: list[int] = []
+        last_id = 0
+        async with self.database.session() as session:
+            async with session.begin():
+                while True:
+                    result = await session.execute(
+                        select(MusicLibraryTrack.id, MusicLibraryTrack.navidrome_id)
+                        .where(MusicLibraryTrack.id > last_id)
+                        .order_by(MusicLibraryTrack.id)
+                        .limit(page_size)
+                    )
+                    rows = result.all()
+                    if not rows:
+                        break
+                    last_id = int(rows[-1].id)
+                    page_deleted_ids = [
+                        int(row.id) for row in rows if row.navidrome_id not in seen_ids
+                    ]
+                    if page_deleted_ids:
+                        await session.execute(
+                            delete(MusicLibraryTrack).where(
+                                MusicLibraryTrack.id.in_(page_deleted_ids)
+                            )
+                        )
+                        deleted_track_ids.extend(page_deleted_ids)
+                    if len(rows) < page_size:
+                        break
+        return tuple(deleted_track_ids)
 
     async def create_subscription(
         self,
