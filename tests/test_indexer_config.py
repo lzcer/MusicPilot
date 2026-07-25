@@ -45,3 +45,16 @@ sites:
 
     assert len(crawlers) == 1
     assert crawlers[0].name == "pt"
+
+
+def test_jpopsuki_uses_advanced_html_music_search() -> None:
+    catalog = load_parser_catalog(Path("config/sites.parser.yaml"))
+    entry = catalog.match("https://jpopsuki.eu")
+
+    assert entry is not None
+    assert entry.adapter == "nexusphp"
+    assert entry.parser is not None
+    assert entry.parser.search_query_param == "torrentname"
+    assert entry.parser.search_params["action"] == "advanced"
+    assert entry.parser.search_params["filter_cat[1]"] == "1"
+    assert entry.parser.search_params["filter_cat[2]"] == "1"
