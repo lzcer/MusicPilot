@@ -786,14 +786,14 @@ class TelegramBotAdapter:
         page_items = _page_items(session.media, session.page, self._MEDIA_PAGE_SIZE)
         pages = _page_count(len(session.media), self._MEDIA_PAGE_SIZE)
         lines = [f"<b>媒体搜索结果（第 {session.page + 1}/{pages} 页）</b>"]
-        for index, item in page_items:
+        for number, (_, item) in enumerate(page_items, start=1):
             artist = item.artist or "未知歌手"
             albums = item.albums or ([item.album] if item.album else [])
             album_text = " / ".join(_short(album, 80) for album in albums[:5]) or "未知专辑"
             lines.extend(
                 (
                     (
-                        f"\n{index + 1}. <b>{escape(_short(item.title, 180))} - "
+                        f"\n{number}. <b>{escape(_short(item.title, 180))} - "
                         f"{escape(_short(artist, 120))}</b>"
                     ),
                     f"专辑：{escape(album_text)}",
@@ -811,12 +811,12 @@ class TelegramBotAdapter:
         page_items = _page_items(session.torrents, session.page, self._TORRENT_PAGE_SIZE)
         pages = _page_count(len(session.torrents), self._TORRENT_PAGE_SIZE)
         lines = [f"<b>种子搜索结果（第 {session.page + 1}/{pages} 页）</b>"]
-        for index, item in page_items:
+        for number, (_, item) in enumerate(page_items, start=1):
             source = item.source or "未知"
             published_at = item.published_at or "未知"
             lines.extend(
                 (
-                    f"\n{index + 1}. <b>{escape(_short(item.title, 220))}</b>",
+                    f"\n{number}. <b>{escape(_short(item.title, 220))}</b>",
                     (
                         f"站点：{escape(_short(source, 80))} "
                         f"· 大小：{_format_size(item.size_bytes)}"
