@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 import yaml
 
 from musicpilot.adapters.indexers.base_url import normalize_site_base_url
+from musicpilot.adapters.indexers.gazelle import GazelleCrawler, GazelleSiteConfig
 from musicpilot.adapters.indexers.mteam import MTeamCrawler, MTeamSiteConfig
 from musicpilot.adapters.indexers.nexusphp import (
     FieldRule,
@@ -65,7 +66,7 @@ def _load_parser_catalog_entries(path: Path) -> tuple[ParserCatalogEntry, ...]:
         if not isinstance(site, dict):
             raise ValueError(f"Invalid parser site entry in {path}: expected mapping")
         adapter = str(site.get("adapter", "nexusphp")).strip().lower()
-        if adapter not in {"nexusphp", "mteam"}:
+        if adapter not in {"gazelle", "nexusphp", "mteam"}:
             raise ValueError(f"Unsupported indexer adapter {adapter!r} in {path}")
         parser = (
             parser_config_from_mapping(site.get("parser")) if adapter == "nexusphp" else None
@@ -125,6 +126,11 @@ def build_indexers(
                 )
             )
             continue
+        if entry.adapter == "gazelle":
+            crawlers.append(
+                GazelleCrawler(_gazelle_site_config(site), proxy_url=site_proxy_url)
+            )
+            continue
         crawlers.append(
             NexusPHPCrawler(_site_config(site, entry), proxy_url=site_proxy_url)
         )
@@ -169,6 +175,23 @@ def _mteam_site_config(raw: Any) -> MTeamSiteConfig:
             site_id=str(raw["id"]) if raw.get("id") else None,
             max_concurrency=int(raw.get("max_concurrency", 2)),
             user_agent=str(raw["user_agent"]) if raw.get("user_agent") else None,
+        )
+    except KeyError as exc:
+        raise ValueError(f"Missing required site config key {exc.args[0]!r}") from exc
+
+
+def _gazelle_site_config(raw: Any) -> GazelleSiteConfig:
+    if not isinstance(raw, dict):
+        raise ValueError("Invalid site entry: expected mapping")
+    try:
+        return GazelleSiteConfig(
+            name=str(raw["name"]),
+            base_url=normalize_site_base_url(str(raw["base_url"])),
+            cookie=str(raw["cookie"]) if raw.get("cookie") else None,
+            site_id=str(raw["id"]) if raw.get("id") else None,
+            max_concurrency=int(raw.get("max_concurrency", 2)),
+            user_agent=str(raw["user_agent"]) if raw.get("user_agent") else None,
+            request_interval=float(raw.get("request_interval", 3)),
         )
     except KeyError as exc:
         raise ValueError(f"Missing required site config key {exc.args[0]!r}") from exc

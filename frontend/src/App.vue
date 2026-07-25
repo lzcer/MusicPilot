@@ -575,6 +575,7 @@ type LogEntry = {
 
 type TestResponse = {
   ok: boolean
+  status: 'success' | 'failed'
   message: string
 }
 
@@ -1990,6 +1991,15 @@ function searchResultType(row: SearchResult | null | undefined) {
   return ''
 }
 
+function searchResultTags(row: SearchResult | null | undefined) {
+  const value = row?.metadata?.tags
+  if (typeof value === 'string') return value.trim() ? [value.trim()] : []
+  if (Array.isArray(value)) {
+    return Array.from(new Set(value.map((item) => String(item).trim()).filter(Boolean)))
+  }
+  return []
+}
+
 function searchResultTime(row: SearchResult) {
   if (!row.published_at) return 0
   const normalized = row.published_at.replace(/^(\d{4}-\d{2}-\d{2})\s+/, '$1T')
@@ -2034,11 +2044,24 @@ function switchPage(page: string) {
   }
 }
 
-async function confirmDownload() {
+function isGazelleResult(result: SearchResult | null) {
+  return result?.metadata?.adapter === 'gazelle'
+}
+
+function tokenDownloadUrl(downloadUrl: string) {
+  const url = new URL(downloadUrl)
+  url.searchParams.set('usetoken', '1')
+  return url.toString()
+}
+
+async function confirmDownload(useToken = false) {
   if (!pendingDownload.value || downloadSubmitting.value) return
   downloadSubmitting.value = true
   try {
-    await addDownload(pendingDownload.value)
+    const result = useToken
+      ? { ...pendingDownload.value, download_url: tokenDownloadUrl(pendingDownload.value.download_url) }
+      : pendingDownload.value
+    await addDownload(result)
     pendingDownload.value = null
   } catch (error) {
     notify(error instanceof Error ? error.message : '下载失败', 'error')
@@ -3504,7 +3527,7 @@ async function testSite() {
       method: 'POST',
       body: JSON.stringify(sitePayload())
     })
-    notify(result.message, result.ok ? 'success' : 'error')
+    notify(result.message, result.status === 'success' ? 'success' : 'error')
   } catch (error) {
     notify(error instanceof Error ? error.message : '站点测试失败', 'error')
   } finally {
@@ -4938,6 +4961,15 @@ onUnmounted(() => {
                         variant="tonal"
                       >
                         类型 {{ searchResultType(row) }}
+                      </v-chip>
+                      <v-chip
+                        v-for="tag in searchResultTags(row)"
+                        :key="tag"
+                        color="warning"
+                        size="small"
+                        variant="tonal"
+                      >
+                        {{ tag }}
                       </v-chip>
                     </div>
                   </div>
@@ -6544,9 +6576,28 @@ onUnmounted(() => {
             <v-icon icon="mdi-shape-outline" size="28" />
             <span>类型 {{ searchResultType(pendingDownload) }}</span>
           </div>
+          <div v-if="searchResultTags(pendingDownload).length" class="confirm-row muted">
+            <v-icon icon="mdi-tag-multiple-outline" size="28" />
+            <div class="confirm-tag-list">
+              <v-chip v-for="tag in searchResultTags(pendingDownload)" :key="tag" color="warning" size="small" variant="tonal">
+                {{ tag }}
+              </v-chip>
+            </div>
+          </div>
         </v-card-text>
         <v-card-actions class="download-confirm-actions">
           <v-btn variant="text" :disabled="downloadSubmitting" @click="pendingDownload = null">取消</v-btn>
+          <v-btn
+            v-if="isGazelleResult(pendingDownload)"
+            color="secondary"
+            prepend-icon="mdi-key-outline"
+            size="large"
+            :loading="downloadSubmitting"
+            :disabled="downloadSubmitting"
+            @click="confirmDownload(true)"
+          >
+            使用令牌下载
+          </v-btn>
           <v-btn
             color="primary"
             prepend-icon="mdi-download"
@@ -8154,6 +8205,13 @@ button.dashboard-health-card:hover {
   text-overflow: clip;
   white-space: normal;
   word-break: break-word;
+}
+
+.confirm-tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
 }
 
 .delete-action-buttons {

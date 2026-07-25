@@ -4,6 +4,10 @@ sites:
         base_url: https://kp.m-team.cc
     adapter: mteam
   - targets:
+      - name: DicMusic
+        base_url: https://dicmusic.com
+    adapter: gazelle
+  - targets:
       - name: OpenCD
         base_url: https://open.cd
       - name: HDFans
