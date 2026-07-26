@@ -11410,23 +11410,59 @@ async def _send_event_notifications(
     title = "MusicPilot 已提交下载" if event_name == "download" else "MusicPilot 媒体库已刷新"
     text = _notification_body(event_name, task)
     system_settings = await state.repository.get_system_settings()
-    notifiers = [
-        TelegramHttpNotifier(
-            token=item.bot_token,
-            chat_ids=tuple(
-                int(chat_id.strip())
-                for chat_id in item.chat_ids.split(",")
-                if chat_id.strip().isdigit()
-            ),
-            proxy=_proxy_url(system_settings) if item.use_proxy else None,
+    notifiers: list[tuple[str, bool, str, TelegramHttpNotifier]] = []
+    for item in enabled:
+        if item.type != "telegram" or not item.bot_token.strip():
+            continue
+        chat_ids = tuple(
+            int(chat_id.strip())
+            for chat_id in item.chat_ids.split(",")
+            if chat_id.strip().isdigit()
         )
-        for item in enabled
-        if item.type == "telegram" and item.bot_token.strip()
-    ]
-    await asyncio.gather(
-        *(notifier.notify(NotifyEvent(title=title, text=text)) for notifier in notifiers),
+        if not chat_ids:
+            continue
+        notifiers.append(
+            (
+                item.name,
+                item.use_proxy,
+                item.bot_token,
+                TelegramHttpNotifier(
+                    token=item.bot_token,
+                    chat_ids=chat_ids,
+                    proxy=_proxy_url(system_settings) if item.use_proxy else None,
+                ),
+            )
+        )
+    if not notifiers:
+        return
+    event = NotifyEvent(title=title, text=text)
+    send_started_at = time.perf_counter()
+    results = await asyncio.gather(
+        *(notifier.notify(event) for _, _, _, notifier in notifiers),
         return_exceptions=True,
     )
+    elapsed_ms = (time.perf_counter() - send_started_at) * 1000
+    event_label = "下载提交" if event_name == "download" else "媒体库刷新"
+    for (channel_name, use_proxy, bot_token, _), result in zip(
+        notifiers,
+        results,
+        strict=True,
+    ):
+        if isinstance(result, BaseException):
+            state.add_log(
+                "notify",
+                f"Telegram {event_label}通知发送失败："
+                f"渠道={channel_name}，任务={task.name}，正文字符={len(event.text)}，"
+                f"使用代理={'是' if use_proxy else '否'}，耗时={elapsed_ms:.0f}ms，"
+                f"异常={_notification_send_error_text(result, secrets=(bot_token,))}",
+                "WARNING",
+            )
+        else:
+            state.add_log(
+                "notify",
+                f"Telegram {event_label}通知发送成功："
+                f"渠道={channel_name}，任务={task.name}，耗时={elapsed_ms:.0f}ms",
+            )
 
 
 async def _send_directory_monitor_failure_notification(

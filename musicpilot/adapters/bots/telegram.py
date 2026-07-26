@@ -31,6 +31,8 @@ TELEGRAM_BOT_COMMANDS = (
     ("playlist_sync", "同步系统歌单到音乐库"),
     ("musicservice_refresh", "刷新音乐服务媒体库"),
 )
+TELEGRAM_NOTIFICATION_MAX_ATTEMPTS = 3
+TELEGRAM_NOTIFICATION_MAX_RETRY_DELAY_SECONDS = 30.0
 
 MediaSearch = Callable[[str, str | None], Awaitable[list[MediaCandidateResponse]]]
 TorrentSearch = Callable[[MediaCandidateResponse], Awaitable[list[SearchResult]]]
@@ -931,12 +933,72 @@ class TelegramHttpNotifier:
             return
         text = _telegram_message_text(event)
         async with httpx.AsyncClient(timeout=20, proxy=self.proxy) as client:
-            for chat_id in self.chat_ids:
-                response = await client.post(
-                    f"https://api.telegram.org/bot{self.token}/sendMessage",
-                    json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            for recipient_index, chat_id in enumerate(self.chat_ids, start=1):
+                await _send_telegram_message(
+                    client=client,
+                    token=self.token,
+                    chat_id=chat_id,
+                    text=text,
+                    recipient_index=recipient_index,
+                    recipient_count=len(self.chat_ids),
                 )
-                response.raise_for_status()
+
+
+async def _send_telegram_message(
+    *,
+    client: httpx.AsyncClient,
+    token: str,
+    chat_id: int,
+    text: str,
+    recipient_index: int,
+    recipient_count: int,
+) -> None:
+    for attempt in range(1, TELEGRAM_NOTIFICATION_MAX_ATTEMPTS + 1):
+        try:
+            response = await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            )
+            response.raise_for_status()
+            return
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            error: httpx.HTTPError = exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 429 and exc.response.status_code < 500:
+                raise
+            error = exc
+        if attempt >= TELEGRAM_NOTIFICATION_MAX_ATTEMPTS:
+            raise error
+        retry_delay = _telegram_notification_retry_delay(error, attempt)
+        logger.warning(
+            "Telegram notification temporarily failed; retrying: "
+            "recipient=%d/%d, attempt=%d/%d, delay=%.1fs, reason=%s",
+            recipient_index,
+            recipient_count,
+            attempt,
+            TELEGRAM_NOTIFICATION_MAX_ATTEMPTS,
+            retry_delay,
+            _telegram_notification_retry_reason(error),
+        )
+        await asyncio.sleep(retry_delay)
+
+
+def _telegram_notification_retry_delay(error: httpx.HTTPError, attempt: int) -> float:
+    delay = float(2 ** (attempt - 1))
+    if isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 429:
+        with contextlib.suppress(TypeError, ValueError):
+            payload = error.response.json()
+            if isinstance(payload, dict):
+                parameters = payload.get("parameters")
+                if isinstance(parameters, dict):
+                    delay = max(delay, float(parameters.get("retry_after") or 0))
+    return min(delay, TELEGRAM_NOTIFICATION_MAX_RETRY_DELAY_SECONDS)
+
+
+def _telegram_notification_retry_reason(error: httpx.HTTPError) -> str:
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"HTTP {error.response.status_code}"
+    return type(error).__name__
 
 
 def _split_query(query: str) -> tuple[str, str | None]:
