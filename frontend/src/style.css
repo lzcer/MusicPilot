@@ -538,6 +538,17 @@ body {
   gap: 12px 16px;
 }
 
+.auto-organize-control {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.auto-organize-select {
+  min-width: 0;
+  flex: 1;
+}
+
 .log-toolbar {
   display: grid;
   grid-template-columns: 150px minmax(260px, 1fr) auto auto;

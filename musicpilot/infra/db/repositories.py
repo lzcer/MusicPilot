@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import String, delete, func, or_, select, update
+from sqlalchemy import String, and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from musicpilot.core.defaults import DEFAULT_SEARCH_EXCLUDE_KEYWORDS
@@ -43,6 +43,10 @@ from musicpilot.ports.metadata import TrackMetadata
 DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "proxy": {},
     "scraping": {
+        "auto_organize": "downloader",
+        "directory_monitor_mode": "native",
+        "directory_monitor_poll_interval_seconds": 60,
+        "directory_monitor_notification_delay_seconds": 10,
         "track_version_control": False,
     },
     "search": {
@@ -354,6 +358,7 @@ class SqlAlchemyMediaRepository:
         *,
         torrent_hash: str,
         save_path: Path | None,
+        auto_organize: str = "downloader",
     ) -> TorrentRecord:
         async with self.database.session() as session:
             result = await session.execute(
@@ -370,6 +375,10 @@ class SqlAlchemyMediaRepository:
             record.status = "completed"
             record.progress = 1.0
             record.save_path = str(save_path) if save_path is not None else None
+            record.completed_at = datetime.now(UTC)
+            payload = dict(record.payload or {})
+            payload["auto_organize_mode"] = auto_organize
+            record.payload = payload
             await session.commit()
             await session.refresh(record)
             return record
@@ -1330,14 +1339,19 @@ class SqlAlchemyMediaRepository:
             return await session.get(TorrentRecord, task_id)
 
     async def list_unfinished_download_tasks(self) -> list[TorrentRecord]:
+        active_statuses = ["queued", "submitted", "downloading", "refreshing_library"]
+        completed_mode = TorrentRecord.payload["auto_organize_mode"].as_string()
+        condition = or_(
+            TorrentRecord.status.in_(active_statuses),
+            and_(
+                TorrentRecord.status == "completed",
+                or_(completed_mode.is_(None), completed_mode != "directory"),
+            ),
+        )
         async with self.database.session() as session:
             result = await session.execute(
                 select(TorrentRecord)
-                .where(
-                    TorrentRecord.status.in_(
-                        ("queued", "submitted", "downloading", "completed", "refreshing_library")
-                    )
-                )
+                .where(condition)
                 .order_by(TorrentRecord.id)
             )
             return list(result.scalars().all())
@@ -1444,24 +1458,50 @@ class SqlAlchemyMediaRepository:
             return row
 
     async def list_active_download_task_items(self) -> list[TorrentRecordItem]:
+        completed_mode = TorrentRecord.payload["auto_organize_mode"].as_string()
         async with self.database.session() as session:
             result = await session.execute(
                 select(TorrentRecordItem)
                 .join(TorrentRecord, TorrentRecordItem.torrent_record_id == TorrentRecord.id)
                 .where(
-                    TorrentRecord.status.in_(
-                        (
-                            "queued",
-                            "submitted",
-                            "downloading",
-                            "completed",
-                            "refreshing_library",
-                        )
+                    or_(
+                        TorrentRecord.status.in_(
+                            ("queued", "submitted", "downloading", "refreshing_library")
+                        ),
+                        and_(
+                            TorrentRecord.status == "completed",
+                            or_(completed_mode.is_(None), completed_mode != "directory"),
+                        ),
                     )
                 )
                 .order_by(TorrentRecordItem.id.desc())
             )
             return list(result.scalars().all())
+
+    async def list_directory_capture_download_task_items(
+        self,
+    ) -> list[tuple[TorrentRecord, TorrentRecordItem]]:
+        completed_mode = TorrentRecord.payload["auto_organize_mode"].as_string()
+        eligible_record = or_(
+            TorrentRecord.status.in_(("queued", "submitted", "downloading")),
+            and_(
+                TorrentRecord.status == "completed",
+                completed_mode == "directory",
+            ),
+        )
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(TorrentRecord, TorrentRecordItem)
+                .join(TorrentRecordItem, TorrentRecordItem.torrent_record_id == TorrentRecord.id)
+                .where(
+                    eligible_record,
+                    TorrentRecordItem.status.not_in(
+                        ("organized", "organize_failed", "organize_skipped")
+                    ),
+                )
+                .order_by(TorrentRecord.id.desc(), TorrentRecordItem.id.desc())
+            )
+            return [(record, item) for record, item in result.all()]
 
     async def delete_download_task(self, task_id: int) -> bool:
         async with self.database.session() as session:
@@ -1989,6 +2029,15 @@ class SqlAlchemyMediaRepository:
     async def dashboard_summary(self) -> dict[str, Any]:
         since = datetime.now(UTC) - timedelta(days=7)
         async with self.database.session() as session:
+            completed_mode = TorrentRecord.payload["auto_organize_mode"].as_string()
+            active_download_condition = and_(
+                TorrentRecord.status.not_in(("library_refreshed", "interrupted")),
+                or_(
+                    TorrentRecord.status != "completed",
+                    completed_mode.is_(None),
+                    completed_mode != "directory",
+                ),
+            )
             library_total = await session.execute(
                 select(func.count()).select_from(MusicLibraryTrack)
             )
@@ -2052,7 +2101,7 @@ class SqlAlchemyMediaRepository:
             download_active = await session.execute(
                 select(func.count())
                 .select_from(TorrentRecord)
-                .where(TorrentRecord.status.not_in(("library_refreshed", "interrupted")))
+                .where(active_download_condition)
             )
             download_completed_7d = await session.execute(
                 select(func.count())

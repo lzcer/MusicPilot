@@ -1,6 +1,6 @@
 ﻿<script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { api, apiNoContent, readError } from './api'
+import { ApiError, api, apiNoContent, readError } from './api'
 import DirectoryPickerField from './components/DirectoryPickerField.vue'
 import ScrollableTable from './components/ScrollableTable.vue'
 import TruncatedTableCell from './components/TruncatedTableCell.vue'
@@ -99,6 +99,7 @@ type DownloadTask = {
   save_path?: string | null
   source?: string
   last_error?: string | null
+  auto_organize_mode?: 'downloader' | 'directory' | null
 }
 
 type DownloadTaskItem = {
@@ -537,6 +538,10 @@ type SystemSettings = {
   }
   scraping: {
     enabled: boolean
+    auto_organize: 'downloader' | 'directory'
+    directory_monitor_mode: 'native' | 'polling'
+    directory_monitor_poll_interval_seconds: number
+    directory_monitor_notification_delay_seconds: number
     mode: 'source' | 'mapped' | 'copy'
     source_directory: string
     mapped_directory: string
@@ -553,6 +558,23 @@ type SystemSettings = {
     minimum_seeders: number
     metadata_concurrency: number
   }
+}
+
+type DirectoryMonitorStatus = {
+  state: 'disabled' | 'probing' | 'running_native' | 'running_polling' | 'failed'
+  mode: 'native' | 'polling'
+  source_directory: string
+  poll_interval_seconds: number
+  failed_at?: string | null
+  message: string
+  detail: string
+}
+
+type DirectoryMonitorErrorDetail = {
+  code?: string
+  message?: string
+  source_directory?: string
+  polling_available?: boolean
 }
 
 type AboutInfo = {
@@ -650,6 +672,7 @@ const musicLibraryLoading = ref(false)
 let logTimer: number | undefined
 let downloadTimer: number | undefined
 let artistBuildTimer: number | undefined
+let directoryMonitorStatusTimer: number | undefined
 let systemTaskTimer: number | undefined
 let systemTaskRefreshPending = false
 let metadataSearchStream: EventSource | undefined
@@ -808,6 +831,20 @@ const fileDeleting = ref(false)
 const activeDownloadDeleteMode = ref<DownloadDeleteMode | null>(null)
 const activeMediaDeleteMode = ref<MediaDeleteMode | null>(null)
 const systemSaving = ref(false)
+const directoryMonitorStatus = ref<DirectoryMonitorStatus>({
+  state: 'disabled',
+  mode: 'native',
+  source_directory: '',
+  poll_interval_seconds: 60,
+  failed_at: null,
+  message: '',
+  detail: ''
+})
+const directoryMonitorDialog = ref(false)
+const directoryMonitorDialogContext = ref<'save' | 'failure'>('failure')
+const directoryMonitorDialogMessage = ref('')
+const directoryMonitorPollingAvailable = ref(true)
+const directoryMonitorActionLoading = ref(false)
 const aboutInfo = ref<AboutInfo | null>(null)
 const databaseExporting = ref(false)
 const databaseImporting = ref(false)
@@ -981,6 +1018,10 @@ const systemForm = ref<SystemSettings>({
   },
   scraping: {
     enabled: false,
+    auto_organize: 'downloader',
+    directory_monitor_mode: 'native',
+    directory_monitor_poll_interval_seconds: 60,
+    directory_monitor_notification_delay_seconds: 10,
     mode: 'mapped',
     source_directory: '',
     mapped_directory: '',
@@ -1004,6 +1045,25 @@ const scrapingModeOptions = [
   { title: '映射文件', value: 'mapped' },
   { title: '复制文件', value: 'copy' }
 ]
+
+const autoOrganizeOptions = [
+  { title: '下载器监听', value: 'downloader' },
+  { title: '目录监听', value: 'directory' }
+]
+
+const autoOrganizeDescription = computed(() =>
+  systemForm.value.scraping.auto_organize === 'directory'
+    ? systemForm.value.scraping.directory_monitor_mode === 'polling'
+      ? `当前使用轮询监听，每 ${systemForm.value.scraping.directory_monitor_poll_interval_seconds} 秒检查源文件目录，稳定后逐文件触发刮削。`
+      : '下载任务到完成即结束；源文件目录的每个新增音乐文件写入稳定后，独立触发现有刮削与整理任务链。'
+    : '下载稳定完成后，由下载任务继续触发目录检索、文件整理和曲库刷新。'
+)
+
+const directoryMonitorFailed = computed(
+  () =>
+    systemForm.value.scraping.auto_organize === 'directory' &&
+    directoryMonitorStatus.value.state === 'failed'
+)
 
 const scrapingModeDescription = computed(() => {
   switch (systemForm.value.scraping.mode) {
@@ -1347,7 +1407,11 @@ const fileBreadcrumbs = computed(() => {
 
 const filteredDownloads = computed(() =>
   downloadActiveOnly.value
-    ? downloads.value.filter((item) => item.state !== 'library_refreshed')
+    ? downloads.value.filter(
+        (item) =>
+          item.state !== 'library_refreshed' &&
+          !(item.state === 'completed' && item.auto_organize_mode === 'directory')
+      )
     : downloads.value
 )
 
@@ -1493,6 +1557,7 @@ async function loadInitialData() {
     loadMediaServers(),
     loadNotifiers(),
     loadSystemSettings(),
+    loadDirectoryMonitorStatus(),
     loadAboutInfo()
   ])
   syncPagePolling()
@@ -3349,6 +3414,14 @@ function startArtistBuildPolling() {
   }, 5000)
 }
 
+function startDirectoryMonitorStatusPolling() {
+  window.clearInterval(directoryMonitorStatusTimer)
+  void loadDirectoryMonitorStatus().catch(() => undefined)
+  directoryMonitorStatusTimer = window.setInterval(() => {
+    void loadDirectoryMonitorStatus().catch(() => undefined)
+  }, 30000)
+}
+
 function syncPagePolling() {
   if (activePage.value === 'logs') {
     startLogPolling()
@@ -3367,9 +3440,19 @@ function syncPagePolling() {
   } else {
     window.clearInterval(artistBuildTimer)
   }
+
+  if (activePage.value === 'settings' && settingsTab.value === 'system') {
+    startDirectoryMonitorStatusPolling()
+  } else {
+    window.clearInterval(directoryMonitorStatusTimer)
+  }
 }
 
 watch(activePage, () => {
+  syncPagePolling()
+})
+
+watch(settingsTab, () => {
   syncPagePolling()
 })
 
@@ -3971,6 +4054,44 @@ async function loadSystemSettings() {
   }
 }
 
+async function loadDirectoryMonitorStatus() {
+  directoryMonitorStatus.value = await api<DirectoryMonitorStatus>(
+    '/api/settings/directory-monitor/status'
+  )
+}
+
+function directoryMonitorErrorDetail(error: unknown) {
+  if (!(error instanceof ApiError) || !error.detail || typeof error.detail !== 'object') {
+    return null
+  }
+  return error.detail as DirectoryMonitorErrorDetail
+}
+
+function openDirectoryMonitorDialog(
+  context: 'save' | 'failure',
+  message: string,
+  pollingAvailable = true
+) {
+  directoryMonitorDialogContext.value = context
+  directoryMonitorDialogMessage.value = message
+  directoryMonitorPollingAvailable.value = pollingAvailable
+  directoryMonitorDialog.value = true
+}
+
+function openDirectoryMonitorFailureDialog() {
+  const status = directoryMonitorStatus.value
+  const reason = [status.message, status.detail].filter(Boolean).join(' ')
+  openDirectoryMonitorDialog('failure', reason || '目录监听已停止，请选择处理方式。')
+}
+
+function updateAutoOrganize(value: 'downloader' | 'directory') {
+  const previous = systemForm.value.scraping.auto_organize
+  systemForm.value.scraping.auto_organize = value
+  if (value === 'directory' && previous !== 'directory') {
+    systemForm.value.scraping.directory_monitor_mode = 'native'
+  }
+}
+
 async function saveSystemSettings() {
   systemSaving.value = true
   try {
@@ -3986,16 +4107,86 @@ async function saveSystemSettings() {
       Number.MAX_SAFE_INTEGER,
       1
     )
+    systemForm.value.scraping.directory_monitor_poll_interval_seconds = clampInteger(
+      systemForm.value.scraping.directory_monitor_poll_interval_seconds,
+      30,
+      Number.MAX_SAFE_INTEGER,
+      60
+    )
+    systemForm.value.scraping.directory_monitor_notification_delay_seconds = clampInteger(
+      systemForm.value.scraping.directory_monitor_notification_delay_seconds,
+      1,
+      Number.MAX_SAFE_INTEGER,
+      10
+    )
     systemForm.value = await api<SystemSettings>('/api/settings/system', {
       method: 'POST',
       body: JSON.stringify(systemForm.value)
     })
+    await loadDirectoryMonitorStatus()
     notify('系统设置已保存')
   } catch (error) {
-    notify(error instanceof Error ? error.message : '绯荤粺设置保存澶辫触', 'error')
+    const detail = directoryMonitorErrorDetail(error)
+    if (detail?.code === 'directory_monitor_native_unavailable') {
+      openDirectoryMonitorDialog(
+        'save',
+        detail.message || (error instanceof Error ? error.message : '原生目录监听不可用。'),
+        detail.polling_available !== false
+      )
+    } else if (detail?.code === 'directory_monitor_start_failed') {
+      await Promise.allSettled([loadSystemSettings(), loadDirectoryMonitorStatus()])
+      notify(detail.message || '系统设置已保存，但目录监听启动失败。', 'error')
+    } else {
+      notify(error instanceof Error ? error.message : '系统设置保存失败', 'error')
+    }
   } finally {
     systemSaving.value = false
   }
+}
+
+async function retryNativeDirectoryMonitor() {
+  directoryMonitorActionLoading.value = true
+  try {
+    if (directoryMonitorDialog.value && directoryMonitorDialogContext.value === 'save') {
+      directoryMonitorDialog.value = false
+      await saveSystemSettings()
+      return
+    }
+    directoryMonitorStatus.value = await api<DirectoryMonitorStatus>(
+      '/api/settings/directory-monitor/retry-native',
+      { method: 'POST' }
+    )
+    await loadSystemSettings()
+    directoryMonitorDialog.value = false
+    notify('原生目录监听已恢复')
+  } catch (error) {
+    const detail = directoryMonitorErrorDetail(error)
+    directoryMonitorDialogMessage.value =
+      detail?.message || (error instanceof Error ? error.message : '原生目录监听检测失败')
+    directoryMonitorPollingAvailable.value = detail?.polling_available !== false
+    await loadDirectoryMonitorStatus().catch(() => undefined)
+  } finally {
+    directoryMonitorActionLoading.value = false
+  }
+}
+
+async function useDirectoryMonitorPolling() {
+  systemForm.value.scraping.directory_monitor_mode = 'polling'
+  systemForm.value.scraping.directory_monitor_poll_interval_seconds = clampInteger(
+    systemForm.value.scraping.directory_monitor_poll_interval_seconds,
+    30,
+    Number.MAX_SAFE_INTEGER,
+    60
+  )
+  directoryMonitorDialog.value = false
+  await saveSystemSettings()
+}
+
+async function switchToDownloaderMonitor() {
+  systemForm.value.scraping.auto_organize = 'downloader'
+  systemForm.value.scraping.directory_monitor_mode = 'native'
+  directoryMonitorDialog.value = false
+  await saveSystemSettings()
 }
 
 async function exportDatabase() {
@@ -4501,6 +4692,7 @@ onUnmounted(() => {
   window.clearInterval(logTimer)
   window.clearInterval(downloadTimer)
   window.clearInterval(artistBuildTimer)
+  window.clearInterval(directoryMonitorStatusTimer)
   stopSystemTaskPolling()
   metadataSearchStream?.close()
 })
@@ -6253,6 +6445,69 @@ onUnmounted(() => {
                         label="重复文件处理"
                       />
                     </div>
+
+                    <div class="settings-grid mt-4">
+                      <div class="scraping-mode-field">
+                        <div class="auto-organize-control">
+                          <v-select
+                            class="auto-organize-select"
+                            :model-value="systemForm.scraping.auto_organize"
+                            :items="autoOrganizeOptions"
+                            label="自动整理"
+                            @update:model-value="updateAutoOrganize"
+                          />
+                          <v-btn
+                            v-if="directoryMonitorFailed"
+                            aria-label="目录监听故障"
+                            color="error"
+                            icon="mdi-alert-circle"
+                            variant="text"
+                            @click.stop="openDirectoryMonitorFailureDialog"
+                          />
+                        </div>
+                        <div class="scraping-mode-description" aria-live="polite">
+                          {{ autoOrganizeDescription }}
+                        </div>
+                      </div>
+                      <div
+                        v-if="systemForm.scraping.auto_organize === 'directory'"
+                        class="scraping-mode-field"
+                      >
+                        <v-text-field
+                          v-model.number="systemForm.scraping.directory_monitor_notification_delay_seconds"
+                          label="通知延迟（秒）"
+                          type="number"
+                          min="1"
+                          hint="在设定时间内持续有文件入库时，将重新计时并合并为一条通知。"
+                          persistent-hint
+                        />
+                      </div>
+                      <div
+                        v-if="
+                          systemForm.scraping.auto_organize === 'directory' &&
+                          systemForm.scraping.directory_monitor_mode === 'polling'
+                        "
+                        class="scraping-mode-field"
+                      >
+                        <v-text-field
+                          v-model.number="systemForm.scraping.directory_monitor_poll_interval_seconds"
+                          label="轮询间隔（秒）"
+                          type="number"
+                          min="30"
+                          hint="最短 30 秒；目录越大，建议设置更长的间隔。"
+                          persistent-hint
+                        />
+                        <v-btn
+                          :loading="directoryMonitorActionLoading"
+                          prepend-icon="mdi-radar"
+                          size="small"
+                          variant="tonal"
+                          @click="retryNativeDirectoryMonitor"
+                        >
+                          重新检测原生监听
+                        </v-btn>
+                      </div>
+                    </div>
                   </v-card-text>
                   <v-card-actions>
                     <v-spacer />
@@ -6384,6 +6639,70 @@ onUnmounted(() => {
         </div>
       </v-main>
     </template>
+
+    <v-dialog v-model="directoryMonitorDialog" max-width="620">
+      <v-card
+        :title="
+          directoryMonitorDialogContext === 'save' ? '原生目录监听不可用' : '目录监听已停止'
+        "
+      >
+        <v-card-text class="dialog-stack">
+          <v-alert type="error" variant="tonal">
+            {{ directoryMonitorDialogMessage }}
+          </v-alert>
+          <div>
+            <strong>源目录：</strong>
+            {{
+              directoryMonitorDialogContext === 'save'
+                ? systemForm.scraping.source_directory || '-'
+                : directoryMonitorStatus.source_directory || '-'
+            }}
+          </div>
+          <div v-if="directoryMonitorDialogContext === 'failure'">
+            <strong>失败时间：</strong>{{ directoryMonitorStatus.failed_at || '-' }}
+          </div>
+          <v-alert v-if="directoryMonitorPollingAvailable" type="warning" variant="tonal">
+            轮询会定期递归检查整个源目录。文件越多、间隔越短，CPU、磁盘和 NAS
+            网络 I/O 越高；新增文件最多延迟一个轮询周期后才会进入稳定检查。
+          </v-alert>
+          <v-text-field
+            v-if="directoryMonitorPollingAvailable"
+            v-model.number="systemForm.scraping.directory_monitor_poll_interval_seconds"
+            label="轮询间隔（秒）"
+            type="number"
+            min="30"
+            hint="最短 30 秒，默认 60 秒。"
+            persistent-hint
+          />
+        </v-card-text>
+        <v-card-actions class="flex-wrap">
+          <v-btn variant="text" @click="directoryMonitorDialog = false">取消</v-btn>
+          <v-spacer />
+          <v-btn
+            :disabled="directoryMonitorActionLoading || systemSaving"
+            variant="tonal"
+            @click="switchToDownloaderMonitor"
+          >
+            切换到下载器监听
+          </v-btn>
+          <v-btn
+            :loading="directoryMonitorActionLoading"
+            variant="tonal"
+            @click="retryNativeDirectoryMonitor"
+          >
+            重新检测原生监听
+          </v-btn>
+          <v-btn
+            v-if="directoryMonitorPollingAvailable"
+            color="warning"
+            :loading="systemSaving"
+            @click="useDirectoryMonitorPolling"
+          >
+            改用轮询监听
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
 
     <v-dialog v-model="searchDialog" max-width="460">
       <v-card title="搜索">

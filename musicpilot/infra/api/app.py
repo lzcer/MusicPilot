@@ -70,12 +70,18 @@ from musicpilot.adapters.music_platforms.spotify import (
     token_expiry,
 )
 from musicpilot.core.artist import ArtistService, normalize_artist_name, split_artist_credit
+from musicpilot.core.directory_monitor import (
+    DirectoryMonitorProbeError,
+    DirectoryMonitorService,
+    probe_native_directory,
+)
 from musicpilot.core.event_bus import EventBus
 from musicpilot.core.events import NotifyEvent, SearchEvent, SearchResult
 from musicpilot.core.metadata import MetadataCascade
 from musicpilot.core.pipeline import MusicPipeline
 from musicpilot.core.processor import MediaProcessor
 from musicpilot.core.scraping import (
+    AUDIO_EXTENSIONS,
     AlbumIdentityLease,
     ArtistDirectoryResolutionError,
     ContextualMetadata,
@@ -124,6 +130,7 @@ from musicpilot.infra.api.schemas import (
     DirectoryBreadcrumbResponse,
     DirectoryEntryResponse,
     DirectoryListResponse,
+    DirectoryMonitorStatusResponse,
     DownloadDeleteMode,
     DownloaderCreateRequest,
     DownloaderResponse,
@@ -234,19 +241,6 @@ from musicpilot.ports.media_server import MEDIA_SERVER_TRACK_PAGE_SIZE, MediaSer
 from musicpilot.ports.metadata import AlbumIdentity, MediaCandidate, TrackMetadata
 
 _OPENCC_T2S = OpenCC("t2s")
-_TORRENT_AUDIO_EXTENSIONS = {
-    ".aac",
-    ".aiff",
-    ".alac",
-    ".ape",
-    ".flac",
-    ".m4a",
-    ".mp3",
-    ".ogg",
-    ".opus",
-    ".wav",
-    ".wma",
-}
 _AUDIO_DETAIL_MAX_COVER_BYTES = 10 * 1024 * 1024
 _AUDIO_DETAIL_CACHE_MAX_ENTRIES = 64
 _AUDIO_DETAIL_CACHE_MAX_BYTES = 64 * 1024 * 1024
@@ -256,6 +250,7 @@ MUSIC_LIBRARY_SYNC_INTERVAL_SECONDS = 3600
 LIBRARY_STORAGE_REFRESH_INTERVAL_SECONDS = 30 * 60
 MUSIC_LIBRARY_SYNC_AFTER_REFRESH_DELAY_SECONDS = 5
 MUSIC_LIBRARY_SYNC_MAX_PAGES = 10_000
+DIRECTORY_LIBRARY_NOTIFICATION_MAX_CHARS = 3500
 SLOW_API_OPERATION_SECONDS = float(os.getenv("MP_SLOW_API_OPERATION_SECONDS", "0.5"))
 PLAYLIST_TRACK_RETRYABLE_STATUSES = {
     "failed",
@@ -281,6 +276,7 @@ DOWNLOAD_ITEM_ORGANIZE_TERMINAL_STATUSES = {
     "organize_skipped",
 }
 DOWNLOAD_ITEM_TASK_PRIORITY = 50
+DIRECTORY_CAPTURE_TASK_PRIORITY = 50
 DOWNLOAD_REFRESH_TASK_PRIORITY = 40
 PLAYLIST_CANDIDATE_CLEANUP_INTERVAL_SECONDS = 300
 PLAYLIST_CANDIDATE_STALE_SECONDS = 1800
@@ -338,6 +334,124 @@ def _elapsed_ms(started_at: float) -> float:
 class SubmittedTorrent:
     torrent_hash: str
     torrent_data: bytes | None = None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class DirectoryLibraryNotificationItem:
+    key: str
+    title: str
+    artist: str
+    album: str
+    refreshed_at: datetime
+
+
+class DirectoryLibraryNotificationAggregator:
+    def __init__(
+        self,
+        *,
+        send: Callable[
+            [tuple[DirectoryLibraryNotificationItem, ...]],
+            Awaitable[None],
+        ],
+        delay_seconds: int = 10,
+    ) -> None:
+        self._send = send
+        self._delay_seconds = max(1, int(delay_seconds))
+        self._items: OrderedDict[str, DirectoryLibraryNotificationItem] = OrderedDict()
+        self._lock = asyncio.Lock()
+        self._event = asyncio.Event()
+        self._worker: asyncio.Task[None] | None = None
+        self._last_added_at: float | None = None
+        self._deadline: float | None = None
+        self._stopping = False
+
+    async def add(self, item: DirectoryLibraryNotificationItem) -> None:
+        async with self._lock:
+            if self._stopping:
+                return
+            self._items[item.key] = item
+            self._items.move_to_end(item.key)
+            now = asyncio.get_running_loop().time()
+            self._last_added_at = now
+            self._deadline = now + self._delay_seconds
+            if self._worker is None or self._worker.done():
+                self._worker = asyncio.create_task(
+                    self._run(),
+                    name="musicpilot-directory-library-notification",
+                )
+            self._event.set()
+
+    async def set_delay(self, delay_seconds: int) -> None:
+        async with self._lock:
+            self._delay_seconds = max(1, int(delay_seconds))
+            if self._items and self._last_added_at is not None:
+                self._deadline = self._last_added_at + self._delay_seconds
+                self._event.set()
+
+    async def flush_and_stop(self) -> None:
+        async with self._lock:
+            self._stopping = True
+            worker = self._worker
+            if worker is None and self._items:
+                worker = asyncio.create_task(
+                    self._run(),
+                    name="musicpilot-directory-library-notification",
+                )
+                self._worker = worker
+            self._event.set()
+        if worker is not None:
+            await worker
+
+    async def _run(self) -> None:
+        while True:
+            batch: tuple[DirectoryLibraryNotificationItem, ...] | None = None
+            async with self._lock:
+                if not self._items:
+                    self._worker = None
+                    return
+                if self._stopping:
+                    batch = self._take_items_locked()
+                else:
+                    deadline = self._deadline or asyncio.get_running_loop().time()
+                    self._event.clear()
+            if batch is not None:
+                await self._deliver(batch)
+                continue
+            timeout = max(0.0, deadline - asyncio.get_running_loop().time())
+            try:
+                await asyncio.wait_for(self._event.wait(), timeout=timeout)
+                continue
+            except TimeoutError:
+                pass
+            async with self._lock:
+                if not self._items:
+                    continue
+                current_deadline = self._deadline
+                if (
+                    current_deadline is not None
+                    and asyncio.get_running_loop().time() < current_deadline
+                ):
+                    continue
+                batch = self._take_items_locked()
+            await self._deliver(batch)
+
+    def _take_items_locked(self) -> tuple[DirectoryLibraryNotificationItem, ...]:
+        batch = tuple(self._items.values())
+        self._items.clear()
+        self._last_added_at = None
+        self._deadline = None
+        return batch
+
+    async def _deliver(
+        self,
+        batch: tuple[DirectoryLibraryNotificationItem, ...],
+    ) -> None:
+        try:
+            await self._send(batch)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Directory library notification batch failed: %s", exc)
 
 
 class ScrapingSourceDirectoryNotFound(RuntimeError):
@@ -621,22 +735,55 @@ class DownloadItemScrapeExecutor:
         if item_id is None:
             raise ValueError("Download item scrape task payload is incomplete.")
         item = await _scrape_download_task_item(self.state, item_id)
+        next_tasks: list[TaskCreate] = []
         if item is not None and bool(payload.get("organize_after_scrape")):
             source_file = _optional_string(payload.get("source_file"))
             if source_file:
                 record = await self.state.repository.get_download_task(item.torrent_record_id)
                 if record is not None:
-                    await _enqueue_download_item_organize(
+                    organize_task = await _download_item_organize_task_if_needed(
                         self.state,
                         record,
                         item,
                         Path(source_file),
                     )
+                    if organize_task is not None:
+                        next_tasks.append(organize_task)
         return TaskExecutionResult(
             result={
                 "item_id": item_id,
                 "status": item.status if item is not None else "missing",
-            }
+            },
+            next_tasks=next_tasks,
+        )
+
+
+class DirectoryCaptureExecutor:
+    def __init__(self, state: AppState) -> None:
+        self.state = state
+
+    async def execute(self, task: object) -> TaskExecutionResult:
+        payload = getattr(task, "payload", {}) or {}
+        source_path = _optional_string(payload.get("source_file"))
+        if source_path is None:
+            raise ValueError("Directory capture task payload is incomplete.")
+        source_file = await asyncio.to_thread(_directory_capture_source_file, source_path)
+        file_generation = _optional_string(payload.get("file_generation"))
+        if file_generation is None:
+            file_generation = await asyncio.to_thread(
+                _manual_file_generation_digest,
+                source_file,
+            )
+        event_id = _optional_string(payload.get("event_id")) or file_generation
+        next_task, result = await _directory_capture_next_task(
+            self.state,
+            source_file,
+            file_generation=file_generation,
+            event_id=event_id,
+        )
+        return TaskExecutionResult(
+            result=result,
+            next_tasks=[next_task] if next_task is not None else [],
         )
 
 
@@ -666,6 +813,7 @@ class ManualFileScrapeExecutor:
         )
         task_name = str(payload.get("task_name") or source_file.name)
         batch_id = _optional_string(payload.get("batch_id"))
+        trigger_source = _optional_string(payload.get("trigger_source"))
         candidate_payloads = [_track_metadata_payload(item) for item in candidates]
         self.state.add_log(
             "metadata",
@@ -677,6 +825,7 @@ class ManualFileScrapeExecutor:
                 "source_file": str(source_file),
                 "candidate_count": len(candidates),
                 "batch_id": batch_id,
+                "trigger_source": trigger_source,
             },
             next_tasks=[
                 TaskCreate(
@@ -686,6 +835,7 @@ class ManualFileScrapeExecutor:
                         "source_file": str(source_file),
                         "task_name": task_name,
                         "batch_id": batch_id,
+                        "trigger_source": trigger_source,
                         "metadata_candidates": candidate_payloads,
                         "metadata_lookup_completed": True,
                         "inferred_metadata": (
@@ -712,15 +862,26 @@ class FileOrganizeExecutor:
         if payload.get("mode") == "manual_file":
             if source_file is None or payload.get("metadata_lookup_completed") is not True:
                 raise ValueError("Manual file organize task payload is incomplete.")
-            summary = await _organize_manual_source_file(
-                self.state,
-                Path(source_file),
-                str(payload.get("task_name") or Path(source_file).name),
-                _metadata_candidates_from_payload(payload.get("metadata_candidates")),
-                inferred_metadata=_track_metadata_from_payload(payload.get("inferred_metadata")),
-            )
-            _raise_artist_directory_resolution_failure(summary)
-            return TaskExecutionResult(result=_scraping_summary_result(summary))
+            self.state.file_organize_inflight += 1
+            try:
+                summary = await _organize_manual_source_file(
+                    self.state,
+                    Path(source_file),
+                    str(payload.get("task_name") or Path(source_file).name),
+                    _metadata_candidates_from_payload(payload.get("metadata_candidates")),
+                    inferred_metadata=_track_metadata_from_payload(
+                        payload.get("inferred_metadata")
+                    ),
+                    trigger_source=_optional_string(payload.get("trigger_source")),
+                )
+                _raise_artist_directory_resolution_failure(summary)
+                _suppress_directory_monitor_results(self.state, summary)
+                return TaskExecutionResult(result=_scraping_summary_result(summary))
+            finally:
+                self.state.file_organize_inflight = max(
+                    0,
+                    self.state.file_organize_inflight - 1,
+                )
         task_id = _optional_int(payload.get("torrent_record_id"))
         item_id = _optional_int(payload.get("item_id"))
         task_name = str(payload.get("task_name") or "download")
@@ -865,6 +1026,10 @@ class AppState:
             DownloadItemScrapeExecutor(self),
         )
         self.task_executors.register(
+            "DIRECTORY_CAPTURE",
+            DirectoryCaptureExecutor(self),
+        )
+        self.task_executors.register(
             "MANUAL_FILE_SCRAPE",
             ManualFileScrapeExecutor(self),
         )
@@ -942,6 +1107,21 @@ class AppState:
         )
         self.download_polling_task: asyncio.Task[None] | None = None
         self.tagged_download_monitor_task: asyncio.Task[None] | None = None
+        self.directory_monitor: DirectoryMonitorService | None = None
+        self.directory_monitor_status: dict[str, Any] = {
+            "state": "disabled",
+            "mode": "native",
+            "source_directory": "",
+            "poll_interval_seconds": 60,
+            "failed_at": None,
+            "message": "",
+            "detail": "",
+        }
+        self.directory_monitor_failure_notified = False
+        self.directory_library_notifications = DirectoryLibraryNotificationAggregator(
+            send=lambda items: _send_directory_library_notification(self, items)
+        )
+        self.file_organize_inflight = 0
         self.music_library_sync_task: asyncio.Task[None] | None = None
         self.library_storage_task: asyncio.Task[None] | None = None
         self.metadata_site_search_task: MetadataSiteSearchTask | None = None
@@ -1086,7 +1266,7 @@ class AppState:
             "completed",
             "refreshing_library",
         }
-        tasks = await self.repository.list_download_tasks()
+        tasks = await self.repository.list_unfinished_download_tasks()
         return [
             TelegramDownloadTask(
                 name=task.name,
@@ -1378,6 +1558,187 @@ class AppState:
         with contextlib.suppress(asyncio.CancelledError):
             await self.tagged_download_monitor_task
 
+    async def reload_directory_monitor(self, *, probe_native: bool = True) -> bool:
+        settings_payload = await self.repository.get_system_settings()
+        config = scraping_config_from_payload(settings_payload)
+        await self.directory_library_notifications.set_delay(
+            config.directory_monitor_notification_delay_seconds
+        )
+        previous = self.directory_monitor
+        recovery_snapshot = None
+        if (
+            previous is not None
+            and config.source_directory is not None
+            and normalize_storage_path(previous.root)
+            == normalize_storage_path(config.source_directory)
+        ):
+            recovery_snapshot = previous.snapshot
+        await self.stop_directory_monitor()
+        if not config.enabled or config.auto_organize != "directory":
+            self._set_directory_monitor_status(
+                state="disabled",
+                mode=config.directory_monitor_mode,
+                source_directory=config.source_directory,
+                poll_interval_seconds=config.directory_monitor_poll_interval_seconds,
+            )
+            self.directory_monitor_failure_notified = False
+            return True
+        if config.source_directory is None:
+            await self._fail_directory_monitor(
+                mode=config.directory_monitor_mode,
+                source_directory=None,
+                poll_interval_seconds=config.directory_monitor_poll_interval_seconds,
+                message="目录监听未启动：刮削源文件目录未配置。",
+                detail="source_directory is empty",
+            )
+            return False
+        if config.directory_monitor_mode == "native" and probe_native:
+            self._set_directory_monitor_status(
+                state="probing",
+                mode="native",
+                source_directory=config.source_directory,
+                poll_interval_seconds=config.directory_monitor_poll_interval_seconds,
+                message="正在检测原生目录监听。",
+            )
+            try:
+                await probe_native_directory(config.source_directory)
+            except DirectoryMonitorProbeError as exc:
+                await self._fail_directory_monitor(
+                    mode="native",
+                    source_directory=config.source_directory,
+                    poll_interval_seconds=config.directory_monitor_poll_interval_seconds,
+                    message="原生目录监听不可用。",
+                    detail=str(exc),
+                )
+                return False
+        monitor = DirectoryMonitorService(
+            root=config.source_directory,
+            mode=config.directory_monitor_mode,
+            poll_interval_seconds=config.directory_monitor_poll_interval_seconds,
+            submit_file=lambda source_file, event_id: (
+                _enqueue_directory_monitor_file(
+                    self,
+                    source_file,
+                    event_id=event_id,
+                )
+            ),
+            on_failed=lambda message, detail: self._handle_directory_monitor_failure(
+                mode=config.directory_monitor_mode,
+                source_directory=config.source_directory,
+                poll_interval_seconds=config.directory_monitor_poll_interval_seconds,
+                message=message,
+                detail=detail,
+            ),
+            log=lambda message, level: self.add_log("directory", message, level),
+            recovery_snapshot=recovery_snapshot,
+        )
+        self.directory_monitor = monitor
+        try:
+            await monitor.start()
+        except Exception as exc:  # noqa: BLE001
+            self.directory_monitor = None
+            await self._fail_directory_monitor(
+                mode=config.directory_monitor_mode,
+                source_directory=config.source_directory,
+                poll_interval_seconds=config.directory_monitor_poll_interval_seconds,
+                message="目录监听启动失败。",
+                detail=str(exc),
+            )
+            return False
+        self._set_directory_monitor_status(
+            state=(
+                "running_native"
+                if config.directory_monitor_mode == "native"
+                else "running_polling"
+            ),
+            mode=config.directory_monitor_mode,
+            source_directory=config.source_directory,
+            poll_interval_seconds=config.directory_monitor_poll_interval_seconds,
+        )
+        self.directory_monitor_failure_notified = False
+        return True
+
+    async def stop_directory_monitor(self) -> None:
+        monitor = self.directory_monitor
+        if monitor is None:
+            return
+        self.directory_monitor = None
+        await monitor.stop()
+        self.add_log("directory", "目录监听已停止。")
+
+    def _set_directory_monitor_status(
+        self,
+        *,
+        state: str,
+        mode: str,
+        source_directory: Path | None,
+        poll_interval_seconds: int,
+        message: str = "",
+        detail: str = "",
+        failed_at: str | None = None,
+    ) -> None:
+        self.directory_monitor_status = {
+            "state": state,
+            "mode": mode,
+            "source_directory": str(source_directory) if source_directory else "",
+            "poll_interval_seconds": max(30, poll_interval_seconds),
+            "failed_at": failed_at,
+            "message": message,
+            "detail": detail,
+        }
+
+    async def _handle_directory_monitor_failure(
+        self,
+        *,
+        mode: str,
+        source_directory: Path,
+        poll_interval_seconds: int,
+        message: str,
+        detail: str,
+    ) -> None:
+        await self._fail_directory_monitor(
+            mode=mode,
+            source_directory=source_directory,
+            poll_interval_seconds=poll_interval_seconds,
+            message=message,
+            detail=detail,
+        )
+
+    async def _fail_directory_monitor(
+        self,
+        *,
+        mode: str,
+        source_directory: Path | None,
+        poll_interval_seconds: int,
+        message: str,
+        detail: str,
+        notify: bool = True,
+    ) -> None:
+        failed_at = datetime.now(UTC).isoformat()
+        self._set_directory_monitor_status(
+            state="failed",
+            mode=mode,
+            source_directory=source_directory,
+            poll_interval_seconds=poll_interval_seconds,
+            failed_at=failed_at,
+            message=message,
+            detail=detail,
+        )
+        self.add_log(
+            "directory",
+            f"{message} 目录={source_directory or '-'}，原因={detail}",
+            "ERROR",
+        )
+        if notify and not self.directory_monitor_failure_notified:
+            self.directory_monitor_failure_notified = True
+            await _send_directory_monitor_failure_notification(
+                self,
+                source_directory=source_directory,
+                failed_at=failed_at,
+                message=message,
+                detail=detail,
+            )
+
     def start_music_library_sync(self) -> None:
         if self.music_library_sync_task is not None and not self.music_library_sync_task.done():
             return
@@ -1529,6 +1890,7 @@ def create_app() -> FastAPI:
         state.task_manager.start()
         state.start_download_polling()
         state.start_tagged_download_monitor()
+        await state.reload_directory_monitor()
         state.start_music_library_sync()
         state.start_library_storage_refresh()
         state.scheduler.start()
@@ -1538,9 +1900,11 @@ def create_app() -> FastAPI:
         root_logger.removeHandler(state.log_handler)
         await state.stop_download_polling()
         await state.stop_tagged_download_monitor()
+        await state.stop_directory_monitor()
         await state.stop_music_library_sync()
         await state.stop_library_storage_refresh()
         await state.task_manager.stop()
+        await state.directory_library_notifications.flush_and_stop()
         if state.metadata_site_search_worker is not None:
             state.metadata_site_search_worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -2069,6 +2433,67 @@ def create_app() -> FastAPI:
     async def system_settings() -> SystemSettingsResponse:
         return SystemSettingsResponse(**await state.repository.get_system_settings())
 
+    @app.get(
+        "/api/settings/directory-monitor/status",
+        response_model=DirectoryMonitorStatusResponse,
+    )
+    async def directory_monitor_status() -> DirectoryMonitorStatusResponse:
+        return DirectoryMonitorStatusResponse(**state.directory_monitor_status)
+
+    @app.post(
+        "/api/settings/directory-monitor/retry-native",
+        response_model=DirectoryMonitorStatusResponse,
+    )
+    async def retry_native_directory_monitor() -> DirectoryMonitorStatusResponse:
+        settings_payload = await state.repository.get_system_settings()
+        config = scraping_config_from_payload(settings_payload)
+        if (
+            not config.enabled
+            or config.auto_organize != "directory"
+            or config.source_directory is None
+        ):
+            raise HTTPException(status_code=409, detail="目录监听尚未启用。")
+        previous_status = dict(state.directory_monitor_status)
+        if config.directory_monitor_mode == "native":
+            state._set_directory_monitor_status(
+                state="probing",
+                mode="native",
+                source_directory=config.source_directory,
+                poll_interval_seconds=config.directory_monitor_poll_interval_seconds,
+                message="正在重新检测原生目录监听。",
+            )
+        try:
+            await probe_native_directory(config.source_directory)
+        except DirectoryMonitorProbeError as exc:
+            if config.directory_monitor_mode == "polling":
+                state.directory_monitor_status = previous_status
+            else:
+                await state._fail_directory_monitor(
+                    mode="native",
+                    source_directory=config.source_directory,
+                    poll_interval_seconds=config.directory_monitor_poll_interval_seconds,
+                    message="原生目录监听仍不可用。",
+                    detail=str(exc),
+                    notify=False,
+                )
+            raise HTTPException(
+                status_code=409 if exc.polling_available else 422,
+                detail={
+                    "code": "directory_monitor_native_unavailable",
+                    "message": str(exc),
+                    "polling_available": exc.polling_available,
+                },
+            ) from exc
+        if config.directory_monitor_mode != "native":
+            scraping_payload = dict(settings_payload.get("scraping") or {})
+            scraping_payload["directory_monitor_mode"] = "native"
+            settings_payload["scraping"] = scraping_payload
+            await state.repository.update_system_settings(settings_payload)
+        restored = await state.reload_directory_monitor(probe_native=False)
+        if not restored:
+            raise HTTPException(status_code=409, detail="原生目录监听恢复失败。")
+        return DirectoryMonitorStatusResponse(**state.directory_monitor_status)
+
     @app.put("/api/settings/system", response_model=SystemSettingsResponse)
     async def update_system_settings(
         payload: SystemSettingsRequest,
@@ -2085,15 +2510,95 @@ def create_app() -> FastAPI:
         payload: SystemSettingsRequest,
     ) -> SystemSettingsResponse:
         previous_settings = await state.repository.get_system_settings()
-        previous_version_control = scraping_config_from_payload(
-            previous_settings
-        ).track_version_control
-        settings_payload = await state.repository.update_system_settings(payload.model_dump())
+        previous_scraping_config = scraping_config_from_payload(previous_settings)
+        requested_payload = payload.model_dump()
+        requested_scraping_config = scraping_config_from_payload(requested_payload)
+        previous_version_control = previous_scraping_config.track_version_control
+        previous_monitor_config = (
+            previous_scraping_config.enabled,
+            previous_scraping_config.auto_organize,
+            normalize_storage_path(previous_scraping_config.source_directory),
+            previous_scraping_config.directory_monitor_mode,
+            (
+                previous_scraping_config.directory_monitor_poll_interval_seconds
+                if previous_scraping_config.directory_monitor_mode == "polling"
+                else None
+            ),
+        )
+        requested_monitor_config = (
+            requested_scraping_config.enabled,
+            requested_scraping_config.auto_organize,
+            normalize_storage_path(requested_scraping_config.source_directory),
+            requested_scraping_config.directory_monitor_mode,
+            (
+                requested_scraping_config.directory_monitor_poll_interval_seconds
+                if requested_scraping_config.directory_monitor_mode == "polling"
+                else None
+            ),
+        )
+        native_probe_completed = False
+        if (
+            requested_scraping_config.enabled
+            and requested_scraping_config.auto_organize == "directory"
+            and requested_scraping_config.directory_monitor_mode == "native"
+            and requested_monitor_config != previous_monitor_config
+        ):
+            if requested_scraping_config.source_directory is None:
+                raise HTTPException(status_code=422, detail="请先配置刮削源文件目录。")
+            try:
+                await probe_native_directory(requested_scraping_config.source_directory)
+            except DirectoryMonitorProbeError as exc:
+                raise HTTPException(
+                    status_code=409 if exc.polling_available else 422,
+                    detail={
+                        "code": "directory_monitor_native_unavailable",
+                        "message": str(exc),
+                        "source_directory": str(requested_scraping_config.source_directory),
+                        "polling_available": exc.polling_available,
+                    },
+                ) from exc
+            native_probe_completed = True
+        settings_payload = await state.repository.update_system_settings(requested_payload)
         await state.reload_bots()
         await state.reload_notifiers()
-        current_version_control = scraping_config_from_payload(
-            settings_payload
-        ).track_version_control
+        current_scraping_config = scraping_config_from_payload(settings_payload)
+        await state.directory_library_notifications.set_delay(
+            current_scraping_config.directory_monitor_notification_delay_seconds
+        )
+        current_version_control = current_scraping_config.track_version_control
+        current_monitor_config = (
+            current_scraping_config.enabled,
+            current_scraping_config.auto_organize,
+            normalize_storage_path(current_scraping_config.source_directory),
+            current_scraping_config.directory_monitor_mode,
+            (
+                current_scraping_config.directory_monitor_poll_interval_seconds
+                if current_scraping_config.directory_monitor_mode == "polling"
+                else None
+            ),
+        )
+        monitor_should_reload = previous_monitor_config != current_monitor_config or (
+            current_scraping_config.enabled
+            and current_scraping_config.auto_organize == "directory"
+            and state.directory_monitor_status.get("state") == "failed"
+        )
+        monitor_start_failure: dict[str, object] | None = None
+        if monitor_should_reload:
+            monitor_started = await state.reload_directory_monitor(
+                probe_native=not native_probe_completed
+            )
+            if not monitor_started:
+                monitor_status = state.directory_monitor_status
+                monitor_start_failure = {
+                    "code": "directory_monitor_start_failed",
+                    "message": "系统设置已保存，但目录监听启动失败。",
+                    "source_directory": str(current_scraping_config.source_directory or ""),
+                    "mode": current_scraping_config.directory_monitor_mode,
+                    "reason": " ".join(
+                        str(monitor_status.get(key) or "")
+                        for key in ("message", "detail")
+                    ).strip(),
+                }
         if previous_version_control != current_version_control:
             try:
                 updated = await _refresh_playlist_library_matches(
@@ -2113,6 +2618,8 @@ def create_app() -> FastAPI:
                     "WARNING",
                 )
         state.add_log("settings", "System settings saved")
+        if monitor_start_failure is not None:
+            raise HTTPException(status_code=409, detail=monitor_start_failure)
         return SystemSettingsResponse(**settings_payload)
 
     @app.get("/api/settings/database/export")
@@ -3537,9 +4044,13 @@ def create_app() -> FastAPI:
             if payload is None or payload.download_path is None
             else Path(payload.download_path)
         )
+        scraping_config = scraping_config_from_payload(
+            await state.repository.get_system_settings()
+        )
         task = await state.repository.mark_torrent_completed(
             torrent_hash=torrent_hash,
             save_path=download_path,
+            auto_organize=scraping_config.auto_organize,
         )
         await _sync_playlist_tracks_for_download_task(state, task)
         state.add_log("transfer", f"Download completed webhook accepted: {torrent_hash}")
@@ -6001,6 +6512,23 @@ async def _enqueue_download_item_organize(
     item: TorrentRecordItem,
     source_file: Path,
 ) -> int | None:
+    task_create = await _download_item_organize_task_if_needed(
+        state,
+        task,
+        item,
+        source_file,
+    )
+    if task_create is None:
+        return None
+    return await state.task_manager.enqueue(task_create)
+
+
+async def _download_item_organize_task_if_needed(
+    state: AppState,
+    task: TorrentRecord,
+    item: TorrentRecordItem,
+    source_file: Path,
+) -> TaskCreate | None:
     idempotency_key = _download_item_organize_idempotency_key(item, source_file)
     task_create = _download_item_organize_task_create(
         torrent_record_id=task.id,
@@ -6044,7 +6572,7 @@ async def _enqueue_download_item_organize(
             task_name=task.name,
             idempotency_key=idempotency_key,
         )
-    return await state.task_manager.enqueue(task_create)
+    return task_create
 
 
 def _download_item_organize_task_create(
@@ -6108,9 +6636,135 @@ def _manual_file_generation_digest(path: Path) -> str:
     return hashlib.sha1(identity.encode("utf-8", errors="ignore")).hexdigest()[:20]
 
 
+def _directory_capture_source_file(value: str) -> Path:
+    source_file = Path(value).expanduser().resolve(strict=True)
+    if not source_file.is_file() or not _is_audio_file(source_file):
+        raise FileNotFoundError(f"Directory capture source file is unavailable: {source_file}")
+    return source_file
+
+
+async def _directory_capture_next_task(
+    state: AppState,
+    source_file: Path,
+    *,
+    file_generation: str,
+    event_id: str,
+) -> tuple[TaskCreate | None, dict[str, object]]:
+    candidates = await state.repository.list_directory_capture_download_task_items()
+    matches = [
+        (record, item)
+        for record, item in candidates
+        if _source_file_matches_torrent_item(source_file, item)
+    ]
+    if len(matches) == 1:
+        record, item = matches[0]
+        next_task: TaskCreate | None = None
+        route = "download_existing"
+        if item.status in DOWNLOAD_ITEM_SCRAPE_INCOMPLETE_STATUSES:
+            next_task = TaskCreate(
+                task_type="DOWNLOAD_ITEM_SCRAPE",
+                payload={
+                    "torrent_record_id": record.id,
+                    "item_id": item.id,
+                    "organize_after_scrape": True,
+                    "source_file": str(source_file),
+                    "task_name": record.name,
+                },
+                resource_keys=[f"download-item:{item.id}"],
+                priority=DOWNLOAD_ITEM_TASK_PRIORITY,
+                max_attempts=3,
+                idempotency_key=(
+                    "directory-capture-item-scrape:"
+                    f"{record.id}:{item.id}:{file_generation}:{event_id}"
+                ),
+            )
+            route = "download_item_scrape"
+        elif item.status in DOWNLOAD_ITEM_SCRAPE_DONE_STATUSES:
+            next_task = await _download_item_organize_task_if_needed(
+                state,
+                record,
+                item,
+                source_file,
+            )
+            route = "download_file_organize" if next_task is not None else route
+        state.add_log(
+            "directory",
+            "目录捕获已关联下载明细："
+            f"事件={event_id}，下载任务={record.id}，明细={item.id}，"
+            f"状态={item.status}，后继={next_task.task_type if next_task else 'existing'}，"
+            f"文件={source_file}",
+        )
+        return next_task, {
+            "route": route,
+            "source_file": str(source_file),
+            "torrent_record_id": record.id,
+            "item_id": item.id,
+            "matched_count": 1,
+        }
+
+    next_task = await _directory_capture_manual_task_if_needed(
+        state,
+        source_file,
+        file_generation=file_generation,
+        event_id=event_id,
+    )
+    route = "manual_file_scrape" if next_task is not None else "manual_existing"
+    state.add_log(
+        "directory",
+        "目录捕获转入手动刮削链："
+        f"事件={event_id}，完整路径匹配数={len(matches)}，"
+        f"后继={next_task.task_type if next_task else 'existing'}，文件={source_file}",
+    )
+    return next_task, {
+        "route": route,
+        "source_file": str(source_file),
+        "matched_count": len(matches),
+    }
+
+
+async def _directory_capture_manual_task_if_needed(
+    state: AppState,
+    source_file: Path,
+    *,
+    file_generation: str,
+    event_id: str,
+) -> TaskCreate | None:
+    event_key = f"{file_generation}:directory:{event_id}"
+    scrape_key = f"manual-file-scrape:{event_key}"
+    organize_key = f"manual-file-organize:{event_key}"
+    existing_scrape = await state.repository.get_system_task_by_idempotency_key(scrape_key)
+    existing_organize = await state.repository.get_system_task_by_idempotency_key(organize_key)
+    if existing_scrape is not None or existing_organize is not None:
+        return None
+    inferred_metadata = await asyncio.to_thread(infer_metadata_from_paths, [source_file])
+    inferred = inferred_metadata.get(source_file)
+    return TaskCreate(
+        task_type="MANUAL_FILE_SCRAPE",
+        payload={
+            "source_file": str(source_file),
+            "task_name": source_file.name,
+            "batch_id": f"directory-{event_id}",
+            "trigger_source": "directory_monitor",
+            "inferred_metadata": (
+                _track_metadata_payload(inferred) if inferred is not None else None
+            ),
+            "organize_idempotency_key": organize_key,
+        },
+        resource_keys=[_scraping_file_resource_key(source_file)],
+        max_attempts=3,
+        idempotency_key=scrape_key,
+    )
+
+
 async def _active_manual_file_task_sources(state: AppState) -> set[str]:
     tasks = await state.repository.list_active_system_tasks_by_types(
-        {"MANUAL_SCRAPE", "MANUAL_FILE_SCRAPE", "FILE_ORGANIZE"}
+        {
+            "DIRECTORY_CAPTURE",
+            "DOWNLOAD_ITEM_SCRAPE",
+            "MANUAL_SCRAPE",
+            "MANUAL_FILE_SCRAPE",
+            "FILE_ORGANIZE",
+        }
     )
     sources: set[str] = set()
     for task in tasks:
@@ -6125,8 +6779,6 @@ async def _active_manual_file_task_sources(state: AppState) -> set[str]:
                 source_key = _path_match_key(source_file)
                 if source_key is not None:
                     sources.add(source_key)
-            continue
-        if task.task_type == "FILE_ORGANIZE" and payload.get("mode") != "manual_file":
             continue
         source_file = _optional_string(payload.get("source_file"))
         if source_file is None:
@@ -6177,6 +6829,52 @@ async def _enqueue_manual_file_scrape(
     )
 
 
+async def _enqueue_directory_monitor_file(
+    state: AppState,
+    source_file: Path,
+    *,
+    event_id: str,
+) -> bool:
+    settings_payload = await state.repository.get_system_settings()
+    config = scraping_config_from_payload(settings_payload)
+    if not config.enabled or config.auto_organize != "directory":
+        return False
+    if config.mode == "source" and state.file_organize_inflight:
+        return False
+    source_file = await asyncio.to_thread(
+        _manual_source_file_for_task,
+        config,
+        str(source_file),
+    )
+    active_sources = await _active_manual_file_task_sources(state)
+    source_key = _path_match_key(source_file)
+    if source_key is None:
+        return False
+    if source_key in active_sources:
+        return True
+    file_generation = await asyncio.to_thread(_manual_file_generation_digest, source_file)
+    task_id = await state.task_manager.enqueue(
+        TaskCreate(
+            task_type="DIRECTORY_CAPTURE",
+            payload={
+                "source_file": str(source_file),
+                "event_id": event_id,
+                "file_generation": file_generation,
+            },
+            resource_keys=[_scraping_file_resource_key(source_file)],
+            priority=DIRECTORY_CAPTURE_TASK_PRIORITY,
+            max_attempts=3,
+            idempotency_key=f"directory-capture:{file_generation}:{event_id}",
+        )
+    )
+    state.add_log(
+        "directory",
+        "目录监听已创建捕获任务："
+        f"事件={event_id}，任务={task_id}，文件={source_file}",
+    )
+    return True
+
+
 def _download_item_scrape_idempotency_key(item: TorrentRecordItem) -> str:
     raw_payload = item.raw_payload if isinstance(item.raw_payload, dict) else {}
     identity = "|".join(
@@ -6222,6 +6920,8 @@ async def _scrape_download_task_item(state: AppState, item_id: int) -> TorrentRe
     item = await state.repository.get_download_task_item(item_id)
     if item is None:
         return None
+    if item.status not in DOWNLOAD_ITEM_SCRAPE_INCOMPLETE_STATUSES:
+        return item
     reference = _download_task_item_reference_metadata(item)
     title = reference.title.strip()
     if not title:
@@ -6629,7 +7329,7 @@ def _append_torrent_audio_item(
     if not file_path:
         return
     file_name = Path(file_path).name
-    if Path(file_name).suffix.lower() not in _TORRENT_AUDIO_EXTENSIONS:
+    if Path(file_name).suffix.lower() not in AUDIO_EXTENSIONS:
         return
     items.append(
         {
@@ -6850,6 +7550,22 @@ def _scraping_summary_result(summary: ScrapingSummary) -> dict[str, int]:
         "failed_files": summary.failed_files,
         "skipped_files": sum(1 for item in summary.results if item.status == "skipped"),
     }
+
+
+def _suppress_directory_monitor_results(state: AppState, summary: ScrapingSummary) -> None:
+    monitor = state.directory_monitor
+    if monitor is None:
+        return
+    monitor.suppress_paths(
+        tuple(
+            dict.fromkeys(
+                path
+                for result in summary.results
+                for path in (result.source_path, result.library_path)
+                if path is not None
+            )
+        )
+    )
 
 
 def _raise_artist_directory_resolution_failure(summary: ScrapingSummary) -> None:
@@ -7128,6 +7844,12 @@ def _system_task_response(item: SystemTask) -> SystemTaskResponse:
 
 def _download_task_response(item: TorrentRecord) -> DownloadTaskResponse:
     torrent_hash = None if _is_pending_hash(item.torrent_hash) else item.torrent_hash
+    raw_auto_organize_mode = (item.payload or {}).get("auto_organize_mode")
+    auto_organize_mode = (
+        raw_auto_organize_mode
+        if raw_auto_organize_mode in {"downloader", "directory"}
+        else None
+    )
     return DownloadTaskResponse(
         id=item.id,
         torrent_hash=torrent_hash,
@@ -7139,6 +7861,7 @@ def _download_task_response(item: TorrentRecord) -> DownloadTaskResponse:
         save_path=item.save_path,
         source=item.source,
         last_error=item.last_error,
+        auto_organize_mode=auto_organize_mode,
     )
 
 
@@ -7611,7 +8334,7 @@ async def _sync_music_library_after_refresh(state: AppState) -> None:
 async def _refresh_music_library_after_change(
     state: AppState,
     reason: str,
-) -> None:
+) -> bool:
     try:
         server = await state.repository.default_media_server()
         if server is None:
@@ -7620,7 +8343,7 @@ async def _refresh_music_library_after_change(
                 f"Music library refresh skipped: no media server, reason={reason}",
                 "WARNING",
             )
-            return
+            return False
         client = build_media_server_client(server)
         await client.start_scan()
     except Exception as exc:  # noqa: BLE001
@@ -7629,7 +8352,7 @@ async def _refresh_music_library_after_change(
             f"Music library refresh failed: reason={reason}, error={exc}",
             "ERROR",
         )
-        return
+        return False
     state.add_log(
         "library",
         f"Media library refresh requested: reason={reason}",
@@ -7640,6 +8363,7 @@ async def _refresh_music_library_after_change(
     )
     state._background_tasks.add(sync_task)
     sync_task.add_done_callback(state._background_tasks.discard)
+    return True
 
 
 async def _sync_music_library_from_media_server(
@@ -9130,7 +9854,7 @@ def _physical_album_identity_for_directory(
         return fallback
     identities: list[AlbumIdentity] = []
     for path in sorted(directory.iterdir(), key=lambda item: item.name.casefold()):
-        if not path.is_file() or path.suffix.casefold() not in _TORRENT_AUDIO_EXTENSIONS:
+        if not path.is_file() or path.suffix.casefold() not in AUDIO_EXTENSIONS:
             continue
         try:
             metadata = read_track_metadata(path)
@@ -9270,9 +9994,11 @@ async def _scrape_manual_source_files(
     source_files: tuple[Path, ...],
     *,
     manual_metadata: dict[Path, tuple[TrackMetadata, ...]] | None = None,
+    cached_metadata: dict[Path, tuple[TrackMetadata, ...]] | None = None,
     contextual_metadata: dict[Path, ContextualMetadata] | None = None,
     exclude_library_paths: tuple[Path, ...] = (),
     use_task_manager: bool = True,
+    source: str = "manual",
 ) -> ScrapingSummary:
     if not exclude_library_paths:
         try:
@@ -9280,7 +10006,7 @@ async def _scrape_manual_source_files(
         except Exception as exc:  # noqa: BLE001
             state.add_log(
                 "library",
-                f"Music library sync before manual scraping failed: {exc}",
+                f"Music library sync before {source} scraping failed: {exc}",
                 "WARNING",
             )
     library_roots = tuple(
@@ -9325,7 +10051,7 @@ async def _scrape_manual_source_files(
             await _ensure_artist_from_metadata(
                 state,
                 item.metadata,
-                context=f"manual scraping {item.source_path}",
+                context=f"{source} scraping {item.source_path}",
             )
         await state.repository.record_scraping_result(
             torrent_hash=None,
@@ -9358,6 +10084,7 @@ async def _scrape_manual_source_files(
             source_files=source_files,
             library_tracks=library_tracks,
             media_history=media_history,
+            cached_metadata=cached_metadata,
             forced_metadata=forced_metadata,
             contextual_metadata=contextual_metadata,
             on_file_result=record_file_result,
@@ -9368,20 +10095,22 @@ async def _scrape_manual_source_files(
     if use_task_manager:
         summary = await state.task_manager.run_exclusive(
             task_type="SCRAPE",
-            resource_keys=[_scraping_batch_resource_key("manual-scrape", source_files)],
+            resource_keys=[_scraping_batch_resource_key(f"{source}-scrape", source_files)],
             payload={
-                "mode": "manual",
+                "mode": source,
                 "task_name": task_name,
                 "source_file_count": len(source_files),
             },
-            wait_log_message=f"Manual scraping is waiting for scraper resource: {task_name}",
+            wait_log_message=(
+                f"{source.title()} scraping is waiting for scraper resource: {task_name}"
+            ),
             runner=run_scrape,
         )
     else:
         summary = await run_scrape()
     state.add_log(
         "metadata",
-        "Manual scraping completed for "
+        f"{source.title()} scraping completed for "
         f"{task_name}: files={summary.source_files}, mapped={summary.mapped_files}, "
         f"updated={summary.updated_files}, moved={summary.moved_files}, "
         f"failed={summary.failed_files}, "
@@ -9390,12 +10119,14 @@ async def _scrape_manual_source_files(
     if any(item.status == "success" for item in summary.results):
         await _refresh_music_library_after_change(
             state,
-            f"manual organization, task={task_name}",
+            f"{source} organization, task={task_name}",
         )
     return summary
 
 
 async def _poll_download_tasks_once(state: AppState) -> None:
+    settings_payload = await state.repository.get_system_settings()
+    scraping_config = scraping_config_from_payload(settings_payload)
     tasks = await state.repository.list_unfinished_download_tasks()
     if not tasks:
         return
@@ -9459,7 +10190,15 @@ async def _poll_download_tasks_once(state: AppState) -> None:
             "save_path": str(status.save_path) if status.save_path is not None else None,
         }
         if status.state == DownloadState.COMPLETED:
-            changes.update({"status": "completed", "completed_at": datetime.now(UTC)})
+            task_payload = dict(task.payload or {})
+            task_payload["auto_organize_mode"] = scraping_config.auto_organize
+            changes.update(
+                {
+                    "status": "completed",
+                    "completed_at": datetime.now(UTC),
+                    "payload": task_payload,
+                }
+            )
         else:
             changes["status"] = "downloading"
             if task.download_started_at is None:
@@ -9812,6 +10551,7 @@ async def _organize_manual_source_file(
     candidates: tuple[TrackMetadata, ...],
     *,
     inferred_metadata: TrackMetadata | None,
+    trigger_source: str | None,
 ) -> ScrapingSummary:
     settings_payload = await state.repository.get_system_settings()
     config = scraping_config_from_payload(settings_payload)
@@ -9871,10 +10611,14 @@ async def _organize_manual_source_file(
         f"failed={summary.failed_files}",
     )
     if any(item.status == "success" for item in summary.results):
-        await _refresh_music_library_after_change(
+        refresh_accepted = await _refresh_music_library_after_change(
             state,
             f"manual file organization, task={task_name}",
         )
+        if refresh_accepted and trigger_source == "directory_monitor":
+            refreshed_at = datetime.now(UTC)
+            for item in _directory_library_notification_items(summary, refreshed_at):
+                await state.directory_library_notifications.add(item)
     return summary
 
 
@@ -10467,6 +11211,182 @@ def _scraping_file_log_message(task_name: str, item: ScrapingFileResult) -> str:
     return ", ".join(parts)
 
 
+def _directory_library_notification_items(
+    summary: ScrapingSummary,
+    refreshed_at: datetime,
+) -> tuple[DirectoryLibraryNotificationItem, ...]:
+    items: list[DirectoryLibraryNotificationItem] = []
+    for result in summary.results:
+        if result.status != "success":
+            continue
+        final_path = result.library_path or result.source_path
+        key = os.path.normcase(normalize_storage_path(final_path))
+        title = str(result.metadata.title or "").strip() or final_path.name
+        items.append(
+            DirectoryLibraryNotificationItem(
+                key=key,
+                title=title,
+                artist=str(result.metadata.artist or "").strip() or "-",
+                album=str(result.metadata.album or "").strip() or "-",
+                refreshed_at=refreshed_at,
+            )
+        )
+    return tuple(items)
+
+
+async def _send_directory_library_notification(
+    state: AppState,
+    items: tuple[DirectoryLibraryNotificationItem, ...],
+) -> None:
+    if not items:
+        return
+    channels = await state.repository.list_notifiers()
+    enabled = [
+        item
+        for item in channels
+        if item.enabled
+        and item.enable_library_notify
+        and item.type == "telegram"
+        and item.bot_token.strip()
+    ]
+    if not enabled:
+        return
+    system_settings = await state.repository.get_system_settings()
+    notifiers: list[tuple[str, bool, str, TelegramHttpNotifier]] = []
+    for channel in enabled:
+        chat_ids = tuple(
+            int(chat_id.strip())
+            for chat_id in channel.chat_ids.split(",")
+            if chat_id.strip().isdigit()
+        )
+        if not chat_ids:
+            continue
+        notifiers.append(
+            (
+                channel.name,
+                channel.use_proxy,
+                channel.bot_token,
+                TelegramHttpNotifier(
+                    token=channel.bot_token,
+                    chat_ids=chat_ids,
+                    proxy=_proxy_url(system_settings) if channel.use_proxy else None,
+                ),
+            )
+        )
+    if not notifiers:
+        return
+    event = NotifyEvent(
+        title="MusicPilot 目录监听已入库",
+        text=_directory_library_notification_body(items),
+    )
+    send_started_at = time.perf_counter()
+    results = await asyncio.gather(
+        *(notifier.notify(event) for _, _, _, notifier in notifiers),
+        return_exceptions=True,
+    )
+    elapsed_ms = (time.perf_counter() - send_started_at) * 1000
+    for (channel_name, use_proxy, bot_token, _), result in zip(
+        notifiers,
+        results,
+        strict=True,
+    ):
+        if isinstance(result, BaseException):
+            state.add_log(
+                "directory",
+                "目录监听入库通知发送失败："
+                f"渠道={channel_name}，入库数量={len(items)}，正文字符={len(event.text)}，"
+                f"使用代理={'是' if use_proxy else '否'}，耗时={elapsed_ms:.0f}ms，"
+                f"异常={_notification_send_error_text(result, secrets=(bot_token,))}",
+                "WARNING",
+            )
+        else:
+            state.add_log(
+                "directory",
+                "目录监听入库通知发送成功："
+                f"渠道={channel_name}，入库数量={len(items)}，耗时={elapsed_ms:.0f}ms",
+            )
+
+
+def _directory_library_notification_body(
+    items: tuple[DirectoryLibraryNotificationItem, ...],
+) -> str:
+    refreshed_at = max(item.refreshed_at for item in items)
+    header = f"<b>入库数量：</b>{len(items)}"
+    footer = f"<b>入库时间：</b>{escape(_format_datetime(refreshed_at))}"
+    lines = [header]
+    shown = 0
+    for index, item in enumerate(items, start=1):
+        line = (
+            f"{index}. {_directory_notification_value(item.title, 120)} - "
+            f"{_directory_notification_value(item.artist, 80)}"
+            f"（{_directory_notification_value(item.album, 80)}）"
+        )
+        remaining = len(items) - index
+        tail = [f"另有 {remaining} 个文件"] if remaining else []
+        candidate = "\n".join((*lines, line, *tail, footer))
+        if len(candidate) > DIRECTORY_LIBRARY_NOTIFICATION_MAX_CHARS:
+            break
+        lines.append(line)
+        shown += 1
+    if shown < len(items):
+        lines.append(f"另有 {len(items) - shown} 个文件")
+    lines.append(footer)
+    return "\n".join(lines)
+
+
+def _directory_notification_value(value: str, max_length: int) -> str:
+    text = value.strip() or "-"
+    if len(text) > max_length:
+        text = f"{text[: max_length - 1]}…"
+    return escape(text)
+
+
+def _notification_send_error_text(
+    error: BaseException,
+    *,
+    secrets: tuple[str, ...] = (),
+) -> str:
+    error_type = type(error).__name__
+    if isinstance(error, httpx.HTTPStatusError):
+        response = error.response
+        description = response.reason_phrase
+        with contextlib.suppress(ValueError):
+            payload = response.json()
+            if isinstance(payload, dict):
+                description = str(payload.get("description") or description)
+        return (
+            f"{error_type}(status={response.status_code}, "
+            f"detail={_notification_log_detail(description, secrets=secrets)})"
+        )
+    if isinstance(error, httpx.TimeoutException):
+        return f"{error_type}(Telegram 请求超时)"
+    if isinstance(error, httpx.TransportError):
+        return f"{error_type}(Telegram 或代理网络传输失败)"
+    detail = _notification_log_detail(str(error), secrets=secrets)
+    return f"{error_type}({detail})"
+
+
+def _notification_log_detail(
+    value: str,
+    *,
+    secrets: tuple[str, ...],
+) -> str:
+    detail = " ".join(value.split()).strip()
+    for secret in secrets:
+        if secret:
+            detail = detail.replace(secret, "***")
+    detail = re.sub(
+        r"(?i)(api\.telegram\.org/bot)[^/\s'\"]+",
+        r"\1***",
+        detail,
+    )
+    if not detail:
+        return "无附加信息"
+    if len(detail) > 300:
+        return f"{detail[:299]}…"
+    return detail
+
+
 async def _send_event_notifications(
     state: AppState,
     event_name: str,
@@ -10507,6 +11427,47 @@ async def _send_event_notifications(
         *(notifier.notify(NotifyEvent(title=title, text=text)) for notifier in notifiers),
         return_exceptions=True,
     )
+
+
+async def _send_directory_monitor_failure_notification(
+    state: AppState,
+    *,
+    source_directory: Path | None,
+    failed_at: str,
+    message: str,
+    detail: str,
+) -> None:
+    notifiers = state.configured_notifiers
+    if not notifiers:
+        state.add_log("directory", "目录监听故障没有可用的通知渠道。", "WARNING")
+        return
+    text = "\n".join(
+        (
+            f"源目录：{source_directory or '-'}",
+            f"失败时间：{failed_at}",
+            f"原因：{message} {detail}".strip(),
+            "请前往刮削设置处理目录监听故障。",
+        )
+    )
+    results = await asyncio.gather(
+        *(
+            notifier.notify(
+                NotifyEvent(
+                    title="MusicPilot 目录监听已停止",
+                    text=text,
+                )
+            )
+            for notifier in notifiers
+        ),
+        return_exceptions=True,
+    )
+    failures = sum(isinstance(result, BaseException) for result in results)
+    if failures:
+        state.add_log(
+            "directory",
+            f"目录监听故障通知发送失败：失败渠道={failures}，总渠道={len(results)}",
+            "WARNING",
+        )
 
 
 def _notification_body(event_name: str, task: TorrentRecord) -> str:

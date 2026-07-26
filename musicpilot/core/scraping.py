@@ -9,7 +9,7 @@ import unicodedata
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 from weakref import WeakValueDictionary
 
 from opencc import OpenCC
@@ -30,6 +30,8 @@ logger = logging.getLogger("musicpilot.metadata.scraping")
 _t2s = OpenCC("t2s")  # Traditional → Simplified
 
 ScrapingMode = Literal["source", "mapped", "copy"]
+AutoOrganizeMode = Literal["downloader", "directory"]
+DirectoryMonitorMode = Literal["native", "polling"]
 RequiredMetadata = Literal["album", "artist", "lyrics", "cover"]
 ClassifyBy = Literal["artist", "album", "artist_album"]
 DuplicateHandling = Literal["ignore", "overwrite", "keep_largest"]
@@ -79,7 +81,7 @@ _INVALID_METADATA_TEXT_KEYS = frozenset(
     }
 )
 
-_AUDIO_EXTENSIONS = {
+AUDIO_EXTENSIONS = frozenset({
     ".aac",
     ".aiff",
     ".alac",
@@ -91,7 +93,7 @@ _AUDIO_EXTENSIONS = {
     ".opus",
     ".wav",
     ".wma",
-}
+})
 
 _ALBUM_COVER_EXTENSION_PRIORITY = {
     ".jpg": 0,
@@ -150,6 +152,10 @@ class ArtistDirectoryResolutionError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class ScrapingConfig:
     enabled: bool = False
+    auto_organize: AutoOrganizeMode = "downloader"
+    directory_monitor_mode: DirectoryMonitorMode = "native"
+    directory_monitor_poll_interval_seconds: int = 60
+    directory_monitor_notification_delay_seconds: int = 10
     mode: ScrapingMode = "mapped"
     source_directory: Path | None = None
     mapped_directory: Path | None = None
@@ -1753,6 +1759,13 @@ def scraping_config_from_payload(payload: dict[str, object]) -> ScrapingConfig:
     if not isinstance(scraping, dict):
         scraping = {}
     mode = str(scraping.get("mode") or "mapped")
+    auto_organize = str(scraping.get("auto_organize") or "downloader")
+    directory_monitor_mode = str(scraping.get("directory_monitor_mode") or "native")
+    poll_interval_value = scraping.get("directory_monitor_poll_interval_seconds", 60)
+    notification_delay_value = scraping.get(
+        "directory_monitor_notification_delay_seconds",
+        10,
+    )
     classify_by = str(scraping.get("classify_by") or "artist")
     duplicate_handling = str(scraping.get("duplicate_handling") or "ignore")
     required = scraping.get("required_metadata")
@@ -1763,10 +1776,31 @@ def scraping_config_from_payload(payload: dict[str, object]) -> ScrapingConfig:
         scrape_metadata = required_metadata
     if mode not in {"source", "mapped", "copy"}:
         mode = "mapped"
+    if auto_organize not in {"downloader", "directory"}:
+        auto_organize = "downloader"
+    if directory_monitor_mode not in {"native", "polling"}:
+        directory_monitor_mode = "native"
+    try:
+        directory_monitor_poll_interval_seconds = max(30, int(poll_interval_value))
+    except (TypeError, ValueError):
+        directory_monitor_poll_interval_seconds = 60
+    try:
+        directory_monitor_notification_delay_seconds = max(
+            1,
+            int(notification_delay_value),
+        )
+    except (TypeError, ValueError):
+        directory_monitor_notification_delay_seconds = 10
     if duplicate_handling not in {"ignore", "overwrite", "keep_largest"}:
         duplicate_handling = "ignore"
     return ScrapingConfig(
         enabled=bool(scraping.get("enabled")),
+        auto_organize=cast(AutoOrganizeMode, auto_organize),
+        directory_monitor_mode=cast(DirectoryMonitorMode, directory_monitor_mode),
+        directory_monitor_poll_interval_seconds=directory_monitor_poll_interval_seconds,
+        directory_monitor_notification_delay_seconds=(
+            directory_monitor_notification_delay_seconds
+        ),
         mode=mode,
         source_directory=_optional_path(scraping.get("source_directory")),
         mapped_directory=_optional_path(scraping.get("mapped_directory")),
@@ -1950,7 +1984,7 @@ def _input_audio_files(source_files: tuple[Path, ...]) -> list[Path]:
     files: list[Path] = []
     for source_file in source_files:
         path = source_file.expanduser()
-        if not path.is_file() or path.suffix.casefold() not in _AUDIO_EXTENSIONS:
+        if not path.is_file() or path.suffix.casefold() not in AUDIO_EXTENSIONS:
             continue
         resolved = path.resolve()
         if resolved in seen:
@@ -2243,13 +2277,13 @@ def _analyze_directory(dir_path: Path, children: list[Path]) -> _DirInferredInfo
 
 
 def _audio_files(path: Path) -> list[Path]:
-    if path.is_file() and path.suffix.casefold() in _AUDIO_EXTENSIONS:
+    if path.is_file() and path.suffix.casefold() in AUDIO_EXTENSIONS:
         return [path]
     if path.is_dir():
         return [
             item
             for item in path.rglob("*")
-            if item.is_file() and item.suffix.casefold() in _AUDIO_EXTENSIONS
+            if item.is_file() and item.suffix.casefold() in AUDIO_EXTENSIONS
         ]
     return []
 
@@ -2866,7 +2900,10 @@ def _format_size(value: int | None) -> str:
 def _scraping_config_log_text(config: ScrapingConfig) -> str:
     return (
         "{"
-        f"enabled={config.enabled}, mode={config.mode!r}, "
+        f"enabled={config.enabled}, auto_organize={config.auto_organize!r}, "
+        "directory_monitor_notification_delay_seconds="
+        f"{config.directory_monitor_notification_delay_seconds}, "
+        f"mode={config.mode!r}, "
         f"source_directory={str(config.source_directory) if config.source_directory else None!r}, "
         f"mapped_directory={str(config.mapped_directory) if config.mapped_directory else None!r}, "
         f"scrape_when_missing={config.scrape_when_missing}, "

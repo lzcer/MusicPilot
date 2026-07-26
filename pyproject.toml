@@ -27,6 +27,7 @@ dependencies = [
   "pydantic-settings>=2.3",
   "pyyaml>=6.0",
   "opencc-python-reimplemented>=0.1.7",
+  "watchfiles>=1.0",
 ]
 
 [project.optional-dependencies]

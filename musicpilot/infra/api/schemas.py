@@ -154,6 +154,7 @@ class DownloadTaskResponse(BaseModel):
     save_path: str | None = None
     source: str = ""
     last_error: str | None = None
+    auto_organize_mode: Literal["downloader", "directory"] | None = None
 
 
 class DownloadTaskItemResponse(BaseModel):
@@ -719,6 +720,10 @@ class ProxySettings(BaseModel):
 
 class ScrapingSettings(BaseModel):
     enabled: bool = False
+    auto_organize: Literal["downloader", "directory"] = "downloader"
+    directory_monitor_mode: Literal["native", "polling"] = "native"
+    directory_monitor_poll_interval_seconds: int = Field(default=60, ge=30)
+    directory_monitor_notification_delay_seconds: int = Field(default=10, ge=1)
     mode: Literal["source", "mapped", "copy"] = "mapped"
     source_directory: str = ""
     mapped_directory: str = ""
@@ -751,6 +756,22 @@ class SystemSettingsResponse(BaseModel):
     proxy: ProxySettings = Field(default_factory=ProxySettings)
     scraping: ScrapingSettings = Field(default_factory=ScrapingSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
+
+
+class DirectoryMonitorStatusResponse(BaseModel):
+    state: Literal[
+        "disabled",
+        "probing",
+        "running_native",
+        "running_polling",
+        "failed",
+    ] = "disabled"
+    mode: Literal["native", "polling"] = "native"
+    source_directory: str = ""
+    poll_interval_seconds: int = Field(default=60, ge=30)
+    failed_at: str | None = None
+    message: str = ""
+    detail: str = ""
 
 
 class LogEntryResponse(BaseModel):

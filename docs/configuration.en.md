@@ -154,13 +154,15 @@ If a site or notification channel has not enabled "use system proxy", saving the
 
 ### 2.1.2. Scraping Settings
 
-Scraping completes metadata, lyrics, tags, and target paths after downloads finish or when files are organized manually.
+Scraping completes metadata, lyrics, tags, and target paths after downloads finish, when music is added to the source directory, or when files are organized manually.
 
 | Field | Options | Description |
 | --- | --- | --- |
 | Enable scraping | On / off | When disabled, automatic scraping will not run. |
+| Auto organize | Downloader monitoring, directory monitoring | Downloader monitoring continues organization after a download completes. Directory monitoring ends the download task at completion and lets new music in the source directory trigger organization. Downloader monitoring is the default. |
+| Notification delay | Seconds, default 10, minimum 1 | Shown only for directory monitoring. Each new library addition within the delay resets the timer and is merged into one notification. |
 | Scraping mode | Source file, mapped file, copied file | Controls where processed files come from and where they are written. |
-| Source directory | Directory picker | Source directory used for manual organization. Available directories come from the filesystem visible to the MusicPilot runtime. |
+| Source directory | Directory picker | Source directory used for manual organization and directory monitoring. Available directories come from the filesystem visible to the MusicPilot runtime. |
 | Mapped directory / copied directory | Directory picker | Required when "mapped file" or "copied file" is selected. Available directories come from the filesystem visible to the MusicPilot runtime. |
 | Try scraping when missing | Album, artist, lyrics, cover | Try online completion when these fields are missing. A cover is present only when the audio file contains embedded artwork. |
 | Fail when missing | Album, artist, lyrics, cover | If these fields are still missing, the organization task is treated as failed. Required cover artwork is checked again after tags are written. |
@@ -169,6 +171,20 @@ Scraping completes metadata, lyrics, tags, and target paths after downloads fini
 | Auto classify | On / off | Create classification directories by artist, album, or artist-album. |
 | Classify by | Artist, album, artist-album | Applies when auto classify is enabled; artist-album saves files as `Artist/Album/Track`, using `Artist/Unknown Album/Track` when album metadata is missing. |
 | Duplicate handling | Ignore, always overwrite, keep largest file | Decides what happens when the target file already exists. |
+
+When directory monitoring starts or the source directory changes, MusicPilot builds a baseline and does not organize files that already exist. After each new music file stabilizes, it creates a directory-capture task. That task associates a download item only by its complete relative path; a different path or a non-unique match never falls back to the filename and instead enters the existing manual scrape chain. A unique match reuses the download item's pre-scrape result and continues the original download task chain, which still triggers file organization and media-library refresh. Directory monitoring does not distinguish downloader files from external files and does not batch them. Ordinary modifications do not trigger another organization, while deleting and recreating a path counts as a new file. Mapped and copied modes still monitor the source directory and then write to the configured target directory.
+
+When directory capture enters the manual scrape chain, a successful file organization joins the notification aggregation window only after the media server accepts the refresh request; library refresh requests still run once per file. The window defaults to 10 seconds and resets whenever another file enters the library. When it expires, MusicPilot sends one merged message to enabled Telegram channels with library notifications turned on. Files matched to download tasks keep the existing download-task notification flow and never enter this window, while ordinary manual organization adds no notification. Switching back to downloader monitoring keeps pending notifications, and a normal shutdown sends any remaining batch immediately.
+
+#### 2.1.2.1. Directory Monitoring Mode
+
+When directory monitoring is selected and saved for the first time, Linux first identifies the filesystem that contains the source directory. Known network filesystems such as NFS, CIFS/SMB, and SSHFS cannot guarantee events for files written by other clients, so MusicPilot explains the reason and asks whether polling should be used instead. Other filesystems are verified by creating a non-music probe file in the actual source directory. A failed probe never falls back automatically. Neither native nor polling monitoring is available when the source directory does not exist or cannot be accessed.
+
+Native monitoring relies only on filesystem events and does not run MusicPilot's own periodic full-directory scan. A lightweight health probe runs once per hour. If both attempts within one probe fail, monitoring stops without switching to polling, and one warning is sent through every enabled notification channel. A red exclamation mark appears beside Auto organize in the scraping settings; its dialog can retry native detection, explicitly switch to polling, switch back to downloader monitoring, or cancel.
+
+Polling monitoring uses `watchfiles` to inspect the source directory recursively at the configured interval. The default is 60 seconds and the minimum is 30 seconds; MusicPilot does not add another 60-second snapshot pass. More files and shorter intervals increase CPU, disk, and NAS network I/O. Detecting a new file can take up to one polling interval, followed by the normal file-stability checks. While polling is active, the page shows the interval and a Retry native monitoring action.
+
+Directory monitoring is supported on Windows, Linux, macOS, and common ARM platforms. On Linux, known network filesystems prompt for polling immediately. Docker bind mounts and unrecognized unusual filesystems are still verified by probing the actual source directory. Polling is enabled only after explicit user confirmation.
 
 "Track version control" recognizes regular, Live, Remix, Acoustic, Instrumental, Karaoke, Demo, and featured/collaboration credits:
 
