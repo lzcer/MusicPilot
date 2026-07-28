@@ -1381,6 +1381,52 @@ class SqlAlchemyMediaRepository:
             )
             return row
 
+    async def claim_download_task_hash(
+        self,
+        task_id: int,
+        *,
+        torrent_hash: str,
+        **changes: Any,
+    ) -> tuple[TorrentRecord | None, bool]:
+        async with self.database.session() as session:
+            row = await session.get(TorrentRecord, task_id)
+            if row is None:
+                return None, False
+            result = await session.execute(
+                select(TorrentRecord).where(
+                    TorrentRecord.torrent_hash == torrent_hash,
+                    TorrentRecord.id != task_id,
+                )
+            )
+            existing = result.scalar_one_or_none()
+            if existing is not None:
+                await session.delete(row)
+                await session.commit()
+                return existing, False
+            row.torrent_hash = torrent_hash
+            for key, value in changes.items():
+                setattr(row, key, value)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                result = await session.execute(
+                    select(TorrentRecord).where(
+                        TorrentRecord.torrent_hash == torrent_hash,
+                        TorrentRecord.id != task_id,
+                    )
+                )
+                existing = result.scalar_one_or_none()
+                if existing is None:
+                    raise
+                row = await session.get(TorrentRecord, task_id)
+                if row is not None:
+                    await session.delete(row)
+                    await session.commit()
+                return existing, False
+            await session.refresh(row)
+            return row, True
+
     async def list_download_task_items(self, task_id: int) -> list[TorrentRecordItem]:
         async with self.database.session() as session:
             result = await session.execute(
@@ -2031,7 +2077,9 @@ class SqlAlchemyMediaRepository:
         async with self.database.session() as session:
             completed_mode = TorrentRecord.payload["auto_organize_mode"].as_string()
             active_download_condition = and_(
-                TorrentRecord.status.not_in(("library_refreshed", "interrupted")),
+                TorrentRecord.status.not_in(
+                    ("library_refreshed", "library_refresh_skipped", "interrupted")
+                ),
                 or_(
                     TorrentRecord.status != "completed",
                     completed_mode.is_(None),

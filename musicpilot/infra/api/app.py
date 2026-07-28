@@ -913,6 +913,7 @@ class DownloadRefreshLibraryExecutor:
         task_id = _optional_int(payload.get("torrent_record_id"))
         if task_id is None:
             raise ValueError("Download refresh task payload is incomplete.")
+        task_generation = _optional_string(payload.get("torrent_record_generation"))
         record = await self.state.repository.get_download_task(task_id)
         if record is None:
             return TaskExecutionResult(
@@ -921,16 +922,32 @@ class DownloadRefreshLibraryExecutor:
                     "status": "missing",
                 }
             )
+        if task_generation is None or _download_task_generation(record) != task_generation:
+            return TaskExecutionResult(
+                result={
+                    "torrent_record_id": task_id,
+                    "status": "stale",
+                }
+            )
         await _refresh_library_for_task(
             self.state,
             record,
             use_scrape_task_manager=False,
         )
         latest = await self.state.repository.get_download_task(task_id)
+        latest_status = (
+            "missing"
+            if latest is None
+            else (
+                latest.status
+                if _download_task_generation(latest) == task_generation
+                else "stale"
+            )
+        )
         return TaskExecutionResult(
             result={
                 "torrent_record_id": task_id,
-                "status": latest.status if latest is not None else "missing",
+                "status": latest_status,
             }
         )
 
@@ -944,12 +961,38 @@ class DownloadFinalizeLibraryExecutor:
         task_id = _optional_int(payload.get("torrent_record_id"))
         if task_id is None:
             raise ValueError("Download finalize task payload is incomplete.")
-        await _finalize_download_refresh_if_ready_direct(self.state, task_id)
+        task_generation = _optional_string(payload.get("torrent_record_generation"))
+        record = await self.state.repository.get_download_task(task_id)
+        if (
+            record is None
+            or task_generation is None
+            or _download_task_generation(record) != task_generation
+        ):
+            return TaskExecutionResult(
+                result={
+                    "torrent_record_id": task_id,
+                    "status": "missing" if record is None else "stale",
+                }
+            )
+        await _finalize_download_refresh_if_ready_direct(
+            self.state,
+            task_id,
+            task_generation,
+        )
         latest = await self.state.repository.get_download_task(task_id)
+        latest_status = (
+            "missing"
+            if latest is None
+            else (
+                latest.status
+                if _download_task_generation(latest) == task_generation
+                else "stale"
+            )
+        )
         return TaskExecutionResult(
             result={
                 "torrent_record_id": task_id,
-                "status": latest.status if latest is not None else "missing",
+                "status": latest_status,
             }
         )
 
@@ -1239,8 +1282,8 @@ class AppState:
         self,
         result: SearchResult,
         media: MediaCandidateResponse,
-    ) -> None:
-        await _submit_download_request(
+    ) -> DownloadResponse:
+        return await _submit_download_request(
             self,
             DownloadRequest(
                 title=result.title,
@@ -6113,19 +6156,37 @@ async def _submit_download_request(state: AppState, payload: DownloadRequest) ->
         "submitted_at": datetime.now(UTC),
     }
     if submitted.torrent_hash:
-        task_changes["torrent_hash"] = submitted.torrent_hash
-    task = await state.repository.update_download_task(task.id, **task_changes)
+        task, claimed = await state.repository.claim_download_task_hash(
+            task.id,
+            torrent_hash=submitted.torrent_hash,
+            **task_changes,
+        )
+    else:
+        task = await state.repository.update_download_task(task.id, **task_changes)
+        claimed = True
+    if task is None:
+        raise HTTPException(status_code=409, detail="Download task no longer exists.")
+    if not claimed:
+        state.add_log(
+            "download",
+            f"Download task already exists: task_id={task.id}, title={payload.title}",
+        )
+        return DownloadResponse(
+            status="existing",
+            task_id=task.id,
+            torrent_hash=task.torrent_hash,
+        )
     item_ids = await _record_submitted_torrent_items(
         state,
-        task.id if task else None,
+        task.id,
         submitted.torrent_data,
     )
-    await _schedule_download_task_item_scraping(state, task.id if task else None, item_ids)
+    await _schedule_download_task_item_scraping(state, task.id, item_ids)
     await _send_event_notifications(state, "download", task)
     state.add_log("download", f"Download submitted: {payload.title}")
     return DownloadResponse(
         status="submitted",
-        task_id=task.id if task else None,
+        task_id=task.id,
         torrent_hash=submitted.torrent_hash or None,
     )
 
@@ -6901,6 +6962,15 @@ def _download_item_scrape_idempotency_key(item: TorrentRecordItem) -> str:
         "download-item-scrape:"
         f"{item.torrent_record_id}:{item.id}:{_download_item_generation(item)}:{digest}"
     )
+
+
+def _download_task_generation(task: TorrentRecord) -> str:
+    created_at = task.created_at
+    if not isinstance(created_at, datetime):
+        return "unknown"
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    return created_at.astimezone(UTC).strftime("%Y%m%d%H%M%S%f")
 
 
 def _download_item_generation(item: TorrentRecordItem) -> str:
@@ -10284,7 +10354,8 @@ async def _schedule_download_refresh_library(
     if terminal >= len(source_files):
         await _finalize_download_refresh_if_ready(state, task.id)
         return
-    idempotency_key = f"download-refresh-library:{task.id}"
+    task_generation = _download_task_generation(refresh_task)
+    idempotency_key = f"download-refresh-library:{task.id}:{task_generation}"
     existing = await state.repository.get_system_task_by_idempotency_key(idempotency_key)
     if existing is not None:
         if existing.status in {"WAIT", "RUNNING"}:
@@ -10308,6 +10379,7 @@ async def _schedule_download_refresh_library(
             task_type="DOWNLOAD_REFRESH_LIBRARY",
             payload={
                 "torrent_record_id": task.id,
+                "torrent_record_generation": task_generation,
                 "task_name": refresh_task.name,
             },
             resource_keys=[f"download-refresh:{task.id}"],
@@ -10408,6 +10480,8 @@ async def _refresh_library_for_task(
         return
     server = await state.repository.default_media_server()
     if server is None:
+        if await _finish_download_with_skipped_library_refresh_if_disabled(state, task):
+            return
         failed = await state.repository.update_download_task(
             task.id,
             status="failed",
@@ -10800,9 +10874,30 @@ async def _scraping_library_snapshots(
     return library_tracks, media_history
 
 
+async def _finish_download_with_skipped_library_refresh_if_disabled(
+    state: AppState,
+    task: TorrentRecord,
+) -> bool:
+    servers = await state.repository.list_media_servers()
+    if not servers or any(server.enabled for server in servers):
+        return False
+    skipped = await state.repository.update_download_task(
+        task.id,
+        status="library_refresh_skipped",
+        library_refreshed_at=datetime.now(UTC),
+        last_error=None,
+    )
+    state.add_log(
+        "library",
+        f"Library refresh skipped for {task.name}: media server is disabled.",
+    )
+    await _send_event_notifications(state, "library", skipped or task)
+    return True
+
+
 async def _finalize_download_refresh_if_ready(state: AppState, task_id: int) -> None:
     task = await state.repository.get_download_task(task_id)
-    if task is None or task.status == "library_refreshed":
+    if task is None or task.status in {"library_refreshed", "library_refresh_skipped"}:
         return
     items = await state.repository.list_download_task_items(task_id)
     payload = task.payload if isinstance(task.payload, dict) else {}
@@ -10815,21 +10910,33 @@ async def _finalize_download_refresh_if_ready(state: AppState, task_id: int) -> 
         item.status not in DOWNLOAD_ITEM_ORGANIZE_TERMINAL_STATUSES for item in items
     ):
         return
+    task_generation = _download_task_generation(task)
     await state.task_manager.enqueue(
         TaskCreate(
             task_type="DOWNLOAD_FINALIZE_LIBRARY",
-            payload={"torrent_record_id": task_id},
+            payload={
+                "torrent_record_id": task_id,
+                "torrent_record_generation": task_generation,
+            },
             resource_keys=[f"download-finalize:{task_id}"],
             priority=DOWNLOAD_REFRESH_TASK_PRIORITY,
             max_attempts=3,
-            idempotency_key=f"download-finalize-library:{task_id}",
+            idempotency_key=f"download-finalize-library:{task_id}:{task_generation}",
         )
     )
 
 
-async def _finalize_download_refresh_if_ready_direct(state: AppState, task_id: int) -> None:
+async def _finalize_download_refresh_if_ready_direct(
+    state: AppState,
+    task_id: int,
+    task_generation: str,
+) -> None:
     task = await state.repository.get_download_task(task_id)
-    if task is None or task.status == "library_refreshed":
+    if (
+        task is None
+        or _download_task_generation(task) != task_generation
+        or task.status in {"library_refreshed", "library_refresh_skipped"}
+    ):
         return
     items = await state.repository.list_download_task_items(task_id)
     payload = task.payload if isinstance(task.payload, dict) else {}
@@ -10859,6 +10966,8 @@ async def _finalize_download_refresh_if_ready_direct(state: AppState, task_id: i
         return
     server = await state.repository.default_media_server()
     if server is None:
+        if await _finish_download_with_skipped_library_refresh_if_disabled(state, task):
+            return
         failed = await state.repository.update_download_task(
             task.id,
             status="failed",

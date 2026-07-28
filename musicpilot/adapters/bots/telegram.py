@@ -20,7 +20,7 @@ from aiohttp.hdrs import USER_AGENT
 from aiohttp.http import SERVER_SOFTWARE
 
 from musicpilot.core.events import NotifyEvent, SearchResult
-from musicpilot.infra.api.schemas import MediaCandidateResponse
+from musicpilot.infra.api.schemas import DownloadResponse, MediaCandidateResponse
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ TELEGRAM_NOTIFICATION_MAX_RETRY_DELAY_SECONDS = 30.0
 
 MediaSearch = Callable[[str, str | None], Awaitable[list[MediaCandidateResponse]]]
 TorrentSearch = Callable[[MediaCandidateResponse], Awaitable[list[SearchResult]]]
-DownloadSubmitter = Callable[[SearchResult, MediaCandidateResponse], Awaitable[None]]
+DownloadSubmitter = Callable[[SearchResult, MediaCandidateResponse], Awaitable[DownloadResponse]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -755,7 +755,7 @@ class TelegramBotAdapter:
             reply_markup=None,
         )
         try:
-            await self.submit_download(torrent, session.selected_media)
+            submission = await self.submit_download(torrent, session.selected_media)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Telegram download submission failed")
             session_id = self._session_messages[(session.chat_id, session.message_id)]
@@ -763,8 +763,9 @@ class TelegramBotAdapter:
             await message.answer(f"下载提交失败：{escape(_error_text(exc))}", parse_mode="HTML")
             return
         self._remove_session(session.chat_id, session.message_id)
+        status_text = "下载任务已存在" if submission.status == "existing" else "已提交下载"
         await message.edit_text(
-            f"<b>已提交下载</b>\n{escape(_short(torrent.title, 600))}",
+            f"<b>{status_text}</b>\n{escape(_short(torrent.title, 600))}",
             parse_mode="HTML",
             reply_markup=None,
         )

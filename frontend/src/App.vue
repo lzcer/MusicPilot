@@ -102,6 +102,12 @@ type DownloadTask = {
   auto_organize_mode?: 'downloader' | 'directory' | null
 }
 
+type DownloadResponse = {
+  status: string
+  task_id?: number | null
+  torrent_hash?: string | null
+}
+
 type DownloadTaskItem = {
   id: number
   torrent_record_id: number
@@ -1410,6 +1416,7 @@ const filteredDownloads = computed(() =>
     ? downloads.value.filter(
         (item) =>
           item.state !== 'library_refreshed' &&
+          item.state !== 'library_refresh_skipped' &&
           !(item.state === 'completed' && item.auto_organize_mode === 'directory')
       )
     : downloads.value
@@ -2114,7 +2121,7 @@ async function confirmDownload() {
 }
 
 async function addDownload(result: SearchResult) {
-  await api('/api/downloads', {
+  const response = await api<DownloadResponse>('/api/downloads', {
     method: 'POST',
     body: JSON.stringify({
       ...result,
@@ -2123,7 +2130,7 @@ async function addDownload(result: SearchResult) {
       selected_site_ids: selectedSiteIds.value
     })
   })
-  notify('已发送到默认下载器')
+  notify(response.status === 'existing' ? '下载任务已存在' : '已发送到默认下载器')
   await loadDownloads()
 }
 
@@ -4476,6 +4483,7 @@ function downloadStatusText(status: string) {
     completed: '下载完成',
     refreshing_library: '整理中',
     library_refreshed: '曲库已刷新',
+    library_refresh_skipped: '跳过刷新',
     source_directory_not_found: '目录未找到',
     failed: '失败',
     deleted: '已删除',
@@ -4495,6 +4503,7 @@ function downloadStatusColor(status: string) {
     completed: 'success',
     refreshing_library: 'info',
     library_refreshed: 'success',
+    library_refresh_skipped: 'success',
     source_directory_not_found: 'error',
     failed: 'error',
     deleted: 'error',
