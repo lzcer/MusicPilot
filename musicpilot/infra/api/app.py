@@ -2669,7 +2669,10 @@ def create_app() -> FastAPI:
 
     @app.post("/api/settings/media-servers", response_model=MediaServerResponse, status_code=201)
     async def create_media_server(payload: MediaServerCreateRequest) -> MediaServerResponse:
-        server = await state.repository.upsert_media_server(payload=payload.model_dump())
+        _validate_media_server_address(payload)
+        server = await state.repository.upsert_media_server(
+            payload=_media_server_payload(payload)
+        )
         return _media_server_response(server)
 
     @app.put("/api/settings/media-servers/{server_id}", response_model=MediaServerResponse)
@@ -2677,9 +2680,10 @@ def create_app() -> FastAPI:
         server_id: str,
         payload: MediaServerCreateRequest,
     ) -> MediaServerResponse:
+        _validate_media_server_address(payload)
         server = await state.repository.upsert_media_server(
             server_id=server_id,
-            payload=payload.model_dump(),
+            payload=_media_server_payload(payload),
         )
         return _media_server_response(server)
 
@@ -2691,12 +2695,19 @@ def create_app() -> FastAPI:
 
     @app.post("/api/settings/media-servers/test", response_model=TestResponse)
     async def test_media_server(payload: MediaServerCreateRequest) -> TestResponse:
+        address_error = _media_server_address_error(payload)
+        if address_error is not None:
+            return TestResponse(ok=False, message=address_error)
         password = payload.password
         if not password and payload.id:
             existing = await state.repository.get_media_server(payload.id)
             password = existing.password if existing else ""
         try:
-            client = build_media_server_client(payload.model_copy(update={"password": password}))
+            client = build_media_server_client(
+                payload.model_copy(
+                    update={"base_url": payload.base_url.strip(), "password": password}
+                )
+            )
             await client.ping()
         except Exception as exc:  # noqa: BLE001
             return TestResponse(ok=False, message=f"媒体服务器连接失败：{exc}")
@@ -7721,6 +7732,24 @@ def _media_server_response(item: MediaServerConfig) -> MediaServerResponse:
         is_default=item.is_default,
         enabled=item.enabled,
     )
+
+
+def _validate_media_server_address(payload: MediaServerCreateRequest) -> None:
+    error = _media_server_address_error(payload)
+    if error is not None:
+        raise HTTPException(status_code=422, detail=error)
+
+
+def _media_server_address_error(payload: MediaServerCreateRequest) -> str | None:
+    if payload.enabled and not payload.base_url.strip():
+        return "音乐库地址不能为空。"
+    return None
+
+
+def _media_server_payload(payload: MediaServerCreateRequest) -> dict[str, object]:
+    data = payload.model_dump()
+    data["base_url"] = payload.base_url.strip()
+    return data
 
 
 def _notifier_response(item: NotifierChannel) -> NotifierResponse:

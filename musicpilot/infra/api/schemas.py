@@ -516,7 +516,7 @@ class MediaServerCreateRequest(BaseModel):
     id: str | None = None
     name: str = Field(default="Navidrome", min_length=1, max_length=128)
     type: str = Field(default="navidrome", pattern="^navidrome$")
-    base_url: str = Field(min_length=1)
+    base_url: str = ""
     api_key: str = ""
     username: str = ""
     password: str = ""

@@ -3803,6 +3803,11 @@ async function syncMediaServerUsersToMainConfig(mainServer: MediaServerConfig) {
 }
 
 async function testMediaServer() {
+  const addressError = mediaServerAddressError()
+  if (addressError) {
+    notify(addressError, 'error')
+    return
+  }
   mediaServerTesting.value = true
   try {
     const result = await api<TestResponse>('/api/settings/media-servers/test', {
@@ -3821,24 +3826,40 @@ async function testMediaServer() {
   }
 }
 
+function mediaServerAddressError() {
+  if (mediaServerForm.value.enabled && !trimmedInput(mediaServerForm.value.base_url)) {
+    return '音乐库地址不能为空'
+  }
+  return ''
+}
+
 async function saveMediaServer() {
-  const editing = Boolean(mediaServerForm.value.id)
-  const server = await api<MediaServerConfig>(
-    editing
-      ? `/api/settings/media-servers/${mediaServerForm.value.id}`
-      : '/api/settings/media-servers',
-    {
-      method: editing ? 'PUT' : 'POST',
-      body: JSON.stringify({
-        ...mediaServerForm.value,
-        password: submittedSecret(mediaServerForm.value.password),
-        is_default: true
-      })
-    }
-  )
-  await syncMediaServerUsersToMainConfig(server)
-  await loadMediaServers()
-  notify('音乐库配置已保存')
+  const addressError = mediaServerAddressError()
+  if (addressError) {
+    notify(addressError, 'error')
+    return
+  }
+  try {
+    const editing = Boolean(mediaServerForm.value.id)
+    const server = await api<MediaServerConfig>(
+      editing
+        ? `/api/settings/media-servers/${mediaServerForm.value.id}`
+        : '/api/settings/media-servers',
+      {
+        method: editing ? 'PUT' : 'POST',
+        body: JSON.stringify({
+          ...mediaServerForm.value,
+          password: submittedSecret(mediaServerForm.value.password),
+          is_default: true
+        })
+      }
+    )
+    await syncMediaServerUsersToMainConfig(server)
+    await loadMediaServers()
+    notify('音乐库配置已保存')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '音乐库配置保存失败', 'error')
+  }
 }
 
 async function testMediaServerUser() {
