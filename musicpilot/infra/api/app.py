@@ -103,6 +103,7 @@ from musicpilot.core.task_queue import (
     TaskExecutionResult,
     TaskExecutorRegistry,
     TaskManager,
+    current_task_execution_context,
 )
 from musicpilot.core.track_variants import (
     TrackVariantSignature,
@@ -127,6 +128,8 @@ from musicpilot.infra.api.schemas import (
     DashboardResponse,
     DashboardStorageSummaryResponse,
     DashboardTaskSummaryResponse,
+    DebugLoggingStateResponse,
+    DebugLoggingUpdateRequest,
     DirectoryBreadcrumbResponse,
     DirectoryEntryResponse,
     DirectoryListResponse,
@@ -1035,6 +1038,7 @@ class AppState:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.logs: deque[dict[str, str]] = deque(maxlen=500)
+        self.debug_logging_enabled = False
         self.log_handler = AppLogHandler(self.logs)
         self.event_bus = EventBus()
         self.database = Database(settings.database_url)
@@ -1815,6 +1819,8 @@ class AppState:
     async def run_metadata_source(
         self,
         source: str,
+        title: str,
+        artist: str | None,
         runner: Callable[[], Awaitable[Any]],
     ) -> Any:
         concurrency = await _metadata_concurrency(self)
@@ -1825,15 +1831,84 @@ class AppState:
                 configured = (concurrency, asyncio.Semaphore(concurrency))
                 self._metadata_source_semaphores[source_key] = configured
             semaphore = configured[1]
+        task_context = current_task_execution_context()
+        task_id = task_context.task_id if task_context is not None else "-"
+        task_type = task_context.task_type if task_context is not None else "direct"
+        task_attempt = task_context.attempt if task_context is not None else "-"
+        task_payload = task_context.payload if task_context is not None else {}
+        source_file = str(
+            task_payload.get("source_file")
+            or task_payload.get("file_path")
+            or task_payload.get("source_path")
+            or "-"
+        )
+        query = f"{title} {artist or ''}".strip()
+        log_context = (
+            f"source={source}, task_id={task_id}, task_type={task_type}, "
+            f"attempt={task_attempt}, file={source_file}, query={query!r}"
+        )
+        wait_started_at = time.perf_counter()
         if semaphore.locked():
             self.add_log(
                 "task",
-                f"Metadata source waiting for resources: source={source}",
+                f"Metadata source waiting for resources: {log_context}",
+                "DEBUG",
             )
-        async with semaphore:
-            return await runner()
+        try:
+            await semaphore.acquire()
+        except asyncio.CancelledError:
+            wait_ms = (time.perf_counter() - wait_started_at) * 1000
+            self.add_log(
+                "task",
+                f"Metadata source wait cancelled: {log_context}, wait_ms={wait_ms:.1f}",
+                "DEBUG",
+            )
+            raise
+        wait_ms = (time.perf_counter() - wait_started_at) * 1000
+        held_started_at = time.perf_counter()
+        self.add_log(
+            "task",
+            f"Metadata source acquired: {log_context}, wait_ms={wait_ms:.1f}",
+            "DEBUG",
+        )
+        try:
+            result = await runner()
+        except asyncio.CancelledError:
+            held_ms = (time.perf_counter() - held_started_at) * 1000
+            self.add_log(
+                "task",
+                f"Metadata source completed: {log_context}, wait_ms={wait_ms:.1f}, "
+                f"held_ms={held_ms:.1f}, result=cancelled",
+                "DEBUG",
+            )
+            raise
+        except Exception as exc:
+            held_ms = (time.perf_counter() - held_started_at) * 1000
+            self.add_log(
+                "task",
+                f"Metadata source completed: {log_context}, wait_ms={wait_ms:.1f}, "
+                f"held_ms={held_ms:.1f}, result=error, error={type(exc).__name__}",
+                "DEBUG",
+            )
+            raise
+        else:
+            held_ms = (time.perf_counter() - held_started_at) * 1000
+            result_count = len(result) if isinstance(result, (list, tuple)) else None
+            outcome = "empty" if result_count == 0 else "success"
+            count_detail = f", result_count={result_count}" if result_count is not None else ""
+            self.add_log(
+                "task",
+                f"Metadata source completed: {log_context}, wait_ms={wait_ms:.1f}, "
+                f"held_ms={held_ms:.1f}, result={outcome}{count_detail}",
+                "DEBUG",
+            )
+            return result
+        finally:
+            semaphore.release()
 
     def add_log(self, category: str, message: str, level: str = "INFO") -> None:
+        if level.upper() == "DEBUG" and not self.debug_logging_enabled:
+            return
         self.logs.appendleft(
             {
                 "timestamp": datetime.now(UTC).isoformat(),
@@ -2045,14 +2120,23 @@ def create_app() -> FastAPI:
             waiting_ids,
             error_message="Task interrupted by user.",
         )
-        force_interrupted = await state.repository.interrupt_running_system_tasks(
-            slow_running_ids,
-            error_message="Task force interrupted by user.",
-        )
-        if force_interrupted:
-            await state.task_manager.force_interrupt_system_tasks(
-                [int(task.id) for task in force_interrupted]
-            )
+        if slow_running_ids:
+            await state.task_manager.force_interrupt_system_tasks(slow_running_ids)
+            refreshed = await state.repository.list_system_tasks_by_ids(slow_running_ids)
+            still_running_ids = [
+                int(task.id) for task in refreshed if task.status == "RUNNING"
+            ]
+            if still_running_ids:
+                await state.repository.interrupt_running_system_tasks(
+                    still_running_ids,
+                    error_message="Task force interrupted by user.",
+                )
+            refreshed = await state.repository.list_system_tasks_by_ids(slow_running_ids)
+            force_interrupted = [
+                task for task in refreshed if task.status == "INTERRUPTED"
+            ]
+        else:
+            force_interrupted = []
         interrupted.extend(force_interrupted)
         for task in interrupted:
             await _sync_interrupted_system_task(state, task)
@@ -3378,6 +3462,17 @@ def create_app() -> FastAPI:
     async def logs(limit: int = 200) -> list[LogEntryResponse]:
         limited = max(1, min(limit, 500))
         return [LogEntryResponse(**entry) for entry in list(state.logs)[:limited]]
+
+    @app.get("/api/logs/debug", response_model=DebugLoggingStateResponse)
+    async def debug_logging_state() -> DebugLoggingStateResponse:
+        return DebugLoggingStateResponse(enabled=state.debug_logging_enabled)
+
+    @app.put("/api/logs/debug", response_model=DebugLoggingStateResponse)
+    async def update_debug_logging(
+        payload: DebugLoggingUpdateRequest,
+    ) -> DebugLoggingStateResponse:
+        state.debug_logging_enabled = payload.enabled
+        return DebugLoggingStateResponse(enabled=state.debug_logging_enabled)
 
     @app.get("/api/directories", response_model=DirectoryListResponse)
     async def directories(path: str | None = None) -> DirectoryListResponse:
@@ -9621,11 +9716,27 @@ async def _album_identity_lease_acquirer(
             name=f"musicpilot-album-identity-{digest}",
         )
         try:
-            identity = await ready
+            done, _pending = await asyncio.wait(
+                (ready, lease_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if ready in done:
+                identity = ready.result()
+            else:
+                await lease_task
+                if not ready.done():
+                    raise RuntimeError(
+                        "Album identity lease ended before producing an identity."
+                    )
+                identity = ready.result()
         except BaseException:
             release_event.set()
+            if not lease_task.done():
+                lease_task.cancel()
             with contextlib.suppress(BaseException):
                 await lease_task
+            if not ready.done():
+                ready.cancel()
             raise
 
         released = False

@@ -34,7 +34,11 @@ class MultiSourceMusicProvider:
     def __init__(
         self,
         client: httpx.AsyncClient | None = None,
-        source_gate: Callable[[str, Callable[[], Awaitable[T]]], Awaitable[T]] | None = None,
+        source_gate: Callable[
+            [str, str, str | None, Callable[[], Awaitable[T]]],
+            Awaitable[T],
+        ]
+        | None = None,
     ) -> None:
         self._client = client or httpx.AsyncClient(timeout=20, follow_redirects=True)
         self._owns_client = client is None
@@ -82,6 +86,8 @@ class MultiSourceMusicProvider:
             raise ValueError(f"Unsupported metadata source: {source}")
         return await self._run_with_source_gate(
             source,
+            title,
+            artist,
             lambda: self._metadata_batch_for_resource(
                 source,
                 title=title,
@@ -100,6 +106,8 @@ class MultiSourceMusicProvider:
         for resource in self._next_resource_order():
             batch = await self._run_with_source_gate(
                 resource,
+                title,
+                artist,
                 lambda resource=resource: self._metadata_batch_for_resource(
                     resource,
                     title=title,
@@ -114,11 +122,13 @@ class MultiSourceMusicProvider:
     async def _run_with_source_gate(
         self,
         resource: str,
+        title: str,
+        artist: str | None,
         runner: Callable[[], Awaitable[T]],
     ) -> T:
         if self._source_gate is None:
             return await runner()
-        return await self._source_gate(resource, runner)
+        return await self._source_gate(resource, title, artist, runner)
 
     def _next_resource_order(self) -> tuple[str, ...]:
         start = self._source_rotation % len(_RESOURCE_ORDER)

@@ -601,6 +601,20 @@ type LogEntry = {
   category: string
 }
 
+type DebugLoggingState = {
+  enabled: boolean
+}
+
+const LOG_LEVEL_OPTIONS = ['DEBUG', 'INFO', 'WARNING', 'ERROR'] as const
+type LogLevel = (typeof LOG_LEVEL_OPTIONS)[number]
+const LOG_LEVEL_SEVERITY: Record<string, number> = {
+  DEBUG: 10,
+  INFO: 20,
+  WARNING: 30,
+  ERROR: 40,
+  CRITICAL: 50,
+}
+
 type TestResponse = {
   ok: boolean
   message: string
@@ -667,8 +681,10 @@ const downloadSubmitting = ref(false)
 const logs = ref<LogEntry[]>([])
 const logsLoading = ref(false)
 const logPaused = ref(false)
-const logLevel = ref('ALL')
+const logLevel = ref<LogLevel>('INFO')
 const logQuery = ref('')
+const debugLoggingEnabled = ref(false)
+const debugLoggingLoading = ref(false)
 const musicLibraryQuery = ref('')
 const musicLibraryPage = ref(1)
 const musicLibraryPageSize = ref(20)
@@ -1381,8 +1397,9 @@ const pagedSearchResults = computed(() => {
 
 const filteredLogs = computed(() => {
   const keyword = logQuery.value.trim().toLowerCase()
+  const minimumSeverity = LOG_LEVEL_SEVERITY[logLevel.value]
   return logs.value.filter((entry) => {
-    const levelMatches = logLevel.value === 'ALL' || entry.level === logLevel.value
+    const levelMatches = (LOG_LEVEL_SEVERITY[entry.level] ?? 0) >= minimumSeverity
     const text = `${entry.timestamp} ${entry.category} ${entry.level} ${entry.message}`.toLowerCase()
     return levelMatches && (!keyword || text.includes(keyword))
   })
@@ -2099,6 +2116,7 @@ function switchPage(page: string) {
   }
   if (page === 'logs') {
     void loadLogs()
+    void loadDebugLoggingState()
   }
   if (page === 'artists') {
     void loadArtists()
@@ -3388,13 +3406,38 @@ function openDeletePlaylist(playlist: Playlist) {
   openDeleteDialog({ kind: 'playlist', id: playlist.id, name: playlist.name })
 }
 
-async function loadLogs() {
-  if (logPaused.value) return
+async function loadLogs(force = false) {
+  if (logPaused.value && !force) return
   logsLoading.value = true
   try {
     logs.value = await api<LogEntry[]>('/api/logs?limit=300')
   } finally {
     logsLoading.value = false
+  }
+}
+
+async function loadDebugLoggingState() {
+  const state = await api<DebugLoggingState>('/api/logs/debug')
+  debugLoggingEnabled.value = state.enabled
+}
+
+async function setDebugLoggingEnabled(enabled: boolean | null) {
+  if (enabled === null || debugLoggingLoading.value) return
+  debugLoggingLoading.value = true
+  try {
+    const state = await api<DebugLoggingState>('/api/logs/debug', {
+      method: 'PUT',
+      body: JSON.stringify({ enabled })
+    })
+    debugLoggingEnabled.value = state.enabled
+    if (state.enabled) {
+      logLevel.value = 'DEBUG'
+    }
+    await loadLogs(true)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : 'DEBUG 日志设置失败', 'error')
+  } finally {
+    debugLoggingLoading.value = false
   }
 }
 
@@ -6093,10 +6136,22 @@ onUnmounted(() => {
               <v-card-text class="log-toolbar">
                 <v-select
                   v-model="logLevel"
-                  :items="['ALL', 'INFO', 'WARNING', 'ERROR']"
-                  label="级别"
+                  :items="LOG_LEVEL_OPTIONS"
+                  label="最低级别"
                   hide-details
                   class="log-level"
+                />
+                <v-switch
+                  :model-value="debugLoggingEnabled"
+                  :loading="debugLoggingLoading"
+                  :disabled="debugLoggingLoading"
+                  color="primary"
+                  density="compact"
+                  hide-details
+                  inset
+                  label="记录 DEBUG"
+                  class="log-debug-switch"
+                  @update:model-value="setDebugLoggingEnabled"
                 />
                 <v-text-field
                   v-model="logQuery"

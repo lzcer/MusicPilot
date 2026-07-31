@@ -781,6 +781,14 @@ class LogEntryResponse(BaseModel):
     category: str = "system"
 
 
+class DebugLoggingStateResponse(BaseModel):
+    enabled: bool
+
+
+class DebugLoggingUpdateRequest(BaseModel):
+    enabled: bool
+
+
 class QBittorrentWebhookRequest(BaseModel):
     download_path: str | None = None
 

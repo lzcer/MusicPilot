@@ -61,6 +61,8 @@ MUSIC_LIBRARY_SYNC_RECOVERY_KEY = "music_library_sync_recovery"
 logger = logging.getLogger(__name__)
 SLOW_DB_OPERATION_SECONDS = float(os.getenv("MP_SLOW_DB_OPERATION_SECONDS", "0.5"))
 SLOW_SYSTEM_TASK_SECONDS = int(os.getenv("MP_SLOW_SYSTEM_TASK_SECONDS", "300"))
+SYSTEM_TASK_EXECUTION_MODE_KEY = "_musicpilot_execution_mode"
+SYSTEM_TASK_EXECUTION_MODE_EXCLUSIVE = "exclusive"
 
 
 @dataclass(frozen=True, slots=True)
@@ -686,15 +688,42 @@ class SqlAlchemyMediaRepository:
             await session.refresh(row)
             return row
 
-    async def list_ready_system_tasks(self, *, limit: int = 20) -> list[SystemTask]:
+    async def list_ready_system_tasks(
+        self,
+        *,
+        limit: int = 20,
+        after: tuple[int, datetime, int] | None = None,
+        excluded_task_types: Iterable[str] | None = None,
+    ) -> list[SystemTask]:
         now = datetime.now(UTC)
+        excluded_types = sorted(set(excluded_task_types or ()))
         async with self.database.session() as session:
-            result = await session.execute(
-                select(SystemTask)
-                .where(
-                    SystemTask.status == "WAIT",
-                    SystemTask.available_at <= now,
+            statement = select(SystemTask).where(
+                SystemTask.status == "WAIT",
+                SystemTask.available_at <= now,
+            )
+            if excluded_types:
+                statement = statement.where(
+                    SystemTask.task_type.not_in(excluded_types)
                 )
+            if after is not None:
+                after_priority, after_created_at, after_id = after
+                statement = statement.where(
+                    or_(
+                        SystemTask.priority < after_priority,
+                        and_(
+                            SystemTask.priority == after_priority,
+                            SystemTask.created_at > after_created_at,
+                        ),
+                        and_(
+                            SystemTask.priority == after_priority,
+                            SystemTask.created_at == after_created_at,
+                            SystemTask.id > after_id,
+                        ),
+                    )
+                )
+            result = await session.execute(
+                statement
                 .order_by(SystemTask.priority.desc(), SystemTask.created_at, SystemTask.id)
                 .limit(limit)
             )
@@ -814,6 +843,28 @@ class SqlAlchemyMediaRepository:
             task = await session.get(SystemTask, task_id)
             if task is None or task.status != "WAIT" or _as_utc(task.available_at) > now:
                 return None
+            current_attempt = int(task.attempts or 0)
+            if current_attempt >= int(task.max_attempts or 1):
+                await session.execute(
+                    update(SystemTask)
+                    .where(
+                        SystemTask.id == task.id,
+                        SystemTask.status == "WAIT",
+                        SystemTask.attempts == current_attempt,
+                    )
+                    .execution_options(synchronize_session=False)
+                    .values(
+                        status="FAILED",
+                        error_message="Task has no attempts remaining.",
+                        finished_at=now,
+                        heartbeat_at=now,
+                        lease_until=None,
+                    )
+                )
+                await session.commit()
+                return None
+            expected_attempt = current_attempt + 1
+            holder_id = _task_lease_holder_id(task.id, expected_attempt)
             resource_keys = _unique_strings(task.resource_keys or [])
             if task.inheritable_key and task.inheritable_key not in resource_keys:
                 resource_keys.append(task.inheritable_key)
@@ -847,6 +898,7 @@ class SqlAlchemyMediaRepository:
                         session,
                         resource_key=resource_key,
                         task_id=task.id,
+                        holder_id=holder_id,
                         chain_id=task.chain_id,
                         lease_until=lease_until,
                         now=now,
@@ -855,12 +907,27 @@ class SqlAlchemyMediaRepository:
                         await session.rollback()
                         return None
                     claimed_keys.append(claimed_key)
-                task.status = "RUNNING"
-                task.attempts += 1
-                task.started_at = now
-                task.heartbeat_at = now
-                task.lease_until = lease_until
-                task.error_message = None
+                claim_result = await session.execute(
+                    update(SystemTask)
+                    .where(
+                        SystemTask.id == task.id,
+                        SystemTask.status == "WAIT",
+                        SystemTask.attempts == current_attempt,
+                        SystemTask.available_at <= now,
+                    )
+                    .execution_options(synchronize_session=False)
+                    .values(
+                        status="RUNNING",
+                        attempts=expected_attempt,
+                        started_at=now,
+                        heartbeat_at=now,
+                        lease_until=lease_until,
+                        error_message=None,
+                    )
+                )
+                if claim_result.rowcount != 1:
+                    await session.rollback()
+                    return None
                 await session.commit()
             except IntegrityError:
                 await session.rollback()
@@ -892,6 +959,10 @@ class SqlAlchemyMediaRepository:
         lease_until = now + timedelta(seconds=lease_seconds)
         chain_value = chain_id or uuid4().hex
         claimed_keys: list[str] = []
+        task_payload = dict(payload or {})
+        task_payload[SYSTEM_TASK_EXECUTION_MODE_KEY] = (
+            SYSTEM_TASK_EXECUTION_MODE_EXCLUSIVE
+        )
         async with self.database.session() as session:
             resource_values = _unique_strings(resource_keys or [])
             if inheritable_key and inheritable_key not in resource_values:
@@ -905,7 +976,7 @@ class SqlAlchemyMediaRepository:
                     priority=priority,
                     resource_keys=resource_values,
                     inheritable_key=inheritable_key,
-                    payload=dict(payload or {}),
+                    payload=task_payload,
                     result={},
                     error_message=None,
                     attempts=1,
@@ -918,6 +989,7 @@ class SqlAlchemyMediaRepository:
                 )
                 session.add(row)
                 await session.flush()
+                holder_id = _task_lease_holder_id(row.id, 1)
                 for resource_key in resource_values:
                     if resource_key == inheritable_key:
                         lease = await _get_active_resource_lease(session, resource_key, now)
@@ -940,6 +1012,7 @@ class SqlAlchemyMediaRepository:
                         session,
                         resource_key=resource_key,
                         task_id=row.id,
+                        holder_id=holder_id,
                         chain_id=chain_value,
                         lease_until=lease_until,
                         now=now,
@@ -965,20 +1038,39 @@ class SqlAlchemyMediaRepository:
         self,
         task_id: int,
         *,
+        expected_attempt: int,
         result: dict[str, Any],
         next_tasks: list[dict[str, Any]],
     ) -> SystemTask | None:
         now = datetime.now(UTC)
         async with self.database.session() as session:
             task = await session.get(SystemTask, task_id)
-            if task is None or task.status != "RUNNING":
+            if (
+                task is None
+                or task.status != "RUNNING"
+                or task.attempts != expected_attempt
+            ):
                 return None
-            task.status = "SUCCEEDED"
-            task.result = result
-            task.error_message = None
-            task.finished_at = now
-            task.heartbeat_at = now
-            task.lease_until = None
+            transition = await session.execute(
+                update(SystemTask)
+                .where(
+                    SystemTask.id == task_id,
+                    SystemTask.status == "RUNNING",
+                    SystemTask.attempts == expected_attempt,
+                )
+                .execution_options(synchronize_session=False)
+                .values(
+                    status="SUCCEEDED",
+                    result=result,
+                    error_message=None,
+                    finished_at=now,
+                    heartbeat_at=now,
+                    lease_until=None,
+                )
+            )
+            if transition.rowcount != 1:
+                await session.rollback()
+                return None
             created_next: list[SystemTask] = []
             for payload in next_tasks:
                 next_task = SystemTask(
@@ -1002,7 +1094,8 @@ class SqlAlchemyMediaRepository:
             await session.execute(
                 delete(SystemTaskResourceLease).where(
                     SystemTaskResourceLease.holder_kind == "task",
-                    SystemTaskResourceLease.task_id == task.id,
+                    SystemTaskResourceLease.holder_id
+                    == _task_lease_holder_id(task.id, expected_attempt),
                 )
             )
             await session.flush()
@@ -1023,26 +1116,47 @@ class SqlAlchemyMediaRepository:
         self,
         task_id: int,
         *,
+        expected_attempt: int,
         error_message: str,
         retry_delay_seconds: int = 60,
     ) -> SystemTask | None:
         now = datetime.now(UTC)
         async with self.database.session() as session:
             task = await session.get(SystemTask, task_id)
-            if task is None or task.status != "RUNNING":
+            if (
+                task is None
+                or task.status != "RUNNING"
+                or task.attempts != expected_attempt
+            ):
                 return None
             should_retry = task.attempts < task.max_attempts
-            task.status = "WAIT" if should_retry else "FAILED"
-            task.error_message = error_message
-            task.heartbeat_at = now
-            task.lease_until = None
-            task.finished_at = None if should_retry else now
+            values: dict[str, Any] = {
+                "status": "WAIT" if should_retry else "FAILED",
+                "error_message": error_message,
+                "heartbeat_at": now,
+                "lease_until": None,
+                "finished_at": None if should_retry else now,
+            }
             if should_retry:
-                task.available_at = now + timedelta(seconds=retry_delay_seconds)
+                values["available_at"] = now + timedelta(seconds=retry_delay_seconds)
+            transition = await session.execute(
+                update(SystemTask)
+                .where(
+                    SystemTask.id == task_id,
+                    SystemTask.status == "RUNNING",
+                    SystemTask.attempts == expected_attempt,
+                )
+                .execution_options(synchronize_session=False)
+                .values(**values)
+            )
+            if transition.rowcount != 1:
+                await session.rollback()
+                return None
             await session.execute(
                 delete(SystemTaskResourceLease).where(
                     SystemTaskResourceLease.holder_kind == "task",
-                    SystemTaskResourceLease.task_id == task.id,
+                    SystemTaskResourceLease.holder_id
+                    == _task_lease_holder_id(task.id, expected_attempt),
                 )
             )
             await session.flush()
@@ -1117,6 +1231,7 @@ class SqlAlchemyMediaRepository:
         task_ids: list[int],
         *,
         error_message: str,
+        restore_attempt: bool = False,
     ) -> list[SystemTask]:
         ids = sorted(set(task_ids))
         if not ids:
@@ -1137,6 +1252,8 @@ class SqlAlchemyMediaRepository:
                 task.finished_at = now
                 task.heartbeat_at = now
                 task.lease_until = None
+                if restore_attempt:
+                    task.attempts = max(int(task.attempts or 0) - 1, 0)
             await session.execute(
                 delete(SystemTaskResourceLease).where(
                     or_(
@@ -1154,22 +1271,45 @@ class SqlAlchemyMediaRepository:
         self,
         task_id: int,
         *,
+        expected_attempt: int,
         lease_seconds: int,
     ) -> bool:
         now = datetime.now(UTC)
         lease_until = now + timedelta(seconds=lease_seconds)
         async with self.database.session() as session:
             task = await session.get(SystemTask, task_id)
-            if task is None or task.status != "RUNNING":
+            if (
+                task is None
+                or task.status != "RUNNING"
+                or task.attempts != expected_attempt
+            ):
                 return False
-            task.heartbeat_at = now
-            task.lease_until = lease_until
+            transition = await session.execute(
+                update(SystemTask)
+                .where(
+                    SystemTask.id == task_id,
+                    SystemTask.status == "RUNNING",
+                    SystemTask.attempts == expected_attempt,
+                )
+                .execution_options(synchronize_session=False)
+                .values(heartbeat_at=now, lease_until=lease_until)
+            )
+            if transition.rowcount != 1:
+                await session.rollback()
+                return False
             await session.execute(
                 update(SystemTaskResourceLease)
                 .where(
                     or_(
-                        SystemTaskResourceLease.task_id == task.id,
-                        SystemTaskResourceLease.chain_id == task.chain_id,
+                        and_(
+                            SystemTaskResourceLease.holder_kind == "task",
+                            SystemTaskResourceLease.holder_id
+                            == _task_lease_holder_id(task.id, expected_attempt),
+                        ),
+                        and_(
+                            SystemTaskResourceLease.holder_kind == "chain",
+                            SystemTaskResourceLease.chain_id == task.chain_id,
+                        ),
                     )
                 )
                 .values(lease_until=lease_until)
@@ -1181,33 +1321,65 @@ class SqlAlchemyMediaRepository:
         self,
         task_id: int,
         *,
+        expected_attempt: int,
         error_message: str,
+        restore_attempt: bool = False,
     ) -> SystemTask | None:
         now = datetime.now(UTC)
         async with self.database.session() as session:
             task = await session.get(SystemTask, task_id)
-            if task is None:
+            if (
+                task is None
+                or task.status != "RUNNING"
+                or task.attempts != expected_attempt
+            ):
                 return None
-            task.status = "WAIT"
-            task.error_message = error_message
-            task.available_at = now
-            task.heartbeat_at = now
-            task.lease_until = None
+            values: dict[str, Any] = {
+                "status": "WAIT",
+                "error_message": error_message,
+                "available_at": now,
+                "heartbeat_at": now,
+                "lease_until": None,
+            }
+            if restore_attempt:
+                values["attempts"] = max(expected_attempt - 1, 0)
+            transition = await session.execute(
+                update(SystemTask)
+                .where(
+                    SystemTask.id == task_id,
+                    SystemTask.status == "RUNNING",
+                    SystemTask.attempts == expected_attempt,
+                )
+                .execution_options(synchronize_session=False)
+                .values(**values)
+            )
+            if transition.rowcount != 1:
+                await session.rollback()
+                return None
             await session.execute(
                 delete(SystemTaskResourceLease).where(
                     SystemTaskResourceLease.holder_kind == "task",
-                    SystemTaskResourceLease.task_id == task.id,
+                    SystemTaskResourceLease.holder_id
+                    == _task_lease_holder_id(task.id, expected_attempt),
                 )
             )
             await session.commit()
             await session.refresh(task)
             return task
 
-    async def recover_stale_system_tasks(self, *, recover_all_running: bool = False) -> int:
+    async def recover_stale_system_tasks(
+        self,
+        *,
+        recover_all_running: bool = False,
+        excluded_task_ids: Iterable[int] | None = None,
+    ) -> int:
         now = datetime.now(UTC)
         recovered = 0
+        excluded_ids = sorted(set(excluded_task_ids or ()))
         async with self.database.session() as session:
             filters = [SystemTask.status == "RUNNING"]
+            if excluded_ids:
+                filters.append(SystemTask.id.not_in(excluded_ids))
             if not recover_all_running:
                 filters.extend(
                     [
@@ -1219,23 +1391,94 @@ class SqlAlchemyMediaRepository:
                 select(SystemTask).where(*filters)
             )
             for task in result.scalars().all():
-                task.status = "WAIT"
-                task.lease_until = None
-                task.heartbeat_at = now
-                task.error_message = (
-                    "Task restored after scheduler restart."
-                    if recover_all_running
-                    else "Task lease expired; restored to WAIT."
+                expected_attempt = int(task.attempts or 0)
+                payload = task.payload if isinstance(task.payload, dict) else {}
+                exclusive = (
+                    payload.get(SYSTEM_TASK_EXECUTION_MODE_KEY)
+                    == SYSTEM_TASK_EXECUTION_MODE_EXCLUSIVE
                 )
+                restore_attempt = recover_all_running or exclusive
+                max_attempts = max(int(task.max_attempts or 1), 1)
+                restored_attempt = min(
+                    max(expected_attempt - 1, 0),
+                    max_attempts - 1,
+                )
+                exhausted = (
+                    not restore_attempt
+                    and expected_attempt >= max_attempts
+                )
+                transition_filters = [
+                    SystemTask.id == task.id,
+                    SystemTask.status == "RUNNING",
+                    SystemTask.attempts == expected_attempt,
+                ]
+                if not recover_all_running:
+                    transition_filters.extend(
+                        [
+                            SystemTask.lease_until.isnot(None),
+                            SystemTask.lease_until <= now,
+                        ]
+                    )
+                transition = await session.execute(
+                    update(SystemTask)
+                    .where(*transition_filters)
+                    .execution_options(synchronize_session=False)
+                    .values(
+                        status=(
+                            "INTERRUPTED"
+                            if exclusive
+                            else ("FAILED" if exhausted else "WAIT")
+                        ),
+                        attempts=restored_attempt if restore_attempt else expected_attempt,
+                        lease_until=None,
+                        heartbeat_at=now,
+                        finished_at=now if exhausted or exclusive else None,
+                        error_message=(
+                            "Exclusive task interrupted after its execution owner was lost."
+                            if exclusive
+                            else (
+                                "Task lease expired with no attempts remaining."
+                                if exhausted
+                                else (
+                                    "Task restored after scheduler restart."
+                                    if recover_all_running
+                                    else "Task lease expired; restored to WAIT."
+                                )
+                            )
+                        ),
+                    )
+                )
+                if transition.rowcount != 1:
+                    continue
+                if not recover_all_running:
+                    await session.execute(
+                        delete(SystemTaskResourceLease).where(
+                            SystemTaskResourceLease.holder_kind == "task",
+                            SystemTaskResourceLease.holder_id.in_(
+                                (
+                                    _task_lease_holder_id(task.id, expected_attempt),
+                                    str(task.id),
+                                )
+                            ),
+                        )
+                    )
+                if exhausted or exclusive:
+                    await session.flush()
+                    active = await _system_task_chain_has_active_tasks(
+                        session,
+                        task.chain_id,
+                        task.id,
+                    )
+                    if not active:
+                        await session.execute(
+                            delete(SystemTaskResourceLease).where(
+                                SystemTaskResourceLease.holder_kind == "chain",
+                                SystemTaskResourceLease.chain_id == task.chain_id,
+                            )
+                        )
                 recovered += 1
             if recover_all_running:
                 await session.execute(delete(SystemTaskResourceLease))
-            else:
-                await session.execute(
-                    delete(SystemTaskResourceLease).where(
-                        SystemTaskResourceLease.lease_until <= now
-                    )
-                )
             await session.commit()
         return recovered
 
@@ -2978,6 +3221,7 @@ async def _claim_task_resource_lease(
     *,
     resource_key: str,
     task_id: int,
+    holder_id: str,
     chain_id: str,
     lease_until: datetime,
     now: datetime,
@@ -2987,18 +3231,27 @@ async def _claim_task_resource_lease(
         lease = await _get_active_resource_lease(session, candidate_key, now)
         if lease is not None:
             continue
-        session.add(
-            SystemTaskResourceLease(
-                resource_key=candidate_key,
-                holder_kind="task",
-                holder_id=str(task_id),
-                task_id=task_id,
-                chain_id=chain_id,
-                lease_until=lease_until,
-            )
-        )
+        try:
+            async with session.begin_nested():
+                session.add(
+                    SystemTaskResourceLease(
+                        resource_key=candidate_key,
+                        holder_kind="task",
+                        holder_id=holder_id,
+                        task_id=task_id,
+                        chain_id=chain_id,
+                        lease_until=lease_until,
+                    )
+                )
+                await session.flush()
+        except IntegrityError:
+            continue
         return candidate_key
     return None
+
+
+def _task_lease_holder_id(task_id: int, attempt: int) -> str:
+    return f"task:{task_id}:attempt:{attempt}"
 
 
 def _as_utc(value: datetime) -> datetime:

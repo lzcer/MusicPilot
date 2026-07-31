@@ -551,10 +551,14 @@ body {
 
 .log-toolbar {
   display: grid;
-  grid-template-columns: 150px minmax(260px, 1fr) auto auto;
+  grid-template-columns: 150px auto minmax(260px, 1fr) auto auto;
   gap: 12px;
   align-items: center;
   border-bottom: 1px solid #e5eaf2;
+}
+
+.log-debug-switch {
+  min-width: 136px;
 }
 
 .log-list {
