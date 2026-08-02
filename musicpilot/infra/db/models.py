@@ -226,6 +226,31 @@ class Playlist(TimestampMixin, Base):
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
+class PlaylistLibrarySyncBinding(TimestampMixin, Base):
+    __tablename__ = "playlist_library_sync_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "playlist_id",
+            "media_server_id",
+            name="uq_playlist_library_sync_binding_playlist_server",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    playlist_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("playlists.id", ondelete="CASCADE"),
+        index=True,
+    )
+    media_server_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("media_servers.id", ondelete="CASCADE"),
+        index=True,
+    )
+    public: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_synced_existing_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class PlaylistTrack(TimestampMixin, Base):
     __tablename__ = "playlist_tracks"
 

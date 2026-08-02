@@ -522,10 +522,18 @@ type PlaylistLibrarySyncResponse = {
   mode?: string
 }
 
+type PlaylistLibrarySyncBinding = {
+  playlist_id: number
+  media_server_id: string
+  public: boolean
+  last_synced_existing_count: number
+}
+
 type PlaylistLibrarySyncForm = {
   playlist: Playlist | null
   media_server_id: string
   public: boolean
+  auto_sync: boolean
 }
 
 type PageResponse<T> = {
@@ -831,10 +839,12 @@ const downloadItemsLoading = ref(false)
 const playlistDownloading = ref(false)
 const playlistLibrarySyncDialog = ref(false)
 const playlistLibrarySyncingIds = ref<number[]>([])
+const playlistLibrarySyncBindings = ref<PlaylistLibrarySyncBinding[]>([])
 const playlistLibrarySyncForm = ref<PlaylistLibrarySyncForm>({
   playlist: null,
   media_server_id: '',
-  public: true
+  public: false,
+  auto_sync: false
 })
 const playlistTrackEditForm = ref({
   id: 0,
@@ -3251,14 +3261,35 @@ async function openPlaylistLibrarySyncDialog(playlist: Playlist) {
   if (!mediaServers.value.length) {
     await loadMediaServers()
   }
+  try {
+    playlistLibrarySyncBindings.value = await api<PlaylistLibrarySyncBinding[]>(
+      `/api/playlists/${playlist.id}/library-sync-bindings`
+    )
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '自动同步配置加载失败', 'error')
+    return
+  }
   const defaultServer = mediaServers.value.find((item) => item.enabled && item.is_default && item.id)
   const firstEnabled = mediaServers.value.find((item) => item.enabled && item.id)
+  const mediaServerId = defaultServer?.id || firstEnabled?.id || ''
+  const binding = playlistLibrarySyncBindings.value.find(
+    (item) => item.media_server_id === mediaServerId
+  )
   playlistLibrarySyncForm.value = {
     playlist,
-    media_server_id: defaultServer?.id || firstEnabled?.id || '',
-    public: true
+    media_server_id: mediaServerId,
+    public: binding?.public ?? false,
+    auto_sync: Boolean(binding)
   }
   playlistLibrarySyncDialog.value = true
+}
+
+function applyPlaylistLibrarySyncBinding(mediaServerId: string) {
+  const binding = playlistLibrarySyncBindings.value.find(
+    (item) => item.media_server_id === mediaServerId
+  )
+  playlistLibrarySyncForm.value.public = binding?.public ?? false
+  playlistLibrarySyncForm.value.auto_sync = Boolean(binding)
 }
 
 async function syncPlaylistToLibrary() {
@@ -3277,7 +3308,8 @@ async function syncPlaylistToLibrary() {
         method: 'POST',
         body: JSON.stringify({
           media_server_id: playlistLibrarySyncForm.value.media_server_id,
-          public: playlistLibrarySyncForm.value.public
+          public: playlistLibrarySyncForm.value.public,
+          auto_sync: playlistLibrarySyncForm.value.auto_sync
         })
       }
     )
@@ -7283,6 +7315,7 @@ onUnmounted(() => {
             item-value="value"
             label="同步账号"
             no-data-text="暂无已启用的音乐库账号"
+            @update:model-value="applyPlaylistLibrarySyncBinding"
           />
           <v-switch
             v-model="playlistLibrarySyncForm.public"
@@ -7291,6 +7324,14 @@ onUnmounted(() => {
             hide-details
             inset
             label="公开"
+          />
+          <v-switch
+            v-model="playlistLibrarySyncForm.auto_sync"
+            color="primary"
+            density="compact"
+            hide-details
+            inset
+            label="自动同步"
           />
         </v-card-text>
         <v-card-actions>

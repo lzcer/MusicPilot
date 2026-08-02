@@ -161,8 +161,6 @@ class NavidromeMediaServerClient:
         song_ids: list[str],
         public: bool = False,
     ) -> MediaServerPlaylistSyncResult:
-        if not song_ids:
-            raise ValueError("song_ids must not be empty.")
         async with httpx.AsyncClient(base_url=self.base_url, timeout=30) as client:
             existing_playlist_id = await self._find_playlist_id(client, name)
             mode = "updated" if existing_playlist_id else "created"

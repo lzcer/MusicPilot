@@ -29,6 +29,7 @@ from musicpilot.infra.db.models import (
     MusicPlatformConnection,
     NotifierChannel,
     Playlist,
+    PlaylistLibrarySyncBinding,
     PlaylistTrack,
     Subscription,
     SystemSetting,
@@ -1913,6 +1914,108 @@ class SqlAlchemyMediaRepository:
             )
             return playlist
 
+    async def list_playlist_library_sync_bindings(
+        self,
+        playlist_id: int,
+    ) -> list[PlaylistLibrarySyncBinding]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(PlaylistLibrarySyncBinding)
+                .where(PlaylistLibrarySyncBinding.playlist_id == playlist_id)
+                .order_by(PlaylistLibrarySyncBinding.media_server_id)
+            )
+            return list(result.scalars().all())
+
+    async def list_enabled_playlist_library_sync_bindings(
+        self,
+        playlist_id: int,
+    ) -> list[PlaylistLibrarySyncBinding]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(PlaylistLibrarySyncBinding)
+                .join(
+                    MediaServerConfig,
+                    MediaServerConfig.id == PlaylistLibrarySyncBinding.media_server_id,
+                )
+                .where(
+                    PlaylistLibrarySyncBinding.playlist_id == playlist_id,
+                    MediaServerConfig.enabled.is_(True),
+                )
+                .order_by(PlaylistLibrarySyncBinding.media_server_id)
+            )
+            return list(result.scalars().all())
+
+    async def get_playlist_library_sync_binding(
+        self,
+        playlist_id: int,
+        media_server_id: str,
+    ) -> PlaylistLibrarySyncBinding | None:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(PlaylistLibrarySyncBinding).where(
+                    PlaylistLibrarySyncBinding.playlist_id == playlist_id,
+                    PlaylistLibrarySyncBinding.media_server_id == media_server_id,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def upsert_playlist_library_sync_binding(
+        self,
+        *,
+        playlist_id: int,
+        media_server_id: str,
+        public: bool,
+        last_synced_existing_count: int,
+    ) -> PlaylistLibrarySyncBinding:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(PlaylistLibrarySyncBinding).where(
+                    PlaylistLibrarySyncBinding.playlist_id == playlist_id,
+                    PlaylistLibrarySyncBinding.media_server_id == media_server_id,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                row = PlaylistLibrarySyncBinding(
+                    playlist_id=playlist_id,
+                    media_server_id=media_server_id,
+                )
+                session.add(row)
+            row.public = public
+            row.last_synced_existing_count = last_synced_existing_count
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def update_playlist_library_sync_binding_count(
+        self,
+        binding_id: int,
+        last_synced_existing_count: int,
+    ) -> PlaylistLibrarySyncBinding | None:
+        async with self.database.session() as session:
+            row = await session.get(PlaylistLibrarySyncBinding, binding_id)
+            if row is None:
+                return None
+            row.last_synced_existing_count = last_synced_existing_count
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def delete_playlist_library_sync_binding(
+        self,
+        playlist_id: int,
+        media_server_id: str,
+    ) -> bool:
+        async with self.database.session() as session:
+            result = await session.execute(
+                delete(PlaylistLibrarySyncBinding).where(
+                    PlaylistLibrarySyncBinding.playlist_id == playlist_id,
+                    PlaylistLibrarySyncBinding.media_server_id == media_server_id,
+                )
+            )
+            await session.commit()
+            return bool(result.rowcount)
+
     async def delete_playlist(self, playlist_id: int) -> bool:
         async with self.database.session() as session:
             row = await session.get(Playlist, playlist_id)
@@ -2247,7 +2350,7 @@ class SqlAlchemyMediaRepository:
             "failed_count": 0,
         }
         for track in tracks:
-            if track.exists_in_library or track.download_status == "existing":
+            if track.exists_in_library:
                 counts["existing_count"] += 1
             if track.download_status == "queue":
                 counts["waiting_count"] += 1
@@ -2535,6 +2638,22 @@ class SqlAlchemyMediaRepository:
             )
             await session.commit()
             return int(result.rowcount or 0)
+
+    async def list_playlist_ids_by_matched_library_tracks(
+        self,
+        track_ids: Iterable[int],
+    ) -> tuple[int, ...]:
+        ids = tuple(dict.fromkeys(track_ids))
+        if not ids:
+            return ()
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(PlaylistTrack.playlist_id)
+                .where(PlaylistTrack.matched_library_track_id.in_(ids))
+                .distinct()
+                .order_by(PlaylistTrack.playlist_id)
+            )
+            return tuple(int(playlist_id) for playlist_id in result.scalars().all())
 
     async def list_music_library_tracks_page(
         self,

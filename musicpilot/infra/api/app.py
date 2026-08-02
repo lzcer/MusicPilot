@@ -193,6 +193,7 @@ from musicpilot.infra.api.schemas import (
     PlaylistImportUrlPreviewRequest,
     PlaylistImportUrlPreviewResponse,
     PlaylistImportUrlRequest,
+    PlaylistLibrarySyncBindingResponse,
     PlaylistLibrarySyncRequest,
     PlaylistLibrarySyncResponse,
     PlaylistResponse,
@@ -1114,6 +1115,8 @@ class AppState:
         self.artist_build_finished_at: datetime | None = None
         self.artist_build_last_error: str | None = None
         self.music_library_sync_lock = asyncio.Lock()
+        self.playlist_library_sync_locks: dict[tuple[int, str], asyncio.Lock] = {}
+        self.pending_playlist_library_sync_bindings: set[tuple[int, str]] = set()
         self.library_storage_lock = asyncio.Lock()
         self.audio_detail_cache = AudioDetailCache(
             max_entries=_AUDIO_DETAIL_CACHE_MAX_ENTRIES,
@@ -3301,6 +3304,7 @@ def create_app() -> FastAPI:
         )
         if updated is None:
             raise HTTPException(status_code=404, detail="Playlist track not found.")
+        await _trigger_playlist_library_auto_sync(state, playlist_id)
         return _playlist_track_response(updated)
 
     @app.delete("/api/playlists/{playlist_id}", status_code=204)
@@ -3364,13 +3368,56 @@ def create_app() -> FastAPI:
         playlist = await state.repository.get_playlist(playlist_id)
         if playlist is None:
             raise HTTPException(status_code=404, detail="Playlist not found.")
+        request = payload or PlaylistLibrarySyncRequest()
         try:
-            library_playlist_id, synced_count, mode = await _sync_playlist_to_media_server(
-                state,
-                playlist,
-                media_server_id=payload.media_server_id if payload else None,
-                public=payload.public if payload else True,
-            )
+            server = await _playlist_sync_media_server(state, request.media_server_id)
+            async with _playlist_library_sync_lock(state, playlist.id, server.id):
+                current_binding = (
+                    await state.repository.get_playlist_library_sync_binding(
+                        playlist.id,
+                        server.id,
+                    )
+                )
+                pending_binding_key = (playlist.id, server.id)
+                is_first_auto_sync = request.auto_sync and current_binding is None
+                if is_first_auto_sync:
+                    state.pending_playlist_library_sync_bindings.add(pending_binding_key)
+                try:
+                    library_playlist_id, synced_count, mode = (
+                        await _sync_playlist_to_media_server(
+                            state,
+                            playlist,
+                            media_server_id=server.id,
+                            public=request.public,
+                        )
+                    )
+                    if request.auto_sync:
+                        counts = await state.repository.playlist_track_counts(playlist.id)
+                        if counts["existing_count"] != synced_count:
+                            library_playlist_id, synced_count, mode = (
+                                await _sync_playlist_to_media_server(
+                                    state,
+                                    playlist,
+                                    media_server_id=server.id,
+                                    public=request.public,
+                                )
+                            )
+                        await state.repository.upsert_playlist_library_sync_binding(
+                            playlist_id=playlist.id,
+                            media_server_id=server.id,
+                            public=request.public,
+                            last_synced_existing_count=synced_count,
+                        )
+                    else:
+                        await state.repository.delete_playlist_library_sync_binding(
+                            playlist.id,
+                            server.id,
+                        )
+                finally:
+                    if is_first_auto_sync:
+                        state.pending_playlist_library_sync_bindings.discard(
+                            pending_binding_key
+                        )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
@@ -3382,6 +3429,27 @@ def create_app() -> FastAPI:
             synced_count=synced_count,
             mode=mode,
         )
+
+    @app.get(
+        "/api/playlists/{playlist_id}/library-sync-bindings",
+        response_model=list[PlaylistLibrarySyncBindingResponse],
+    )
+    async def playlist_library_sync_bindings(
+        playlist_id: int,
+    ) -> list[PlaylistLibrarySyncBindingResponse]:
+        playlist = await state.repository.get_playlist(playlist_id)
+        if playlist is None:
+            raise HTTPException(status_code=404, detail="Playlist not found.")
+        bindings = await state.repository.list_playlist_library_sync_bindings(playlist_id)
+        return [
+            PlaylistLibrarySyncBindingResponse(
+                playlist_id=item.playlist_id,
+                media_server_id=item.media_server_id,
+                public=item.public,
+                last_synced_existing_count=item.last_synced_existing_count,
+            )
+            for item in bindings
+        ]
 
     @app.post("/api/playlists/{playlist_id}/download", response_model=PlaylistDownloadResponse)
     async def download_playlist(playlist_id: int) -> PlaylistDownloadResponse:
@@ -4623,6 +4691,13 @@ async def _refresh_playlist_library_matches(
             track_version_control=track_version_control,
         )
         updated += int(refreshed is not None)
+    affected_playlist_ids = (
+        {playlist_id}
+        if playlist_id is not None
+        else {track.playlist_id for track in playlist_tracks}
+    )
+    for affected_playlist_id in affected_playlist_ids:
+        await _trigger_playlist_library_auto_sync(state, affected_playlist_id)
     return updated
 
 
@@ -4684,6 +4759,8 @@ async def _refresh_playlist_matches_for_library_changes(
             track_version_control=track_version_control,
         )
         updated += int(refreshed is not None)
+    for playlist_id in {track.playlist_id for track in affected_tracks.values()}:
+        await _trigger_playlist_library_auto_sync(state, playlist_id)
     return updated
 
 
@@ -5184,6 +5261,7 @@ async def _check_and_download_playlist_track(
             "Playlist track exists in library: "
             f"track={_playlist_track_log_text(track)}, library_id={match.id}",
         )
+        await _trigger_playlist_library_auto_sync(state, track.playlist_id)
         return "existing"
 
     active_item = await _match_active_download_task_item(state, track.title, track.artist)
@@ -5728,6 +5806,9 @@ async def _bind_playlist_track_to_task(
     *,
     last_error: str | None,
 ) -> None:
+    track = await state.repository.get_playlist_track(track_id)
+    if track is None:
+        return
     await state.repository.update_playlist_track(
         track_id,
         exists_in_library=False,
@@ -5738,6 +5819,8 @@ async def _bind_playlist_track_to_task(
         last_download_attempt_at=datetime.now(UTC),
         last_error=last_error,
     )
+    if track.exists_in_library:
+        await _trigger_playlist_library_auto_sync(state, track.playlist_id)
 
 
 async def _sync_interrupted_system_task(state: AppState, task: SystemTask) -> None:
@@ -8781,13 +8864,10 @@ def _media_server_track_payload(track: MediaServerTrack) -> dict[str, Any]:
     }
 
 
-async def _sync_playlist_to_media_server(
+async def _playlist_sync_media_server(
     state: AppState,
-    playlist: Playlist,
-    *,
-    media_server_id: str | None = None,
-    public: bool = True,
-) -> tuple[str | None, int, str]:
+    media_server_id: str | None,
+) -> MediaServerConfig:
     server = (
         await state.repository.get_media_server(media_server_id)
         if media_server_id
@@ -8799,14 +8879,23 @@ async def _sync_playlist_to_media_server(
         raise ValueError("请先配置并启用默认媒体服务器。")
     if not server.enabled:
         raise ValueError("请选择已启用的媒体服务器用户。")
+    return server
+
+
+async def _sync_playlist_to_media_server(
+    state: AppState,
+    playlist: Playlist,
+    *,
+    media_server_id: str | None = None,
+    public: bool = False,
+) -> tuple[str | None, int, str]:
+    server = await _playlist_sync_media_server(state, media_server_id)
     matched_tracks = await state.repository.list_matched_playlist_library_tracks(playlist.id)
     song_ids = [
         library_track.navidrome_id
         for _, library_track in matched_tracks
         if library_track.navidrome_id
     ]
-    if not song_ids:
-        raise ValueError("该歌单没有已匹配到音乐库的歌曲。")
     client = build_media_server_client(server)
     result = await client.sync_playlist(name=playlist.name, song_ids=song_ids, public=public)
     state.add_log(
@@ -8818,6 +8907,95 @@ async def _sync_playlist_to_media_server(
         f"mode={result.mode}, tracks={result.synced_count}",
     )
     return result.playlist_id, result.synced_count, result.mode
+
+
+def _playlist_library_sync_lock(
+    state: AppState,
+    playlist_id: int,
+    media_server_id: str,
+) -> asyncio.Lock:
+    key = (playlist_id, media_server_id)
+    lock = state.playlist_library_sync_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        state.playlist_library_sync_locks[key] = lock
+    return lock
+
+
+async def _trigger_playlist_library_auto_sync(state: AppState, playlist_id: int) -> None:
+    try:
+        bindings = await state.repository.list_enabled_playlist_library_sync_bindings(
+            playlist_id
+        )
+        media_server_ids = {binding.media_server_id for binding in bindings}
+        media_server_ids.update(
+            media_server_id
+            for pending_playlist_id, media_server_id in (
+                state.pending_playlist_library_sync_bindings
+            )
+            if pending_playlist_id == playlist_id
+        )
+        if not media_server_ids:
+            return
+        await asyncio.gather(
+            *(
+                _sync_playlist_library_binding_if_changed(
+                    state,
+                    playlist_id=playlist_id,
+                    media_server_id=media_server_id,
+                )
+                for media_server_id in media_server_ids
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        state.add_log(
+            "playlist",
+            "Automatic playlist library sync check failed: "
+            f"playlist_id={playlist_id}, error={exc}",
+            "ERROR",
+        )
+
+
+async def _sync_playlist_library_binding_if_changed(
+    state: AppState,
+    *,
+    playlist_id: int,
+    media_server_id: str,
+) -> None:
+    try:
+        async with _playlist_library_sync_lock(state, playlist_id, media_server_id):
+            binding = await state.repository.get_playlist_library_sync_binding(
+                playlist_id,
+                media_server_id,
+            )
+            if binding is None:
+                return
+            server = await state.repository.get_media_server(media_server_id)
+            if server is None or not server.enabled:
+                return
+            counts = await state.repository.playlist_track_counts(playlist_id)
+            if binding.last_synced_existing_count == counts["existing_count"]:
+                return
+            playlist = await state.repository.get_playlist(playlist_id)
+            if playlist is None:
+                return
+            _library_playlist_id, synced_count, _mode = await _sync_playlist_to_media_server(
+                state,
+                playlist,
+                media_server_id=media_server_id,
+                public=binding.public,
+            )
+            await state.repository.update_playlist_library_sync_binding_count(
+                binding.id,
+                synced_count,
+            )
+    except Exception as exc:  # noqa: BLE001
+        state.add_log(
+            "playlist",
+            "Automatic playlist library sync failed: "
+            f"playlist_id={playlist_id}, media_server_id={media_server_id}, error={exc}",
+            "ERROR",
+        )
 
 
 async def _delete_task_torrent(
@@ -9031,7 +9209,13 @@ async def _delete_music_library_tracks_for_media(
                 )
     if not matched:
         return
-    deleted = await state.repository.delete_music_library_tracks(track.id for track in matched)
+    matched_track_ids = tuple(track.id for track in matched)
+    affected_playlist_ids = await state.repository.list_playlist_ids_by_matched_library_tracks(
+        matched_track_ids
+    )
+    deleted = await state.repository.delete_music_library_tracks(matched_track_ids)
+    for playlist_id in affected_playlist_ids:
+        await _refresh_playlist_library_matches(state, playlist_id)
     state.add_log(
         "library",
         f"Removed music library track(s): "

@@ -700,7 +700,15 @@ class PlaylistTrackDownloadResponse(BaseModel):
 
 class PlaylistLibrarySyncRequest(BaseModel):
     media_server_id: str | None = None
-    public: bool = True
+    public: bool = False
+    auto_sync: bool = False
+
+
+class PlaylistLibrarySyncBindingResponse(BaseModel):
+    playlist_id: int
+    media_server_id: str
+    public: bool = False
+    last_synced_existing_count: int
 
 
 class PlaylistLibrarySyncResponse(BaseModel):
