@@ -380,16 +380,31 @@ class TelegramBotAdapter:
                 parts[1],
             )
 
-        self._dispatcher.message.register(handle_downloading, Command("downloading"))
-        self._dispatcher.message.register(handle_info, Command("info"))
-        self._dispatcher.message.register(handle_playlist, Command("playlist"))
+        authorized_chat = F.chat.id.in_(self.chat_ids)
+        authorized_callback_chat = F.message.chat.id.in_(self.chat_ids)
+        self._dispatcher.message.register(
+            handle_downloading,
+            Command("downloading"),
+            authorized_chat,
+        )
+        self._dispatcher.message.register(handle_info, Command("info"), authorized_chat)
+        self._dispatcher.message.register(handle_playlist, Command("playlist"), authorized_chat)
         self._dispatcher.message.register(
             handle_musicservice_refresh,
             Command("musicservice_refresh"),
+            authorized_chat,
         )
-        self._dispatcher.message.register(handle_playlist_sync, Command("playlist_sync"))
-        self._dispatcher.callback_query.register(handle_callback, F.data.startswith("tg:"))
-        self._dispatcher.message.register(handle_text, F.text)
+        self._dispatcher.message.register(
+            handle_playlist_sync,
+            Command("playlist_sync"),
+            authorized_chat,
+        )
+        self._dispatcher.callback_query.register(
+            handle_callback,
+            F.data.startswith("tg:"),
+            authorized_callback_chat,
+        )
+        self._dispatcher.message.register(handle_text, F.text, authorized_chat)
         self._task = asyncio.create_task(
             self._run_polling(),
             name="musicpilot-telegram-bot",
