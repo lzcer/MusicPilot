@@ -285,6 +285,22 @@ class _CandidateScore:
         return self.base.total + self.variant + self.collaboration
 
 
+IdentityReferenceKind = Literal["source", "inferred", "contextual"]
+
+
+@dataclass(frozen=True, slots=True)
+class _IdentityReference:
+    kind: IdentityReferenceKind
+    metadata: TrackMetadata
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedIdentity:
+    reference: _IdentityReference
+    candidate: TrackMetadata
+    score: _CandidateScore
+
+
 class LocalMusicScraper:
     def __init__(
         self,
@@ -622,11 +638,16 @@ class LocalMusicScraper:
         )
         fallback_metadata = _path_only_metadata_for_matching(source_file, raw_dir_meta)
         metadata = _merge_metadata(source_metadata, match_metadata)
+        identity_references: tuple[_IdentityReference, ...]
+        search_reference: TrackMetadata
         if contextual_metadata is not None:
             metadata = _merge_metadata(metadata, contextual_metadata.metadata)
             match_metadata = _merge_metadata(match_metadata, contextual_metadata.metadata)
             fallback_metadata = contextual_metadata.metadata
-            verification_reference = contextual_metadata.metadata
+            search_reference = contextual_metadata.metadata
+            identity_references = (
+                _IdentityReference("contextual", contextual_metadata.metadata),
+            )
             requires_identity_verification = contextual_metadata.verify_identity
         else:
             requires_identity_verification = _metadata_requires_identity_verification(
@@ -636,7 +657,11 @@ class LocalMusicScraper:
                 source_file,
                 raw_dir_meta,
             )
-            verification_reference = _identity_verification_reference(metadata)
+            identity_references = _identity_verification_references(
+                source_metadata,
+                fallback_metadata,
+            )
+            search_reference = _identity_verification_reference(metadata)
         scrape_fields = _metadata_fields_union(
             config.scrape_when_missing,
             config.required_metadata,
@@ -646,59 +671,35 @@ class LocalMusicScraper:
         if not needs_scrape and not requires_identity_verification:
             return None
         if requires_identity_verification:
-            verified = await _select_identity_candidate(
-                verification_reference,
+            selected = await self._select_verified_identity(
+                identity_references,
                 cached_candidates,
-                artist_service=self.artist_service,
                 track_version_control=config.track_version_control,
                 reference_file=source_file,
-            )
-            enriching = (
-                await _select_identity_candidate(
-                    verification_reference,
-                    cached_candidates,
-                    artist_service=self.artist_service,
-                    track_version_control=config.track_version_control,
-                    reference_file=source_file,
-                    required=config.required_metadata,
-                    trigger_fields=trigger_fields,
-                    require_trigger_gain=True,
-                )
-                if needs_scrape
-                else verified
+                required=config.required_metadata if needs_scrape else (),
+                trigger_fields=trigger_fields,
+                require_trigger_gain=needs_scrape,
             )
             candidates = cached_candidates
-            if verified is None or (needs_scrape and enriching is None):
-                candidates = _merge_metadata_candidates(
+            if selected is None:
+                selected, candidates = await self._verify_metadata_identities(
+                    search_reference,
+                    identity_references,
                     candidates,
-                    await self._search_metadata_candidates(
-                        verification_reference,
-                        verification_reference,
-                        (),
-                    ),
+                    source_file=source_file,
+                    track_version_control=config.track_version_control,
+                    required=config.required_metadata if needs_scrape else (),
+                    trigger_fields=trigger_fields,
+                    require_trigger_gain=needs_scrape,
                 )
-                verified = await _select_identity_candidate(
-                    verification_reference,
+            if selected is None and needs_scrape:
+                selected = await self._select_verified_identity(
+                    identity_references,
                     candidates,
-                    artist_service=self.artist_service,
                     track_version_control=config.track_version_control,
                     reference_file=source_file,
                 )
-                enriching = (
-                    await _select_identity_candidate(
-                        verification_reference,
-                        candidates,
-                        artist_service=self.artist_service,
-                        track_version_control=config.track_version_control,
-                        reference_file=source_file,
-                        required=config.required_metadata,
-                        trigger_fields=trigger_fields,
-                        require_trigger_gain=True,
-                    )
-                    if needs_scrape
-                    else verified
-                )
-            return source_file, candidates, enriching or verified
+            return source_file, candidates, selected.candidate if selected is not None else None
         looked_up = await _select_metadata_candidate(
             match_metadata,
             cached_candidates,
@@ -785,6 +786,7 @@ class LocalMusicScraper:
         missing_before = _missing_metadata_fields(source_metadata, scrape_fields)
         needs_scrape = bool(missing_before)
         metadata = _merge_metadata(source_metadata, match_metadata)
+        duplicate_source_metadata = source_metadata
         candidate_count = 0
         candidate_reference = match_metadata
         candidate_stage = "metadata_candidate"
@@ -813,12 +815,18 @@ class LocalMusicScraper:
             )
 
         requires_identity_verification = False
-        verification_reference = match_metadata
+        search_reference = match_metadata
+        identity_references: tuple[_IdentityReference, ...] = (
+            _IdentityReference("source", match_metadata),
+        )
         if forced_metadata is None and contextual_metadata is not None:
             metadata = _merge_metadata(metadata, contextual_metadata.metadata)
             match_metadata = _merge_metadata(match_metadata, contextual_metadata.metadata)
             fallback_metadata = contextual_metadata.metadata
-            verification_reference = contextual_metadata.metadata
+            search_reference = contextual_metadata.metadata
+            identity_references = (
+                _IdentityReference("contextual", contextual_metadata.metadata),
+            )
             requires_identity_verification = contextual_metadata.verify_identity
         elif forced_metadata is None:
             requires_identity_verification = _metadata_requires_identity_verification(
@@ -828,14 +836,18 @@ class LocalMusicScraper:
                 source_file,
                 raw_dir_meta,
             )
-            verification_reference = _identity_verification_reference(metadata)
+            identity_references = _identity_verification_references(
+                source_metadata,
+                fallback_metadata,
+            )
+            search_reference = _identity_verification_reference(metadata)
         input_variant_signature = _metadata_variant_signature(
             match_metadata,
             source_file=source_file,
         )
         logger.info(
             "Scraping file input: source=%s, source_metadata=%s, dir_inferred=%s, "
-            "match_metadata=%s, fallback_metadata=%s, scrape_fields=%s, "
+            "match_metadata=%s, fallback_metadata=%s, search_reference=%s, scrape_fields=%s, "
             "missing_before=%s, cached_candidates=%s, forced_metadata=%s, "
             "contextual_metadata=%s, verify_identity=%s, version=%s, version_evidence=%s",
             source_file,
@@ -843,6 +855,7 @@ class LocalMusicScraper:
             _metadata_log_text(dir_meta),
             _metadata_log_text(match_metadata),
             _metadata_log_text(fallback_metadata),
+            _metadata_log_text(search_reference),
             scrape_fields,
             missing_before,
             _metadata_candidates_log_text(cached_candidates),
@@ -888,31 +901,37 @@ class LocalMusicScraper:
         elif requires_identity_verification:
             if metadata_lookup_completed:
                 candidates = cached_candidates
-                verified = await _select_identity_candidate(
-                    verification_reference,
+                verified = await self._select_verified_identity(
+                    identity_references,
                     candidates,
-                    artist_service=self.artist_service,
                     track_version_control=config.track_version_control,
                     reference_file=source_file,
+                    required=config.required_metadata if needs_scrape else (),
+                    trigger_fields=missing_before,
+                    require_trigger_gain=needs_scrape,
                 )
             else:
-                _online_verified, online_candidates = await self._verify_metadata_identity(
-                    verification_reference,
+                verified, candidates = await self._verify_metadata_identities(
+                    search_reference,
+                    identity_references,
+                    cached_candidates,
                     source_file=source_file,
                     track_version_control=config.track_version_control,
+                    required=config.required_metadata if needs_scrape else (),
+                    trigger_fields=missing_before,
+                    require_trigger_gain=needs_scrape,
                 )
-                candidates = _merge_metadata_candidates(cached_candidates, online_candidates)
-                verified = await _select_identity_candidate(
-                    verification_reference,
+            if verified is None and needs_scrape:
+                verified = await self._select_verified_identity(
+                    identity_references,
                     candidates,
-                    artist_service=self.artist_service,
                     track_version_control=config.track_version_control,
                     reference_file=source_file,
                 )
             candidate_count = len(candidates)
             if verified is None:
-                error_message = await _identity_verification_failure_message(
-                    verification_reference,
+                error_message = await _identity_references_failure_message(
+                    identity_references,
                     candidates,
                     artist_service=self.artist_service,
                     track_version_control=config.track_version_control,
@@ -920,9 +939,9 @@ class LocalMusicScraper:
                 )
                 logger.info(
                     "Scraping file result: source=%s, status=failed, "
-                    "stage=identity_verification, metadata=%s, error=%s",
+                    "stage=identity_verification, references=%s, error=%s",
                     source_file,
-                    _metadata_log_text(verification_reference),
+                    _identity_references_log_text(identity_references),
                     error_message,
                 )
                 return (
@@ -942,6 +961,25 @@ class LocalMusicScraper:
                     0,
                     0,
                 )
+            verification_reference = verified.reference.metadata
+            if verified.reference.kind != "contextual":
+                metadata = _merge_missing_metadata(
+                    verification_reference,
+                    verified.candidate,
+                )
+                match_metadata = verification_reference
+                should_write_tags = verified.reference.kind == "inferred"
+                if should_write_tags:
+                    duplicate_source_metadata = verification_reference
+            logger.info(
+                "Scraping identity verification result: source=%s, reference=%s, "
+                "reference_metadata=%s, selected=%s, score=%s",
+                source_file,
+                verified.reference.kind,
+                _metadata_log_text(verification_reference),
+                _metadata_log_text(verified.candidate),
+                verified.score.ranking_total,
+            )
             if needs_scrape:
                 adopted = await _select_identity_candidate(
                     verification_reference,
@@ -958,7 +996,7 @@ class LocalMusicScraper:
                     "trigger_fields=%s, verified=%s, adopted=%s, trigger_gain=%s",
                     source_file,
                     missing_before,
-                    _metadata_log_text(verified),
+                    _metadata_log_text(verified.candidate),
                     _metadata_log_text(adopted),
                     _candidate_trigger_gain(adopted, missing_before) if adopted else (),
                 )
@@ -1269,7 +1307,11 @@ class LocalMusicScraper:
             )
 
         duplicate_match = await _find_duplicate_media(
-            _duplicate_metadata_candidates(source_metadata, match_metadata, metadata),
+            _duplicate_metadata_candidates(
+                duplicate_source_metadata,
+                match_metadata,
+                metadata,
+            ),
             (*library_tracks, *media_history),
             artist_service=self.artist_service,
             track_version_control=config.track_version_control,
@@ -1591,22 +1633,81 @@ class LocalMusicScraper:
             reference_file=reference_file,
         )
 
-    async def _verify_metadata_identity(
+    async def _select_verified_identity(
         self,
-        reference: TrackMetadata,
+        references: tuple[_IdentityReference, ...],
+        candidates: tuple[TrackMetadata, ...],
+        *,
+        reference_file: Path | None = None,
+        track_version_control: bool = False,
+        required: tuple[RequiredMetadata, ...] = (),
+        trigger_fields: tuple[RequiredMetadata, ...] = (),
+        require_trigger_gain: bool = False,
+    ) -> _VerifiedIdentity | None:
+        selected: _VerifiedIdentity | None = None
+        selected_key: tuple[int, int, int, int, int, int] | None = None
+        for priority, reference in enumerate(references):
+            candidate = await _select_identity_candidate(
+                reference.metadata,
+                candidates,
+                artist_service=self.artist_service,
+                track_version_control=track_version_control,
+                reference_file=reference_file,
+                required=required,
+                trigger_fields=trigger_fields,
+                require_trigger_gain=require_trigger_gain,
+            )
+            if candidate is None:
+                continue
+            score = await _candidate_match_score(
+                reference.metadata,
+                candidate,
+                artist_service=self.artist_service,
+                reference_file=reference_file,
+            )
+            key = (
+                score.ranking_total,
+                score.base.total,
+                score.base.title,
+                score.base.artist,
+                score.base.album,
+                -priority,
+            )
+            if selected_key is None or key > selected_key:
+                selected = _VerifiedIdentity(reference, candidate, score)
+                selected_key = key
+        return selected
+
+    async def _verify_metadata_identities(
+        self,
+        search_reference: TrackMetadata,
+        references: tuple[_IdentityReference, ...],
+        cached_candidates: tuple[TrackMetadata, ...],
         *,
         source_file: Path | None = None,
         track_version_control: bool = False,
-    ) -> tuple[TrackMetadata | None, tuple[TrackMetadata, ...]]:
-        candidates = await self._search_metadata_candidates(reference, reference, ())
-        verified = await _select_identity_candidate(
-            reference,
-            candidates,
-            artist_service=self.artist_service,
-            track_version_control=track_version_control,
-            reference_file=source_file,
+        required: tuple[RequiredMetadata, ...] = (),
+        trigger_fields: tuple[RequiredMetadata, ...] = (),
+        require_trigger_gain: bool = False,
+    ) -> tuple[_VerifiedIdentity | None, tuple[TrackMetadata, ...]]:
+        candidates = _merge_metadata_candidates(
+            cached_candidates,
+            await self._search_metadata_candidates(
+                search_reference,
+                search_reference,
+                (),
+            ),
         )
-        return verified, candidates
+        selected = await self._select_verified_identity(
+            references,
+            candidates,
+            reference_file=source_file,
+            track_version_control=track_version_control,
+            required=required,
+            trigger_fields=trigger_fields,
+            require_trigger_gain=require_trigger_gain,
+        )
+        return selected, candidates
 
     async def _search_metadata_candidates(
         self,
@@ -3106,6 +3207,25 @@ def _identity_verification_reference(metadata: TrackMetadata) -> TrackMetadata:
     )
 
 
+def _identity_verification_references(
+    source_metadata: TrackMetadata,
+    inferred_metadata: TrackMetadata,
+) -> tuple[_IdentityReference, ...]:
+    references = [_IdentityReference("source", source_metadata)]
+    if not _same_metadata_match_key(source_metadata, inferred_metadata):
+        references.append(_IdentityReference("inferred", inferred_metadata))
+    return tuple(references)
+
+
+def _identity_references_log_text(
+    references: tuple[_IdentityReference, ...],
+) -> str:
+    return "[" + ", ".join(
+        f"{reference.kind}={_metadata_log_text(reference.metadata)}"
+        for reference in references
+    ) + "]"
+
+
 def _title_looks_noisy(title: str | None) -> bool:
     if not title:
         return False
@@ -3395,11 +3515,45 @@ async def _identity_verification_failure_message(
         reference_file=reference_file,
     )
     return (
-        "本地推断元数据未通过联网校验。"
+        "本地元数据未通过联网校验。"
         f"title={metadata.title!r}, artist={metadata.artist!r}, "
         f"album={metadata.album!r}, candidates={len(candidates)}"
         f"{score_text}{diagnostics_text}"
     )
+
+
+async def _identity_references_failure_message(
+    references: tuple[_IdentityReference, ...],
+    candidates: tuple[TrackMetadata, ...],
+    *,
+    artist_service: ArtistService | None = None,
+    track_version_control: bool = False,
+    reference_file: Path | None = None,
+) -> str:
+    if len(references) == 1:
+        return await _identity_verification_failure_message(
+            references[0].metadata,
+            candidates,
+            artist_service=artist_service,
+            track_version_control=track_version_control,
+            reference_file=reference_file,
+        )
+    labels = {
+        "source": "源文件数据",
+        "inferred": "目录推断",
+        "contextual": "上下文推断",
+    }
+    details: list[str] = []
+    for reference in references:
+        detail = await _identity_verification_failure_message(
+            reference.metadata,
+            candidates,
+            artist_service=artist_service,
+            track_version_control=track_version_control,
+            reference_file=reference_file,
+        )
+        details.append(f"{labels[reference.kind]}：{detail}")
+    return "源文件数据与目录推断均未通过联网校验。" + "；".join(details)
 
 
 async def _version_control_failure_text(
