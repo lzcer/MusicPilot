@@ -3642,6 +3642,11 @@ def create_app() -> FastAPI:
                 failures.append(FileBulkDeleteFailure(path=item_path, message=str(exc)))
                 continue
             deleted_paths.append(item_path)
+        if payload.root_type == "mapped" and deleted_paths:
+            await _refresh_music_library_after_change(
+                state,
+                f"mapped file deletion, paths={len(deleted_paths)}",
+            )
         return FileBulkDeleteResponse(
             deleted_paths=deleted_paths,
             not_found_paths=not_found_paths,
