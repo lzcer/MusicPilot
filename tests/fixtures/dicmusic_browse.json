@@ -1,0 +1,674 @@
+{
+ "status": "success",
+ "response": {
+  "currentPage": 1,
+  "pages": 2692,
+  "results": [
+   {
+    "groupId": 150028,
+    "groupName": "&#26053;&#34892;&#32773; (The Traveller)",
+    "artist": "旅行者 (The Traveller)",
+    "cover": "https://s41.ax1x.com/2026/08/06/pm73GQI.jpg",
+    "tags": [
+     "chinese",
+     "folk",
+     "mandarin",
+     "2010s"
+    ],
+    "bookmarked": false,
+    "vanityHouse": false,
+    "groupYear": 2010,
+    "releaseType": "专辑",
+    "groupTime": "1786028597",
+    "maxSize": 390531072,
+    "totalSnatched": 0,
+    "totalSeeders": 1,
+    "totalLeechers": 1,
+    "torrents": [
+     {
+      "torrentId": 205583,
+      "editionId": 1,
+      "artists": [
+       {
+        "id": 58288,
+        "name": "旅行者 (The Traveller)",
+        "aliasid": 61941
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2010,
+      "remasterCatalogueNumber": "",
+      "remasterTitle": "",
+      "media": "CD",
+      "encoding": "Lossless",
+      "format": "FLAC",
+      "hasLog": true,
+      "logScore": 100,
+      "hasCue": true,
+      "scene": false,
+      "jinzhuan": true,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 13,
+      "time": "2026-08-06 23:03:17",
+      "size": 390531072,
+      "snatches": 0,
+      "seeders": 1,
+      "leechers": 1,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     }
+    ]
+   },
+   {
+    "groupId": 4404,
+    "groupName": "&#39340;&#12392;&#40575;",
+    "artist": "Kenshi Yonezu (米津玄師)",
+    "cover": "https://y.gtimg.cn/music/photo_new/T002R300x300M000000V3BzA0cbMuK_1.jpg?max_age=2592000",
+    "tags": [
+     "pop",
+     "japanese",
+     "jpop",
+     "2010s"
+    ],
+    "bookmarked": false,
+    "vanityHouse": false,
+    "groupYear": 2019,
+    "releaseType": "单曲专辑",
+    "groupTime": "1786012609",
+    "maxSize": 194172617,
+    "totalSnatched": 33,
+    "totalSeeders": 17,
+    "totalLeechers": 1,
+    "torrents": [
+     {
+      "torrentId": 5054,
+      "editionId": 1,
+      "artists": [
+       {
+        "id": 3720,
+        "name": "Kenshi Yonezu (米津玄師)",
+        "aliasid": 4391
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2019,
+      "remasterCatalogueNumber": "SECL-2497",
+      "remasterTitle": "",
+      "media": "CD",
+      "encoding": "Lossless",
+      "format": "FLAC",
+      "hasLog": true,
+      "logScore": 100,
+      "hasCue": true,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 7,
+      "time": "2019-11-02 21:03:22",
+      "size": 73635700,
+      "snatches": 33,
+      "seeders": 16,
+      "leechers": 0,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     },
+     {
+      "torrentId": 205566,
+      "editionId": 2,
+      "artists": [
+       {
+        "id": 3720,
+        "name": "Kenshi Yonezu (米津玄師)",
+        "aliasid": 4391
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2019,
+      "remasterCatalogueNumber": "",
+      "remasterTitle": "",
+      "media": "WEB",
+      "encoding": "24bit Lossless",
+      "format": "FLAC",
+      "hasLog": false,
+      "logScore": 100,
+      "hasCue": false,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 3,
+      "time": "2026-08-06 18:36:49",
+      "size": 194172617,
+      "snatches": 0,
+      "seeders": 1,
+      "leechers": 1,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     }
+    ]
+   },
+   {
+    "groupId": 15998,
+    "groupName": "&#12497;&#12503;&#12522;&#12459;",
+    "artist": "Kenshi Yonezu (米津玄師)",
+    "cover": "https://dicimg.kshare.club/1226/20200406/110904.jpg",
+    "tags": [
+     "pop"
+    ],
+    "bookmarked": false,
+    "vanityHouse": false,
+    "groupYear": 2020,
+    "releaseType": "单曲专辑",
+    "groupTime": "1786011729",
+    "maxSize": 45702690,
+    "totalSnatched": 10,
+    "totalSeeders": 6,
+    "totalLeechers": 0,
+    "torrents": [
+     {
+      "torrentId": 18412,
+      "editionId": 1,
+      "artists": [
+       {
+        "id": 3720,
+        "name": "Kenshi Yonezu (米津玄師)",
+        "aliasid": 4391
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2020,
+      "remasterCatalogueNumber": "",
+      "remasterTitle": "",
+      "media": "WEB",
+      "encoding": "Lossless",
+      "format": "FLAC",
+      "hasLog": false,
+      "logScore": 100,
+      "hasCue": false,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 2,
+      "time": "2020-04-06 11:22:06",
+      "size": 26633622,
+      "snatches": 10,
+      "seeders": 5,
+      "leechers": 0,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     },
+     {
+      "torrentId": 205564,
+      "editionId": 2,
+      "artists": [
+       {
+        "id": 3720,
+        "name": "Kenshi Yonezu (米津玄師)",
+        "aliasid": 4391
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2020,
+      "remasterCatalogueNumber": "",
+      "remasterTitle": "Apple Digital Master",
+      "media": "WEB",
+      "encoding": "24bit Lossless",
+      "format": "FLAC",
+      "hasLog": false,
+      "logScore": 100,
+      "hasCue": false,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 2,
+      "time": "2026-08-06 18:22:09",
+      "size": 45702690,
+      "snatches": 0,
+      "seeders": 1,
+      "leechers": 0,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     }
+    ]
+   },
+   {
+    "groupId": 61282,
+    "groupName": "UNBELIEVERS (&#12450;&#12531;&#12499;&#12522;&#12540;&#12496;&#12540;&#12474;)",
+    "artist": "Kenshi Yonezu (米津玄師)",
+    "cover": "https://img2.kshare.club/dic/user/4430/20220618/62aca7e92180d.jpg",
+    "tags": [
+     "jpop",
+     "2010s"
+    ],
+    "bookmarked": false,
+    "vanityHouse": false,
+    "groupYear": 2015,
+    "releaseType": "单曲专辑",
+    "groupTime": "1786007435",
+    "maxSize": 97139398,
+    "totalSnatched": 16,
+    "totalSeeders": 9,
+    "totalLeechers": 0,
+    "torrents": [
+     {
+      "torrentId": 205561,
+      "editionId": 1,
+      "artists": [
+       {
+        "id": 3720,
+        "name": "Kenshi Yonezu (米津玄師)",
+        "aliasid": 4391
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2015,
+      "remasterCatalogueNumber": "",
+      "remasterTitle": "",
+      "media": "WEB",
+      "encoding": "Lossless",
+      "format": "FLAC",
+      "hasLog": false,
+      "logScore": 100,
+      "hasCue": false,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 4,
+      "time": "2026-08-06 17:10:35",
+      "size": 97139398,
+      "snatches": 0,
+      "seeders": 1,
+      "leechers": 0,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     },
+     {
+      "torrentId": 80250,
+      "editionId": 2,
+      "artists": [
+       {
+        "id": 3720,
+        "name": "Kenshi Yonezu (米津玄師)",
+        "aliasid": 4391
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2015,
+      "remasterCatalogueNumber": "UMCK-5582",
+      "remasterTitle": "",
+      "media": "CD",
+      "encoding": "Lossless",
+      "format": "FLAC",
+      "hasLog": true,
+      "logScore": 100,
+      "hasCue": true,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 6,
+      "time": "2022-06-18 00:11:38",
+      "size": 96068577,
+      "snatches": 16,
+      "seeders": 8,
+      "leechers": 0,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     }
+    ]
+   },
+   {
+    "groupId": 143148,
+    "groupName": "fly away / way out (&#39131;&#12406;&#26178; / &#39131;&#12412;&#12358;&#12424;)",
+    "artist": "Vaundy & yama (ヤマ)",
+    "cover": "https://ptpimg.me/010o5z.jpg",
+    "tags": [
+     "rock",
+     "japanese",
+     "jpop",
+     "2020s",
+     "anime"
+    ],
+    "bookmarked": false,
+    "vanityHouse": false,
+    "groupYear": 2026,
+    "releaseType": "单曲专辑",
+    "groupTime": "1785960616",
+    "maxSize": 723892998,
+    "totalSnatched": 5,
+    "totalSeeders": 6,
+    "totalLeechers": 2,
+    "torrents": [
+     {
+      "torrentId": 195106,
+      "editionId": 1,
+      "artists": [
+       {
+        "id": 43271,
+        "name": "Vaundy",
+        "aliasid": 45822
+       },
+       {
+        "id": 79082,
+        "name": "yama (ヤマ)",
+        "aliasid": 127073
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2026,
+      "remasterCatalogueNumber": "VVXX02034B00Z",
+      "remasterTitle": "",
+      "media": "WEB",
+      "encoding": "24bit Lossless",
+      "format": "FLAC",
+      "hasLog": false,
+      "logScore": 100,
+      "hasCue": false,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 3,
+      "time": "2026-04-19 00:22:00",
+      "size": 118934230,
+      "snatches": 2,
+      "seeders": 2,
+      "leechers": 1,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     },
+     {
+      "torrentId": 195107,
+      "editionId": 2,
+      "artists": [
+       {
+        "id": 43271,
+        "name": "Vaundy",
+        "aliasid": 45822
+       },
+       {
+        "id": 79082,
+        "name": "yama (ヤマ)",
+        "aliasid": 127073
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2026,
+      "remasterCatalogueNumber": "VVXX02035B00Z",
+      "remasterTitle": "",
+      "media": "WEB",
+      "encoding": "24bit Lossless",
+      "format": "FLAC",
+      "hasLog": false,
+      "logScore": 100,
+      "hasCue": false,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 3,
+      "time": "2026-04-19 00:23:35",
+      "size": 119502125,
+      "snatches": 2,
+      "seeders": 2,
+      "leechers": 1,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     },
+     {
+      "torrentId": 205541,
+      "editionId": 3,
+      "artists": [
+       {
+        "id": 43271,
+        "name": "Vaundy",
+        "aliasid": 45822
+       },
+       {
+        "id": 79082,
+        "name": "yama (ヤマ)",
+        "aliasid": 127073
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2026,
+      "remasterCatalogueNumber": "VVCV-19",
+      "remasterTitle": "&#23436;&#20840;&#29983;&#29987;&#38480;&#23450;&#30436;",
+      "media": "CD",
+      "encoding": "Lossless",
+      "format": "FLAC",
+      "hasLog": true,
+      "logScore": 100,
+      "hasCue": true,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 16,
+      "time": "2026-08-06 04:10:16",
+      "size": 723892998,
+      "snatches": 1,
+      "seeders": 2,
+      "leechers": 0,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     }
+    ]
+   },
+   {
+    "groupId": 150027,
+    "groupName": "Four Hand Piano Music, Vol. 17",
+    "artist": "Johannes Brahms (勃拉姆斯) performed by Christian Köhn & Silke-Thora Matthies",
+    "cover": "https://ptpimg.me/2m6ibu.jpg",
+    "tags": [
+     "classical",
+     "piano",
+     "four.hand"
+    ],
+    "bookmarked": false,
+    "vanityHouse": false,
+    "groupYear": 2006,
+    "releaseType": "专辑",
+    "groupTime": "1786028141",
+    "maxSize": 204039329,
+    "totalSnatched": 0,
+    "totalSeeders": 1,
+    "totalLeechers": 1,
+    "torrents": [
+     {
+      "torrentId": 205582,
+      "editionId": 1,
+      "artists": [
+       {
+        "id": 258717,
+        "name": "Christian Köhn",
+        "aliasid": 269290
+       },
+       {
+        "id": 258718,
+        "name": "Silke-Thora Matthies",
+        "aliasid": 269291
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2006,
+      "remasterCatalogueNumber": "8.555849",
+      "remasterTitle": "",
+      "media": "CD",
+      "encoding": "Lossless",
+      "format": "FLAC",
+      "hasLog": true,
+      "logScore": 100,
+      "hasCue": true,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 6,
+      "time": "2026-08-06 22:55:41",
+      "size": 204039329,
+      "snatches": 0,
+      "seeders": 1,
+      "leechers": 1,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     }
+    ]
+   },
+   {
+    "groupId": 150026,
+    "groupName": "The Gadsby Project",
+    "artist": "Red Mountain Church",
+    "cover": "https://ptpimg.me/6rpy9b.jpg",
+    "tags": [
+     "rock",
+     "folk",
+     "indie",
+     "hymns"
+    ],
+    "bookmarked": false,
+    "vanityHouse": false,
+    "groupYear": 2005,
+    "releaseType": "专辑",
+    "groupTime": "1786028141",
+    "maxSize": 362171648,
+    "totalSnatched": 0,
+    "totalSeeders": 1,
+    "totalLeechers": 1,
+    "torrents": [
+     {
+      "torrentId": 205581,
+      "editionId": 1,
+      "artists": [
+       {
+        "id": 258714,
+        "name": "Red Mountain Church",
+        "aliasid": 269287
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2005,
+      "remasterCatalogueNumber": "",
+      "remasterTitle": "",
+      "media": "WEB",
+      "encoding": "Lossless",
+      "format": "FLAC",
+      "hasLog": false,
+      "logScore": 100,
+      "hasCue": false,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 16,
+      "time": "2026-08-06 22:55:41",
+      "size": 362171648,
+      "snatches": 0,
+      "seeders": 1,
+      "leechers": 1,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     }
+    ]
+   },
+   {
+    "groupId": 150025,
+    "groupName": "Inna Red I Hour",
+    "artist": "Abja",
+    "cover": "https://ptpimg.me/r7zhwt.jpg",
+    "tags": [
+     "reggae",
+     "roots"
+    ],
+    "bookmarked": false,
+    "vanityHouse": false,
+    "groupYear": 2003,
+    "releaseType": "专辑",
+    "groupTime": "1786028140",
+    "maxSize": 390415240,
+    "totalSnatched": 0,
+    "totalSeeders": 1,
+    "totalLeechers": 1,
+    "torrents": [
+     {
+      "torrentId": 205580,
+      "editionId": 1,
+      "artists": [
+       {
+        "id": 258716,
+        "name": "Abja",
+        "aliasid": 269289
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2003,
+      "remasterCatalogueNumber": "IGCD007",
+      "remasterTitle": "",
+      "media": "CD",
+      "encoding": "Lossless",
+      "format": "FLAC",
+      "hasLog": true,
+      "logScore": 100,
+      "hasCue": true,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 16,
+      "time": "2026-08-06 22:55:40",
+      "size": 390415240,
+      "snatches": 0,
+      "seeders": 1,
+      "leechers": 1,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     }
+    ]
+   }
+  ]
+ }
+}
