@@ -2081,6 +2081,13 @@ function viewResult(row: SearchResult) {
 }
 
 function searchResultType(row: SearchResult | null | undefined) {
+  if (isGazelleResult(row)) {
+    const metadata = row?.metadata ?? {}
+    return ['category', 'release_type', 'media']
+      .map((key) => metadata[key])
+      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      .join(' / ')
+  }
   const value = row?.metadata?.type
   if (typeof value === 'string') return value.trim()
   if (Array.isArray(value)) {
@@ -2102,6 +2109,32 @@ function searchResultSize(row: SearchResult) {
 
 function openDownloadConfirm(result: SearchResult) {
   pendingDownload.value = result
+}
+
+function isGazelleResult(result: SearchResult | null | undefined) {
+  return result?.metadata?.adapter === 'gazelle'
+}
+
+function canUseToken(result: SearchResult | null | undefined) {
+  return isGazelleResult(result) && result?.metadata?.can_use_token === true
+}
+
+function resultTags(result: SearchResult) {
+  const metadata = result.metadata ?? {}
+  const tags: string[] = []
+  if (Array.isArray(metadata.tags)) {
+    tags.push(
+      ...metadata.tags.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    )
+  }
+  if (metadata.freeload === true || metadata.neutral_leech === true) tags.push('不计上传')
+  return [...new Set(tags)]
+}
+
+function tokenDownloadResult(result: SearchResult) {
+  const url = new URL(result.download_url)
+  url.searchParams.set('usetoken', '1')
+  return { ...result, download_url: url.toString() }
 }
 
 function switchPage(page: string) {
@@ -2134,11 +2167,11 @@ function switchPage(page: string) {
   }
 }
 
-async function confirmDownload() {
+async function confirmDownload(useToken = false) {
   if (!pendingDownload.value || downloadSubmitting.value) return
   downloadSubmitting.value = true
   try {
-    await addDownload(pendingDownload.value)
+    await addDownload(useToken ? tokenDownloadResult(pendingDownload.value) : pendingDownload.value)
     pendingDownload.value = null
   } catch (error) {
     notify(error instanceof Error ? error.message : '下载失败', 'error')
@@ -5236,6 +5269,14 @@ onUnmounted(() => {
                       >
                         类型 {{ searchResultType(row) }}
                       </v-chip>
+                      <v-chip
+                        v-for="tag in isGazelleResult(row) ? resultTags(row) : []"
+                        :key="tag"
+                        size="small"
+                        variant="outlined"
+                      >
+                        {{ tag }}
+                      </v-chip>
                     </div>
                   </div>
                   <div class="result-card-footer">
@@ -6984,6 +7025,16 @@ onUnmounted(() => {
         <v-card-actions class="download-confirm-actions">
           <v-btn variant="text" :disabled="downloadSubmitting" @click="pendingDownload = null">取消</v-btn>
           <v-btn
+            v-if="canUseToken(pendingDownload)"
+            color="primary"
+            prepend-icon="mdi-cards"
+            size="large"
+            :disabled="downloadSubmitting"
+            @click="confirmDownload(true)"
+          >
+            使用令牌下载
+          </v-btn>
+          <v-btn
             color="primary"
             prepend-icon="mdi-download"
             size="large"
@@ -8388,6 +8439,10 @@ onUnmounted(() => {
   gap: 12px;
   justify-content: flex-end;
   padding: 12px 16px 0;
+}
+
+.result-card-subtitle {
+  white-space: pre-line;
 }
 
 .site-result-filter {
