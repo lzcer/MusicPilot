@@ -724,7 +724,8 @@ class TelegramBotAdapter:
         session.selected_media = selected
         session.stage = "searching_torrents"
         logger.info("Telegram torrent search started: chat=%s", _chat_log_label(message))
-        await message.edit_text("正在搜索可下载的种子…", reply_markup=None)
+        await message.edit_reply_markup(reply_markup=None)
+        await message.answer("种子搜索中...")
         try:
             torrents = await self.search_torrents(selected)
         except Exception as exc:  # noqa: BLE001
@@ -748,7 +749,8 @@ class TelegramBotAdapter:
         session.stage = "torrent"
         session.page = 0
         session_id = self._session_messages[(session.chat_id, session.message_id)]
-        await self._render_torrents(message, session_id, session)
+        torrent_message = await self._send_torrents(message, session_id, session)
+        self._move_session(session_id, session, torrent_message)
         logger.info(
             "Telegram torrent search completed: chat=%s, results=%d",
             _chat_log_label(message),
@@ -826,6 +828,21 @@ class TelegramBotAdapter:
         )
 
     async def _render_torrents(self, message: Any, session_id: str, session: _Interaction) -> None:
+        text = self._torrent_result_text(session)
+        await message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=self._torrent_keyboard(session_id, session, len(session.torrents)),
+        )
+
+    async def _send_torrents(self, message: Any, session_id: str, session: _Interaction) -> Any:
+        return await message.answer(
+            self._torrent_result_text(session),
+            parse_mode="HTML",
+            reply_markup=self._torrent_keyboard(session_id, session, len(session.torrents)),
+        )
+
+    def _torrent_result_text(self, session: _Interaction) -> str:
         page_items = _page_items(session.torrents, session.page, self._TORRENT_PAGE_SIZE)
         pages = _page_count(len(session.torrents), self._TORRENT_PAGE_SIZE)
         lines = [f"<b>种子搜索结果（第 {session.page + 1}/{pages} 页）</b>"]
@@ -847,11 +864,7 @@ class TelegramBotAdapter:
             )
             if item.promotion:
                 lines.append(f"促销：{escape(_short(item.promotion, 80))}")
-        await message.edit_text(
-            "\n".join(lines),
-            parse_mode="HTML",
-            reply_markup=self._torrent_keyboard(session_id, session, len(session.torrents)),
-        )
+        return "\n".join(lines)
 
     def _media_keyboard(self, session_id: str, session: _Interaction, total: int) -> object:
         return self._keyboard(session_id, session, total, self._MEDIA_PAGE_SIZE, "s", "m")
@@ -906,6 +919,12 @@ class TelegramBotAdapter:
     def _store_session(self, session_id: str, session: _Interaction) -> None:
         self._cleanup_sessions()
         self._sessions[session_id] = session
+        self._session_messages[(session.chat_id, session.message_id)] = session_id
+
+    def _move_session(self, session_id: str, session: _Interaction, message: Any) -> None:
+        self._session_messages.pop((session.chat_id, session.message_id), None)
+        session.chat_id = message.chat.id
+        session.message_id = message.message_id
         self._session_messages[(session.chat_id, session.message_id)] = session_id
 
     def _get_session(self, session_id: str, chat_id: int, message_id: int) -> _Interaction | None:
