@@ -15,4 +15,5 @@ frontend/node_modules/
 frontend/dist/
 .env
 .codex-*.log
+.codex-tmp
 frontend/.npm-cache/

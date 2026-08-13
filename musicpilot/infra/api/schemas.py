@@ -24,6 +24,61 @@ class AboutResponse(BaseModel):
     license: str
 
 
+DiscoveryResourceType = Literal["songs", "albums", "playlists", "artists", "tags"]
+
+
+class DiscoveryChartItemResponse(BaseModel):
+    id: str
+    resource_type: DiscoveryResourceType
+    rank: int
+    name: str
+    artist_name: str | None = None
+    artwork_url: str | None = None
+    release_date: str | None = None
+    genres: list[str] = Field(default_factory=list)
+    listeners: int | None = None
+    playcount: int | None = None
+
+
+class DiscoveryChartResponse(BaseModel):
+    resource_type: DiscoveryResourceType
+    items: list[DiscoveryChartItemResponse]
+    next_offset: int | None = None
+    has_more: bool = False
+
+
+class DiscoveryTrackResponse(BaseModel):
+    id: str
+    position: int
+    name: str
+    artist_name: str | None = None
+    album_name: str | None = None
+    artwork_url: str | None = None
+    duration_seconds: int | None = None
+
+
+class DiscoveryItemDetailResponse(BaseModel):
+    id: str
+    resource_type: DiscoveryResourceType
+    name: str
+    artist_name: str | None = None
+    album_name: str | None = None
+    description: str | None = None
+    artwork_url: str | None = None
+    external_url: str | None = None
+    release_date: str | None = None
+    genres: list[str] = Field(default_factory=list)
+    duration_seconds: int | None = None
+    track_count: int | None = None
+    listeners: int | None = None
+    playcount: int | None = None
+    tracks: list[DiscoveryTrackResponse] = Field(default_factory=list)
+
+
+class DiscoveryProviderStatusResponse(BaseModel):
+    configured: bool
+
+
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
@@ -754,14 +809,20 @@ class SearchSettings(BaseModel):
     metadata_concurrency: int = Field(default=3, ge=1, le=20)
 
 
+class DiscoverySettings(BaseModel):
+    lastfm_api_key: str = ""
+
+
 class SystemSettingsRequest(BaseModel):
     proxy: ProxySettings = Field(default_factory=ProxySettings)
+    discovery: DiscoverySettings | None = None
     scraping: ScrapingSettings = Field(default_factory=ScrapingSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
 
 
 class SystemSettingsResponse(BaseModel):
     proxy: ProxySettings = Field(default_factory=ProxySettings)
+    discovery: DiscoverySettings = Field(default_factory=DiscoverySettings)
     scraping: ScrapingSettings = Field(default_factory=ScrapingSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
 

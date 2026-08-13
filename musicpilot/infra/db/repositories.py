@@ -43,6 +43,7 @@ from musicpilot.ports.metadata import TrackMetadata
 
 DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "proxy": {},
+    "discovery": {"lastfm_api_key": ""},
     "scraping": {
         "auto_organize": "downloader",
         "directory_monitor_mode": "native",

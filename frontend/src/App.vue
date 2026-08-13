@@ -1,6 +1,7 @@
 ﻿<script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ApiError, api, apiNoContent, readError } from './api'
+import DiscoveryPage from './components/DiscoveryPage.vue'
 import DirectoryPickerField from './components/DirectoryPickerField.vue'
 import ScrollableTable from './components/ScrollableTable.vue'
 import TruncatedTableCell from './components/TruncatedTableCell.vue'
@@ -52,6 +53,24 @@ type MediaCandidate = {
   external_id: string
   group_key?: string | null
   exists_in_library?: boolean
+}
+
+type DiscoverySongAction = {
+  name: string
+  artist_name?: string | null
+}
+
+type DiscoveryAlbumAction = DiscoverySongAction & {
+  id: string
+  album_name: string
+  artwork_url?: string | null
+  release_date?: string | null
+}
+
+type DiscoveryPlaylistAction = {
+  id: string
+  name: string
+  external_url: string
 }
 
 type MetadataCandidatePageResponse = {
@@ -832,6 +851,7 @@ const mediaServerTesting = ref(false)
 const notifierTesting = ref(false)
 const musicPlatformConnecting = ref(false)
 const playlistLoading = ref(false)
+const discoveryPlaylistAddingId = ref<string | null>(null)
 const availablePlaylistLoading = ref(false)
 const playlistTrackLoading = ref(false)
 const playlistTrackEditSaving = ref(false)
@@ -1189,6 +1209,7 @@ const navItems = [
   { title: '仪表盘', value: 'dashboard', icon: 'mdi-view-dashboard-outline' },
   { title: '搜索', value: 'search', icon: 'mdi-magnify' },
   { title: '下载', value: 'downloads', icon: 'mdi-download' },
+  { title: '发现', value: 'discovery', icon: 'mdi-compass-outline' },
   { title: '歌单', value: 'playlists', icon: 'mdi-playlist-music-outline' },
   { title: '整理', value: 'media', icon: 'mdi-music-box-multiple' },
   { title: '文件管理', value: 'files', icon: 'mdi-folder-music-outline' },
@@ -1595,7 +1616,7 @@ async function loadInitialData() {
     loadAboutInfo()
   ])
   syncPagePolling()
-  subscribeMetadataSiteSearch()
+  subscribeMetadataSiteSearch(false)
 }
 
 async function loadAboutInfo() {
@@ -1920,6 +1941,49 @@ function openSiteConfirm(candidate: MediaCandidate) {
   siteConfirmDialog.value = true
 }
 
+async function startDiscoverySongSearch(item: DiscoverySongAction) {
+  switchPage('search')
+  searchText.value = item.name
+  searchArtist.value = item.artist_name || ''
+  noMetadataDialog.value = false
+  await runSearch()
+}
+
+function startDiscoveryAlbumSearch(item: DiscoveryAlbumAction) {
+  switchPage('search')
+  stopMetadataCandidatePaging()
+  metadataSearchStream?.close()
+  metadataSearchStream = undefined
+  metadataSearchLoading.value = false
+  torrentSearchLoading.value = false
+  searchDialog.value = false
+  noMetadataDialog.value = false
+  searchText.value = item.album_name
+  searchArtist.value = item.artist_name || ''
+  metadataSearchQuery.value = item.album_name
+  metadataSearchArtist.value = item.artist_name || ''
+  metadataCandidates.value = []
+  searchResults.value = []
+  hasSearchedTorrents.value = false
+  searchSiteFilter.value = ''
+  searchPage.value = 1
+  searchStats.value = { raw_count: 0, filtered_count: 0 }
+  searchProgress.value = { completed_sites: 0, total_sites: 0, active_keywords: [] }
+  selectedMedia.value = {
+    title: item.name,
+    artist: item.artist_name || null,
+    album: item.album_name,
+    albums: [item.album_name],
+    release_date: item.release_date || null,
+    cover_url: item.artwork_url || null,
+    source: 'apple_music',
+    external_id: item.id
+  }
+  selectedAlbumNames.value = [item.album_name]
+  selectedSiteIds.value = [...enabledSiteIds.value]
+  siteConfirmDialog.value = true
+}
+
 async function runMetadataSiteSearch() {
   if (!selectedMedia.value || !canRunMetadataSiteSearch.value) return
   const siteIds = selectedEnabledSiteIds.value
@@ -1943,14 +2007,14 @@ async function runMetadataSiteSearch() {
       })
     })
     applyMetadataSearchSnapshot(snapshot)
-    subscribeMetadataSiteSearch()
+    subscribeMetadataSiteSearch(true)
   } catch (error) {
     notify(error instanceof Error ? error.message : '站点搜索失败', 'error')
     torrentSearchLoading.value = false
   }
 }
 
-function subscribeMetadataSiteSearch() {
+function subscribeMetadataSiteSearch(notifyCompletion: boolean) {
   metadataSearchStream?.close()
   metadataSearchStream = new EventSource('/api/search/by-metadata/stream/current', {
     withCredentials: true
@@ -1984,7 +2048,11 @@ function subscribeMetadataSiteSearch() {
     torrentSearchLoading.value = false
     metadataSearchStream?.close()
     metadataSearchStream = undefined
-    if (!searchResults.value.length && (payload.raw_count ?? 0) > 0) {
+    if (
+      notifyCompletion &&
+      !searchResults.value.length &&
+      (payload.raw_count ?? 0) > 0
+    ) {
       notify('未找到资源', 'warning')
     }
   })
@@ -3448,6 +3516,29 @@ async function loadLogs(force = false) {
   }
 }
 
+async function addDiscoveryPlaylist(item: DiscoveryPlaylistAction) {
+  if (discoveryPlaylistAddingId.value) return
+  discoveryPlaylistAddingId.value = item.id
+  try {
+    const previews = await api<PlaylistAvailable[]>('/api/playlists/parse-url', {
+      method: 'POST',
+      body: JSON.stringify({ url: item.external_url })
+    })
+    const importToken = previews[0]?.import_token
+    if (!importToken) throw new Error('未读取到可导入的歌单')
+    await api('/api/playlists/import-url', {
+      method: 'POST',
+      body: JSON.stringify({ import_token: importToken })
+    })
+    await loadPlaylists()
+    notify(`已加入歌单：${item.name}`)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '加入歌单失败', 'error')
+  } finally {
+    discoveryPlaylistAddingId.value = null
+  }
+}
+
 async function loadDebugLoggingState() {
   const state = await api<DebugLoggingState>('/api/logs/debug')
   debugLoggingEnabled.value = state.enabled
@@ -4139,8 +4230,7 @@ async function confirmDelete() {
   }
 }
 
-async function loadSystemSettings() {
-  const settings = await api<SystemSettings>('/api/settings/system')
+function applySystemSettings(settings: Partial<SystemSettings>) {
   systemForm.value = {
     proxy: {
       ...systemForm.value.proxy,
@@ -4155,6 +4245,10 @@ async function loadSystemSettings() {
       ...(settings.search ?? {})
     }
   }
+}
+
+async function loadSystemSettings() {
+  applySystemSettings(await api<SystemSettings>('/api/settings/system'))
 }
 
 async function loadDirectoryMonitorStatus() {
@@ -4222,10 +4316,11 @@ async function saveSystemSettings() {
       Number.MAX_SAFE_INTEGER,
       10
     )
-    systemForm.value = await api<SystemSettings>('/api/settings/system', {
+    const settings = await api<SystemSettings>('/api/settings/system', {
       method: 'POST',
       body: JSON.stringify(systemForm.value)
     })
+    applySystemSettings(settings)
     await loadDirectoryMonitorStatus()
     notify('系统设置已保存')
   } catch (error) {
@@ -4839,6 +4934,13 @@ onUnmounted(() => {
             title="仪表盘"
             rounded="lg"
             @click="switchPage('dashboard')"
+          />
+          <v-list-item
+            :active="activePage === 'discovery'"
+            prepend-icon="mdi-compass-outline"
+            title="发现"
+            rounded="lg"
+            @click="switchPage('discovery')"
           />
           <v-divider class="nav-group-divider" />
           <template v-for="(group, index) in navGroups" :key="group.title">
@@ -5772,6 +5874,14 @@ onUnmounted(() => {
               </v-table>
             </v-card>
           </section>
+
+          <DiscoveryPage
+            v-if="activePage === 'discovery'"
+            :playlist-adding-id="discoveryPlaylistAddingId"
+            @search-song="startDiscoverySongSearch"
+            @search-album="startDiscoveryAlbumSearch"
+            @add-playlist="addDiscoveryPlaylist"
+          />
 
           <section v-if="activePage === 'musicLibrary'" class="page-stack">
             <div class="toolbar-row">

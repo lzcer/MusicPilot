@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import copy
 import dataclasses
 import hashlib
 import importlib.metadata
@@ -22,7 +23,7 @@ from datetime import UTC, datetime, timedelta
 from html import escape
 from pathlib import Path
 from secrets import compare_digest, token_urlsafe
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote, unquote, urlparse
 
 import httpx
@@ -56,11 +57,33 @@ from musicpilot.adapters.metadata import (
     MutagenTagWriter,
     NetEaseMusicProvider,
 )
+from musicpilot.adapters.music_platforms.apple_music import (
+    AppleMusicDiscoveryAdapter,
+    AppleMusicDiscoveryError,
+    AppleMusicResourceNotFound,
+    AppleMusicWebTokenProvider,
+)
+from musicpilot.adapters.music_platforms.lastfm import (
+    LastFmDiscoveryAdapter,
+    LastFmDiscoveryError,
+    LastFmNotConfigured,
+    LastFmResourceNotFound,
+)
+from musicpilot.adapters.music_platforms.netease_music import (
+    NeteaseMusicDiscoveryAdapter,
+    NeteaseMusicDiscoveryError,
+    NeteaseMusicResourceNotFound,
+)
 from musicpilot.adapters.music_platforms.public_playlist import (
     PublicPlaylist,
     PublicPlaylistImporter,
     PublicPlaylistParseError,
     UnsupportedPublicPlaylistURL,
+)
+from musicpilot.adapters.music_platforms.qq_music import (
+    QQMusicDiscoveryAdapter,
+    QQMusicDiscoveryError,
+    QQMusicResourceNotFound,
 )
 from musicpilot.adapters.music_platforms.spotify import (
     SPOTIFY_PLAYLIST_SCOPES,
@@ -75,6 +98,7 @@ from musicpilot.core.directory_monitor import (
     DirectoryMonitorService,
     probe_native_directory,
 )
+from musicpilot.core.discovery import DiscoveryService
 from musicpilot.core.event_bus import EventBus
 from musicpilot.core.events import NotifyEvent, SearchEvent, SearchResult
 from musicpilot.core.metadata import MetadataCascade
@@ -134,6 +158,11 @@ from musicpilot.infra.api.schemas import (
     DirectoryEntryResponse,
     DirectoryListResponse,
     DirectoryMonitorStatusResponse,
+    DiscoveryChartItemResponse,
+    DiscoveryChartResponse,
+    DiscoveryItemDetailResponse,
+    DiscoveryProviderStatusResponse,
+    DiscoveryTrackResponse,
     DownloadDeleteMode,
     DownloaderCreateRequest,
     DownloaderResponse,
@@ -240,6 +269,12 @@ from musicpilot.infra.db.models import (
     TorrentRecordItem,
 )
 from musicpilot.infra.scheduler import SubscriptionScheduler
+from musicpilot.ports.discovery import (
+    DiscoveryChartItem,
+    DiscoveryChartPage,
+    DiscoveryItemDetail,
+    DiscoveryResourceType,
+)
 from musicpilot.ports.downloader import Downloader, DownloadState, DownloadStatus
 from musicpilot.ports.media_server import MEDIA_SERVER_TRACK_PAGE_SIZE, MediaServerTrack
 from musicpilot.ports.metadata import AlbumIdentity, MediaCandidate, TrackMetadata
@@ -256,6 +291,7 @@ MUSIC_LIBRARY_SYNC_AFTER_REFRESH_DELAY_SECONDS = 5
 MUSIC_LIBRARY_SYNC_MAX_PAGES = 10_000
 DIRECTORY_LIBRARY_NOTIFICATION_MAX_CHARS = 3500
 SLOW_API_OPERATION_SECONDS = float(os.getenv("MP_SLOW_API_OPERATION_SECONDS", "0.5"))
+SYSTEM_SECRET_MASK = "••••••••"
 PLAYLIST_TRACK_RETRYABLE_STATUSES = {
     "failed",
     "not_found",
@@ -1105,7 +1141,95 @@ class AppState:
             ]
         )
         self.spotify = SpotifyClient()
-        self.public_playlist_importer = PublicPlaylistImporter()
+        self.apple_music_client = httpx.AsyncClient(
+            timeout=30,
+            follow_redirects=True,
+            trust_env=False,
+        )
+        self.apple_music_token_provider = AppleMusicWebTokenProvider(self.apple_music_client)
+
+        async def apple_music_proxy() -> str | None:
+            return _proxy_url(await self.repository.get_system_settings())
+
+        self.apple_music_discovery = AppleMusicDiscoveryAdapter(
+            self.apple_music_client,
+            self.apple_music_token_provider,
+            apple_music_proxy,
+        )
+        self.apple_music_discovery_service = DiscoveryService(
+            self.apple_music_discovery,
+            cache_namespace="apple_music:cn",
+        )
+        self.qq_music_client = httpx.AsyncClient(
+            timeout=30,
+            follow_redirects=True,
+            trust_env=False,
+        )
+
+        async def qq_music_proxy() -> str | None:
+            return _proxy_url(await self.repository.get_system_settings())
+
+        self.qq_music_discovery = QQMusicDiscoveryAdapter(
+            self.qq_music_client,
+            qq_music_proxy,
+        )
+        self.qq_music_discovery_service = DiscoveryService(
+            self.qq_music_discovery,
+            cache_namespace="qq_music:cn",
+        )
+        self.netease_music_client = httpx.AsyncClient(
+            base_url="https://music.163.com",
+            timeout=30,
+            follow_redirects=True,
+            trust_env=False,
+            headers={
+                "Referer": "https://music.163.com/",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0 Safari/537.36"
+                ),
+            },
+        )
+
+        async def netease_music_proxy() -> str | None:
+            return _proxy_url(await self.repository.get_system_settings())
+
+        self.netease_music_discovery = NeteaseMusicDiscoveryAdapter(
+            self.netease_music_client,
+            netease_music_proxy,
+        )
+        self.netease_music_discovery_service = DiscoveryService(
+            self.netease_music_discovery,
+            cache_namespace="netease_music:cn",
+        )
+        self.lastfm_client = httpx.AsyncClient(
+            timeout=30,
+            follow_redirects=True,
+            trust_env=False,
+        )
+
+        async def lastfm_api_key() -> str:
+            system_settings = await self.repository.get_system_settings()
+            discovery_settings = system_settings.get("discovery")
+            if not isinstance(discovery_settings, dict):
+                return ""
+            return str(discovery_settings.get("lastfm_api_key") or "")
+
+        async def lastfm_proxy() -> str | None:
+            return _proxy_url(await self.repository.get_system_settings())
+
+        self.lastfm_discovery = LastFmDiscoveryAdapter(
+            lastfm_api_key,
+            self.lastfm_client,
+            lastfm_proxy,
+        )
+        self.lastfm_discovery_service = DiscoveryService(
+            self.lastfm_discovery,
+            cache_namespace="lastfm:china",
+        )
+        self.public_playlist_importer = PublicPlaylistImporter(
+            apple_token_provider=self.apple_music_token_provider,
+        )
         self.oauth_states: dict[str, str] = {}
         self._oauth_state_ttl: dict[str, float] = {}
         self.playlist_import_previews: dict[str, PublicPlaylist] = {}
@@ -2042,6 +2166,14 @@ def create_app() -> FastAPI:
             await state.downloader.close()
         await state.spotify.close()
         await state.public_playlist_importer.close()
+        await state.apple_music_discovery.close()
+        await state.apple_music_client.aclose()
+        await state.qq_music_discovery.close()
+        await state.qq_music_client.aclose()
+        await state.netease_music_discovery.close()
+        await state.netease_music_client.aclose()
+        await state.lastfm_discovery.close()
+        await state.lastfm_client.aclose()
         for provider in (*state.metadata.providers, *state.scraping_metadata.providers):
             close = getattr(provider, "close", None)
             if close is not None:
@@ -2086,6 +2218,283 @@ def create_app() -> FastAPI:
         )
         storage = _dashboard_storage_response(settings_payload, storage_snapshot)
         return _dashboard_response(summary, storage)
+
+    @app.get(
+        "/api/discovery/apple-music/charts/{resource_type}",
+        response_model=DiscoveryChartResponse,
+    )
+    async def apple_music_discovery_chart(
+        resource_type: Literal["songs", "albums", "playlists"],
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=20, ge=1, le=50),
+    ) -> DiscoveryChartResponse:
+        try:
+            page = await state.apple_music_discovery_service.chart(
+                resource_type, offset=offset, limit=limit
+            )
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="Apple Music 榜单请求超时，请重试。",
+            ) from exc
+        except (AppleMusicDiscoveryError, httpx.HTTPError) as exc:
+            state.add_log(
+                "discovery",
+                f"Apple Music chart failed: resource_type={resource_type}, error={exc}",
+                "ERROR",
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Apple Music 榜单暂时不可用，请重试。",
+            ) from exc
+        return _discovery_chart_response(resource_type, page)
+
+    @app.get(
+        "/api/discovery/apple-music/items/{resource_type}/{item_id}",
+        response_model=DiscoveryItemDetailResponse,
+    )
+    async def apple_music_discovery_detail(
+        resource_type: Literal["songs", "albums", "playlists"],
+        item_id: str,
+    ) -> DiscoveryItemDetailResponse:
+        try:
+            item = await state.apple_music_discovery_service.detail(resource_type, item_id)
+        except AppleMusicResourceNotFound as exc:
+            raise HTTPException(status_code=404, detail="Apple Music 资源不存在。") from exc
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="Apple Music 详情请求超时，请重试。",
+            ) from exc
+        except (AppleMusicDiscoveryError, httpx.HTTPError) as exc:
+            state.add_log(
+                "discovery",
+                "Apple Music detail failed: "
+                f"resource_type={resource_type}, item_id={item_id}, error={exc}",
+                "ERROR",
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Apple Music 详情暂时不可用，请重试。",
+            ) from exc
+        return DiscoveryItemDetailResponse(
+            id=item.id,
+            resource_type=item.resource_type,
+            name=item.name,
+            artist_name=item.artist_name,
+            album_name=item.album_name,
+            description=item.description,
+            artwork_url=item.artwork_url,
+            external_url=item.external_url,
+            release_date=item.release_date,
+            genres=list(item.genres),
+            duration_seconds=item.duration_seconds,
+            track_count=item.track_count,
+            listeners=item.listeners,
+            playcount=item.playcount,
+            tracks=[
+                DiscoveryTrackResponse(
+                    id=track.id,
+                    position=track.position,
+                    name=track.name,
+                    artist_name=track.artist_name,
+                    album_name=track.album_name,
+                    artwork_url=track.artwork_url,
+                    duration_seconds=track.duration_seconds,
+                )
+                for track in item.tracks
+            ],
+        )
+
+    @app.get(
+        "/api/discovery/qq-music/charts/{resource_type}",
+        response_model=DiscoveryChartResponse,
+    )
+    async def qq_music_discovery_chart(
+        resource_type: Literal["songs", "albums", "playlists"],
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=20, ge=1, le=50),
+    ) -> DiscoveryChartResponse:
+        try:
+            page = await state.qq_music_discovery_service.chart(
+                resource_type, offset=offset, limit=limit
+            )
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="QQ 音乐榜单请求超时，请重试。",
+            ) from exc
+        except (QQMusicDiscoveryError, httpx.HTTPError) as exc:
+            state.add_log(
+                "discovery",
+                f"QQ Music chart failed: resource_type={resource_type}, error={exc}",
+                "ERROR",
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="QQ 音乐榜单暂时不可用，请重试。",
+            ) from exc
+        return _discovery_chart_response(resource_type, page)
+
+    @app.get(
+        "/api/discovery/qq-music/items/{resource_type}/{item_id}",
+        response_model=DiscoveryItemDetailResponse,
+    )
+    async def qq_music_discovery_detail(
+        resource_type: Literal["songs", "albums", "playlists"],
+        item_id: str,
+    ) -> DiscoveryItemDetailResponse:
+        try:
+            item = await state.qq_music_discovery_service.detail(resource_type, item_id)
+        except QQMusicResourceNotFound as exc:
+            raise HTTPException(status_code=404, detail="QQ 音乐资源不存在。") from exc
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="QQ 音乐详情请求超时，请重试。",
+            ) from exc
+        except (QQMusicDiscoveryError, httpx.HTTPError) as exc:
+            state.add_log(
+                "discovery",
+                "QQ Music detail failed: "
+                f"resource_type={resource_type}, item_id={item_id}, error={exc}",
+                "ERROR",
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="QQ 音乐详情暂时不可用，请重试。",
+            ) from exc
+        return _discovery_detail_response(item)
+
+    @app.get(
+        "/api/discovery/netease-music/charts/{resource_type}",
+        response_model=DiscoveryChartResponse,
+    )
+    async def netease_music_discovery_chart(
+        resource_type: Literal["songs", "albums", "playlists"],
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=20, ge=1, le=50),
+    ) -> DiscoveryChartResponse:
+        try:
+            page = await state.netease_music_discovery_service.chart(
+                resource_type, offset=offset, limit=limit
+            )
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="网易云音乐榜单请求超时，请重试。",
+            ) from exc
+        except (NeteaseMusicDiscoveryError, httpx.HTTPError) as exc:
+            state.add_log(
+                "discovery",
+                f"Netease Music chart failed: resource_type={resource_type}, error={exc}",
+                "ERROR",
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="网易云音乐榜单暂时不可用，请重试。",
+            ) from exc
+        return _discovery_chart_response(resource_type, page)
+
+    @app.get(
+        "/api/discovery/netease-music/items/{resource_type}/{item_id}",
+        response_model=DiscoveryItemDetailResponse,
+    )
+    async def netease_music_discovery_detail(
+        resource_type: Literal["songs", "albums", "playlists"],
+        item_id: str,
+    ) -> DiscoveryItemDetailResponse:
+        try:
+            item = await state.netease_music_discovery_service.detail(
+                resource_type,
+                item_id,
+            )
+        except NeteaseMusicResourceNotFound as exc:
+            raise HTTPException(status_code=404, detail="网易云音乐资源不存在。") from exc
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="网易云音乐详情请求超时，请重试。",
+            ) from exc
+        except (NeteaseMusicDiscoveryError, httpx.HTTPError) as exc:
+            state.add_log(
+                "discovery",
+                "Netease Music detail failed: "
+                f"resource_type={resource_type}, item_id={item_id}, error={exc}",
+                "ERROR",
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="网易云音乐详情暂时不可用，请重试。",
+            ) from exc
+        return _discovery_detail_response(item)
+
+    @app.get(
+        "/api/discovery/lastfm/status",
+        response_model=DiscoveryProviderStatusResponse,
+    )
+    async def lastfm_discovery_status() -> DiscoveryProviderStatusResponse:
+        return DiscoveryProviderStatusResponse(
+            configured=await state.lastfm_discovery.configured()
+        )
+
+    @app.get(
+        "/api/discovery/lastfm/charts/{resource_type}",
+        response_model=DiscoveryChartResponse,
+    )
+    async def lastfm_discovery_chart(
+        resource_type: Literal["songs", "artists", "tags"],
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=20, ge=1, le=50),
+    ) -> DiscoveryChartResponse:
+        try:
+            page = await state.lastfm_discovery_service.chart(
+                resource_type, offset=offset, limit=limit
+            )
+        except LastFmNotConfigured as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="请先在系统设置中配置 Last.fm API Key。",
+            ) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="Last.fm 榜单请求超时，请重试。") from exc
+        except (LastFmDiscoveryError, httpx.HTTPError) as exc:
+            state.add_log(
+                "discovery",
+                f"Last.fm chart failed: resource_type={resource_type}, error={exc}",
+                "ERROR",
+            )
+            raise HTTPException(status_code=502, detail="Last.fm 榜单暂时不可用，请重试。") from exc
+        return _discovery_chart_response(resource_type, page)
+
+    @app.get(
+        "/api/discovery/lastfm/items/{resource_type}/{item_id}",
+        response_model=DiscoveryItemDetailResponse,
+    )
+    async def lastfm_discovery_detail(
+        resource_type: Literal["songs", "artists", "tags"],
+        item_id: str,
+    ) -> DiscoveryItemDetailResponse:
+        try:
+            item = await state.lastfm_discovery_service.detail(resource_type, item_id)
+        except LastFmNotConfigured as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="请先在系统设置中配置 Last.fm API Key。",
+            ) from exc
+        except LastFmResourceNotFound as exc:
+            raise HTTPException(status_code=404, detail="Last.fm 资源不存在。") from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="Last.fm 详情请求超时，请重试。") from exc
+        except (LastFmDiscoveryError, httpx.HTTPError) as exc:
+            state.add_log(
+                "discovery",
+                "Last.fm detail failed: "
+                f"resource_type={resource_type}, item_id={item_id}, error={exc}",
+                "ERROR",
+            )
+            raise HTTPException(status_code=502, detail="Last.fm 详情暂时不可用，请重试。") from exc
+        return _discovery_detail_response(item)
 
     @app.get("/api/system-tasks", response_model=list[SystemTaskResponse])
     async def system_tasks(
@@ -2561,7 +2970,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/settings/system", response_model=SystemSettingsResponse)
     async def system_settings() -> SystemSettingsResponse:
-        return SystemSettingsResponse(**await state.repository.get_system_settings())
+        return _system_settings_response(await state.repository.get_system_settings())
 
     @app.get(
         "/api/settings/directory-monitor/status",
@@ -2642,6 +3051,25 @@ def create_app() -> FastAPI:
         previous_settings = await state.repository.get_system_settings()
         previous_scraping_config = scraping_config_from_payload(previous_settings)
         requested_payload = payload.model_dump()
+        previous_discovery = previous_settings.get("discovery")
+        requested_discovery = requested_payload.get("discovery")
+        previous_lastfm_api_key = (
+            str(previous_discovery.get("lastfm_api_key") or "")
+            if isinstance(previous_discovery, dict)
+            else ""
+        )
+        if requested_discovery is None:
+            requested_payload["discovery"] = (
+                copy.deepcopy(previous_discovery)
+                if isinstance(previous_discovery, dict)
+                else {}
+            )
+        elif isinstance(requested_discovery, dict):
+            requested_lastfm_api_key = str(requested_discovery.get("lastfm_api_key") or "")
+            if requested_lastfm_api_key == SYSTEM_SECRET_MASK:
+                requested_discovery["lastfm_api_key"] = previous_lastfm_api_key
+            else:
+                requested_discovery["lastfm_api_key"] = requested_lastfm_api_key.strip()
         requested_scraping_config = scraping_config_from_payload(requested_payload)
         previous_version_control = previous_scraping_config.track_version_control
         previous_monitor_config = (
@@ -2689,6 +3117,14 @@ def create_app() -> FastAPI:
                 ) from exc
             native_probe_completed = True
         settings_payload = await state.repository.update_system_settings(requested_payload)
+        current_discovery = settings_payload.get("discovery")
+        current_lastfm_api_key = (
+            str(current_discovery.get("lastfm_api_key") or "")
+            if isinstance(current_discovery, dict)
+            else ""
+        )
+        if previous_lastfm_api_key != current_lastfm_api_key:
+            await state.lastfm_discovery_service.clear()
         await state.reload_bots()
         await state.reload_notifiers()
         current_scraping_config = scraping_config_from_payload(settings_payload)
@@ -2750,7 +3186,7 @@ def create_app() -> FastAPI:
         state.add_log("settings", "System settings saved")
         if monitor_start_failure is not None:
             raise HTTPException(status_code=409, detail=monitor_start_failure)
-        return SystemSettingsResponse(**settings_payload)
+        return _system_settings_response(settings_payload)
 
     @app.get("/api/settings/database/export")
     async def export_database() -> StreamingResponse:
@@ -8017,6 +8453,75 @@ def _notifier_response(item: NotifierChannel) -> NotifierResponse:
         enable_download_notify=item.enable_download_notify,
         enable_library_notify=item.enable_library_notify,
         enabled=item.enabled,
+    )
+
+
+def _system_settings_response(payload: dict[str, Any]) -> SystemSettingsResponse:
+    response_payload = copy.deepcopy(payload)
+    discovery = response_payload.get("discovery")
+    if not isinstance(discovery, dict):
+        discovery = {}
+        response_payload["discovery"] = discovery
+    discovery["lastfm_api_key"] = (
+        SYSTEM_SECRET_MASK if str(discovery.get("lastfm_api_key") or "").strip() else ""
+    )
+    return SystemSettingsResponse(**response_payload)
+
+
+def _discovery_chart_response(
+    resource_type: DiscoveryResourceType,
+    page: DiscoveryChartPage,
+) -> DiscoveryChartResponse:
+    return DiscoveryChartResponse(
+        resource_type=resource_type,
+        next_offset=page.next_offset,
+        has_more=page.has_more,
+        items=[
+            DiscoveryChartItemResponse(
+                id=item.id,
+                resource_type=item.resource_type,
+                rank=item.rank,
+                name=item.name,
+                artist_name=item.artist_name,
+                artwork_url=item.artwork_url,
+                release_date=item.release_date,
+                genres=list(item.genres),
+                listeners=item.listeners,
+                playcount=item.playcount,
+            )
+            for item in page.items
+        ],
+    )
+
+
+def _discovery_detail_response(item: DiscoveryItemDetail) -> DiscoveryItemDetailResponse:
+    return DiscoveryItemDetailResponse(
+        id=item.id,
+        resource_type=item.resource_type,
+        name=item.name,
+        artist_name=item.artist_name,
+        album_name=item.album_name,
+        description=item.description,
+        artwork_url=item.artwork_url,
+        external_url=item.external_url,
+        release_date=item.release_date,
+        genres=list(item.genres),
+        duration_seconds=item.duration_seconds,
+        track_count=item.track_count,
+        listeners=item.listeners,
+        playcount=item.playcount,
+        tracks=[
+            DiscoveryTrackResponse(
+                id=track.id,
+                position=track.position,
+                name=track.name,
+                artist_name=track.artist_name,
+                album_name=track.album_name,
+                artwork_url=track.artwork_url,
+                duration_seconds=track.duration_seconds,
+            )
+            for track in item.tracks
+        ],
     )
 
 
