@@ -334,7 +334,7 @@ watch(activeSource, (source) => {
 <template>
   <section class="discovery-page page-stack">
     <v-tabs v-model="activeSource" class="discovery-source-tabs" color="primary">
-      <v-tab prepend-icon="mdi-qqchat" value="qq_music">QQ 音乐</v-tab>
+      <v-tab prepend-icon="mdi-music-note" value="qq_music">QQ 音乐</v-tab>
       <v-tab prepend-icon="mdi-music-circle" value="netease_music">网易云音乐</v-tab>
       <v-tab prepend-icon="mdi-apple" value="apple_music">Apple Music</v-tab>
     </v-tabs>

@@ -5126,9 +5126,6 @@ onUnmounted(() => {
                 <v-card class="dashboard-panel">
                   <v-card-title class="dashboard-panel-title">
                     <span>最近整理</span>
-                    <v-chip size="small" color="error" variant="tonal">
-                      失败 {{ dashboard.media.failed }}
-                    </v-chip>
                   </v-card-title>
                   <v-list density="compact" lines="two">
                     <v-list-item
