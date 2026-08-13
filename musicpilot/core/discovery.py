@@ -28,8 +28,8 @@ class DiscoveryService:
         provider: DiscoveryProvider,
         *,
         cache_namespace: str,
-        chart_ttl_seconds: float = 5 * 60,
-        detail_ttl_seconds: float = 30 * 60,
+        chart_ttl_seconds: float = 60 * 60,
+        detail_ttl_seconds: float = 60 * 60,
         request_timeout_seconds: float = 30,
     ) -> None:
         self._provider = provider

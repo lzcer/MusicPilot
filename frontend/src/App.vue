@@ -42,6 +42,8 @@ type SearchSortField = 'size' | 'seeders' | 'publishedAt'
 
 type SearchSortDirection = 'asc' | 'desc'
 
+type SearchResultView = 'raw' | 'filtered'
+
 type MediaCandidate = {
   title: string
   artist?: string | null
@@ -96,6 +98,7 @@ type MetadataSiteSearchStreamPayload = {
   raw_count?: number
   filtered_count?: number
   done?: boolean
+  raw_results?: SearchResult[]
   results?: SearchResult[]
 }
 
@@ -682,6 +685,8 @@ const torrentSearchLoading = ref(false)
 const searchText = ref('')
 const searchArtist = ref('')
 const searchResults = ref<SearchResult[]>([])
+const rawSearchResults = ref<SearchResult[]>([])
+const searchResultView = ref<SearchResultView>('filtered')
 const metadataCandidates = ref<MediaCandidate[]>([])
 const metadataSearchQuery = ref('')
 const metadataSearchArtist = ref('')
@@ -1360,8 +1365,14 @@ const torrentSearchConditionText = computed(() => {
   return `${siteText} · 搜索中：${active}`
 })
 
+const displayedSearchResults = computed(() =>
+  searchResultView.value === 'raw' ? rawSearchResults.value : searchResults.value
+)
+
 const resultSiteOptions = computed(() => {
-  const names = Array.from(new Set(searchResults.value.map((item) => item.source).filter(Boolean))).sort()
+  const names = Array.from(
+    new Set(displayedSearchResults.value.map((item) => item.source).filter(Boolean))
+  ).sort()
   return [
     { title: '全部站点', value: '' },
     ...names.map((name) => ({ title: name, value: name }))
@@ -1369,8 +1380,8 @@ const resultSiteOptions = computed(() => {
 })
 
 const filteredSearchResults = computed(() => {
-  if (!searchSiteFilter.value) return searchResults.value
-  return searchResults.value.filter((item) => item.source === searchSiteFilter.value)
+  if (!searchSiteFilter.value) return displayedSearchResults.value
+  return displayedSearchResults.value.filter((item) => item.source === searchSiteFilter.value)
 })
 
 const resultSortOptions = [
@@ -1387,6 +1398,11 @@ function toggleSearchSort(field: SearchSortField) {
     searchSortDirection.value = 'desc'
   }
   searchPage.value = 1
+}
+
+function selectSearchResultView(view: SearchResultView) {
+  if (view === 'raw' && torrentSearchLoading.value) return
+  searchResultView.value = view
 }
 
 function searchSortIcon(field: SearchSortField) {
@@ -1751,6 +1767,8 @@ async function runSearch() {
   selectedMedia.value = null
   selectedAlbumNames.value = []
   searchResults.value = []
+  rawSearchResults.value = []
+  searchResultView.value = 'filtered'
   metadataCandidates.value = []
   hasSearchedTorrents.value = false
   searchStats.value = { raw_count: 0, filtered_count: 0 }
@@ -1875,6 +1893,8 @@ function runDirectSearch() {
   selectedMedia.value = null
   selectedAlbumNames.value = []
   searchResults.value = []
+  rawSearchResults.value = []
+  searchResultView.value = 'filtered'
   hasSearchedTorrents.value = true
   searchSiteFilter.value = ''
   searchPage.value = 1
@@ -1900,7 +1920,16 @@ function runDirectSearch() {
     torrentSearchLoading.value = false
   })
 
-  stream.addEventListener('done', () => {
+  stream.addEventListener('done', (event) => {
+    const payload = JSON.parse((event as MessageEvent).data) as {
+      raw_count?: number
+      raw_results?: SearchResult[]
+    }
+    rawSearchResults.value = payload.raw_results ?? []
+    searchStats.value = {
+      raw_count: payload.raw_count ?? rawSearchResults.value.length,
+      filtered_count: searchResults.value.length
+    }
     stream.close()
     torrentSearchLoading.value = false
   })
@@ -1913,6 +1942,8 @@ function openDirectSiteSearchConfirm() {
   searchDialog.value = false
   metadataCandidates.value = []
   searchResults.value = []
+  rawSearchResults.value = []
+  searchResultView.value = 'filtered'
   hasSearchedTorrents.value = false
   searchSiteFilter.value = ''
   searchPage.value = 1
@@ -1964,6 +1995,8 @@ function startDiscoveryAlbumSearch(item: DiscoveryAlbumAction) {
   metadataSearchArtist.value = item.artist_name || ''
   metadataCandidates.value = []
   searchResults.value = []
+  rawSearchResults.value = []
+  searchResultView.value = 'filtered'
   hasSearchedTorrents.value = false
   searchSiteFilter.value = ''
   searchPage.value = 1
@@ -1992,6 +2025,8 @@ async function runMetadataSiteSearch() {
   torrentSearchLoading.value = true
   metadataCandidates.value = []
   searchResults.value = []
+  rawSearchResults.value = []
+  searchResultView.value = 'filtered'
   hasSearchedTorrents.value = true
   searchSiteFilter.value = ''
   searchPage.value = 1
@@ -2080,6 +2115,9 @@ function applyMetadataSearchSnapshot(payload: MetadataSiteSearchStreamPayload) {
   }
   if (payload.results) {
     searchResults.value = payload.results
+  }
+  if (payload.done && payload.raw_results) {
+    rawSearchResults.value = payload.raw_results
   }
   hasSearchedTorrents.value =
     hasSearchedTorrents.value ||
@@ -3646,6 +3684,16 @@ watch(searchSiteFilter, () => {
   searchPage.value = 1
 })
 
+watch(searchResultView, () => {
+  searchPage.value = 1
+  if (
+    searchSiteFilter.value &&
+    !displayedSearchResults.value.some((item) => item.source === searchSiteFilter.value)
+  ) {
+    searchSiteFilter.value = ''
+  }
+})
+
 function openNewSiteDialog() {
   editingSiteId.value = null
   siteForm.value = {
@@ -5179,8 +5227,27 @@ onUnmounted(() => {
                     size="16"
                     width="2"
                   />
-                  <span>原始 {{ searchStats.raw_count }}</span>
-                  <span>过滤后 {{ searchStats.filtered_count }}</span>
+                  <div class="search-result-view-toggle" role="group" aria-label="结果范围">
+                    <v-btn
+                      :class="{ 'search-result-view-button--active': searchResultView === 'raw' }"
+                      :disabled="torrentSearchLoading"
+                      size="small"
+                      variant="text"
+                      @click="selectSearchResultView('raw')"
+                    >
+                      原始 {{ searchStats.raw_count }}
+                    </v-btn>
+                    <v-btn
+                      :class="{
+                        'search-result-view-button--active': searchResultView === 'filtered'
+                      }"
+                      size="small"
+                      variant="text"
+                      @click="selectSearchResultView('filtered')"
+                    >
+                      过滤后 {{ searchStats.filtered_count }}
+                    </v-btn>
+                  </div>
                 </div>
                 <div v-if="torrentSearchLoading" class="torrent-status-condition">
                   {{ torrentSearchConditionText }}
@@ -5267,7 +5334,7 @@ onUnmounted(() => {
             </div>
 
             <v-card class="search-panel">
-              <div v-if="searchResults.length" class="search-result-controls">
+              <div v-if="displayedSearchResults.length" class="search-result-controls">
                 <v-select
                   v-model="searchSiteFilter"
                   :items="resultSiteOptions"
@@ -8475,10 +8542,32 @@ onUnmounted(() => {
   align-items: center;
   display: flex;
   flex-wrap: wrap;
+  gap: 8px;
+}
+
+.search-result-view-toggle {
+  border: 1px solid rgba(var(--v-theme-info), 0.28);
+  border-radius: 4px;
+  display: inline-flex;
+  height: 30px;
+  overflow: hidden;
+}
+
+.search-result-view-toggle :deep(.v-btn) {
+  border-radius: 0;
   font-size: 13px;
   font-weight: 700;
-  gap: 12px;
-  line-height: 18px;
+  min-width: 88px;
+  padding-inline: 12px;
+}
+
+.search-result-view-toggle :deep(.v-btn + .v-btn) {
+  border-left: 1px solid rgba(var(--v-theme-info), 0.28);
+}
+
+.search-result-view-toggle :deep(.search-result-view-button--active) {
+  background: rgb(var(--v-theme-info));
+  color: rgb(var(--v-theme-on-info));
 }
 
 .torrent-status-condition {

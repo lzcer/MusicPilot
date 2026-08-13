@@ -514,6 +514,7 @@ class MetadataSiteSearchTask:
         self.filtered_count = 0
         self.done = False
         self.errors: list[dict[str, str]] = []
+        self.raw_results: list[dict[str, Any]] = []
         self.results: list[dict[str, Any]] = []
         self._site_states: dict[str, dict[str, Any]] = {}
         self._active_keywords: dict[str, int] = {}
@@ -541,6 +542,7 @@ class MetadataSiteSearchTask:
             "filtered_count": self.filtered_count,
             "done": self.done,
             "errors": self.errors,
+            "raw_results": self.raw_results,
             "results": self.results,
         }
 
@@ -584,6 +586,7 @@ class MetadataSiteSearchTask:
         site: str,
         raw_count: int,
         filtered_count: int,
+        raw_results: list[SearchResultResponse],
         results: list[SearchResultResponse],
         errors: list[str],
     ) -> None:
@@ -593,10 +596,19 @@ class MetadataSiteSearchTask:
                 "site": site,
                 "raw_count": raw_count,
                 "filtered_count": filtered_count,
+                "raw_results": [item.model_dump() for item in raw_results],
                 "results": [item.model_dump() for item in results],
                 "errors": errors,
             }
-            site_payload["errors"] = errors
+            site_payload.update(
+                {
+                    "raw_count": raw_count,
+                    "filtered_count": filtered_count,
+                    "raw_results": [item.model_dump() for item in raw_results],
+                    "results": [item.model_dump() for item in results],
+                    "errors": errors,
+                }
+            )
             self._site_states[site] = site_payload
             self._rebuild_search_totals()
         await self.publish("site_done", site_payload)
@@ -611,6 +623,7 @@ class MetadataSiteSearchTask:
 
     async def finish(self) -> None:
         async with self._lock:
+            self.raw_count = len(self.raw_results)
             self.done = True
         await self.publish("done", self.snapshot())
 
@@ -621,10 +634,29 @@ class MetadataSiteSearchTask:
             queue.put_nowait((event, payload))
 
     def _rebuild_search_totals(self) -> None:
-        self.raw_count = sum(int(state["raw_count"]) for state in self._site_states.values())
         self.filtered_count = sum(
             int(state["filtered_count"]) for state in self._site_states.values()
         )
+        raw_results = [
+            _search_result_from_payload(result)
+            for state in self._site_states.values()
+            for result in state.get("raw_results", [])
+            if isinstance(result, dict)
+        ]
+        deduped_raw_results = _dedupe_results(raw_results)
+        self.raw_results = [
+            _search_result_response(item).model_dump()
+            for item in sorted(
+                deduped_raw_results,
+                key=lambda item: item.seeders,
+                reverse=True,
+            )
+        ]
+        self.raw_count = sum(
+            int(state["raw_count"])
+            for state in self._site_states.values()
+            if "raw_results" not in state
+        ) + len(self.raw_results)
         results = [
             result
             for state in self._site_states.values()
@@ -2764,6 +2796,7 @@ def create_app() -> FastAPI:
 
             state.add_log("search", f"Search started: {query}")
             count = 0
+            raw_results: list[SearchResult] = []
             for indexer in state.indexers:
                 try:
                     _source, results = await _search_indexer(state, indexer, query, limit)
@@ -2771,6 +2804,7 @@ def create_app() -> FastAPI:
                     state.add_log("search", f"Indexer failed: {exc}", "ERROR")
                     yield _sse("error", {"source": "unknown", "message": str(exc)})
                     continue
+                raw_results.extend(results)
                 for result in results:
                     count += 1
                     yield _sse(
@@ -2789,8 +2823,19 @@ def create_app() -> FastAPI:
                             "metadata": result.metadata,
                         },
                     )
+            deduped_raw_results = _dedupe_results(raw_results)
             state.add_log("search", f"Search completed: {query}, {count} result(s)")
-            yield _sse("done", {"count": count})
+            yield _sse(
+                "done",
+                {
+                    "count": count,
+                    "raw_count": len(deduped_raw_results),
+                    "raw_results": [
+                        _search_result_response(item).model_dump()
+                        for item in deduped_raw_results
+                    ],
+                },
+            )
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
@@ -8144,6 +8189,7 @@ async def _run_metadata_site_search_for_indexer(
                 site=site_name,
                 raw_count=0,
                 filtered_count=0,
+                raw_results=[],
                 results=[],
                 errors=[],
             )
@@ -8191,10 +8237,12 @@ async def _run_metadata_site_search_for_indexer(
         )
         filtered = await _filter_by_artist_with_aliases(state, merged, task.media.artist)
         ranked = sorted(filtered, key=lambda item: item.seeders, reverse=True)[:limit]
+        deduped_raw_results = _dedupe_results(raw_results)
         await task.site_done(
             site=site_name,
-            raw_count=len(raw_results),
+            raw_count=len(deduped_raw_results),
             filtered_count=len(filtered),
+            raw_results=[_search_result_response(item) for item in deduped_raw_results],
             results=[_search_result_response(item) for item in ranked],
             errors=errors,
         )
