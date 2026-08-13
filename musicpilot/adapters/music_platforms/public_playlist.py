@@ -164,27 +164,27 @@ class PublicPlaylistImporter:
             playlist_id = _path_id(parsed.path)
         if not playlist_id:
             raise PublicPlaylistParseError("无法识别 QQ 音乐歌单 ID。")
-        response = await self._client.get(
-            "https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg",
-            headers={"Referer": f"https://y.qq.com/n/ryqq/playlist/{playlist_id}"},
-            params={
-                "disstid": playlist_id,
-                "type": "1",
-                "json": "1",
-                "utf8": "1",
-                "onlysong": "0",
-                "format": "json",
-            },
-        )
-        response.raise_for_status()
-        payload = response.json()
-        playlist_data = _safe_get(payload, ["cdlist", 0], {}) or {}
-        raw_tracks = (
-            _safe_get(playlist_data, ["songlist"], [])
-            or _safe_get(playlist_data, ["list"], [])
-            or _safe_get(payload, ["songlist"], [])
-            or []
-        )
+        try:
+            numeric_id = int(playlist_id)
+        except ValueError as exc:
+            raise PublicPlaylistParseError("QQ 音乐歌单 ID 无效。") from exc
+        payload = await self._qq_playlist_page(numeric_id, begin=0, count=500)
+        playlist_data = payload.get("dirinfo")
+        if not isinstance(playlist_data, dict) or not playlist_data.get("id"):
+            raise PublicPlaylistParseError("QQ 音乐歌单不存在或无法访问。")
+        raw_tracks = payload.get("songlist")
+        raw_tracks = raw_tracks if isinstance(raw_tracks, list) else []
+        total = _optional_int(payload.get("total_song_num")) or _optional_int(
+            playlist_data.get("songnum")
+        ) or len(raw_tracks)
+        begin = len(raw_tracks)
+        while begin < total:
+            page = await self._qq_playlist_page(numeric_id, begin=begin, count=500)
+            page_tracks = page.get("songlist")
+            if not isinstance(page_tracks, list) or not page_tracks:
+                break
+            raw_tracks.extend(page_tracks)
+            begin += len(page_tracks)
         tracks = [
             _qq_track(track, index)
             for index, track in enumerate(raw_tracks, start=1)
@@ -193,14 +193,67 @@ class PublicPlaylistImporter:
         return PublicPlaylist(
             platform="qq",
             external_id=playlist_id,
-            name=_optional_string(playlist_data.get("dissname")) or f"playlist-{playlist_id}",
+            name=_optional_string(playlist_data.get("title")) or f"playlist-{playlist_id}",
             source_url=playlist_url,
-            owner_name=_optional_string(_safe_get(playlist_data, ["nick"], None)),
+            owner_name=_optional_string(playlist_data.get("host_nick")),
             description=_optional_string(playlist_data.get("desc")),
-            cover_url=_optional_string(playlist_data.get("logo")),
+            cover_url=_optional_string(playlist_data.get("picurl")),
             raw_payload=payload,
             tracks=[track for track in tracks if track is not None],
         )
+
+    async def _qq_playlist_page(
+        self,
+        playlist_id: int,
+        *,
+        begin: int,
+        count: int,
+    ) -> dict[str, Any]:
+        response = await self._client.post(
+            "https://u.y.qq.com/cgi-bin/musicu.fcg",
+            json={
+                "comm": {
+                    "ct": 24,
+                    "cv": 0,
+                    "format": "json",
+                    "inCharset": "utf-8",
+                    "outCharset": "utf-8",
+                    "notice": 0,
+                    "platform": "yqq.json",
+                    "needNewCode": 1,
+                    "uin": 0,
+                },
+                "req": {
+                    "module": "music.srfDissInfo.aiDissInfo",
+                    "method": "uniform_get_Dissinfo",
+                    "param": {
+                        "disstid": playlist_id,
+                        "enc_host_uin": "",
+                        "tag": 1,
+                        "userinfo": 1,
+                        "song_begin": begin,
+                        "song_num": count,
+                    },
+                },
+            },
+            headers={"Referer": "https://y.qq.com/"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        request = payload.get("req") if isinstance(payload, dict) else None
+        if not isinstance(request, dict) or _optional_int(request.get("code")) not in {
+            None,
+            0,
+        }:
+            raise PublicPlaylistParseError("QQ 音乐歌单接口返回错误。")
+        data = request.get("data")
+        if not isinstance(data, dict):
+            raise PublicPlaylistParseError("QQ 音乐歌单接口响应格式无效。")
+        if _optional_int(data.get("code")) not in {None, 0} or _optional_int(
+            data.get("subcode")
+        ) not in {None, 0}:
+            raise PublicPlaylistParseError("QQ 音乐歌单不存在或无法访问。")
+        return data
 
     async def _parse_netease(self, playlist_url: str) -> PublicPlaylist:
         parsed = urlparse(playlist_url)

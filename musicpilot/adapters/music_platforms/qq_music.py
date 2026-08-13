@@ -17,9 +17,6 @@ from musicpilot.ports.discovery import (
 )
 
 QQ_MUSIC_API_URL = "https://u.y.qq.com/cgi-bin/musicu.fcg"
-QQ_MUSIC_PLAYLIST_API_URL = (
-    "https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg"
-)
 QQ_MUSIC_PLAYLIST_CHART_URL = (
     "https://c.y.qq.com/splcloud/fcgi-bin/fcg_get_diss_by_tag.fcg"
 )
@@ -288,17 +285,18 @@ class QQMusicDiscoveryAdapter:
         )
 
     async def _playlist_detail(self, item_id: str) -> DiscoveryItemDetail:
-        playlist = await self._playlist_page(item_id, begin=0, count=500)
-        if not playlist:
+        first_page = await self._playlist_page(item_id, begin=0, count=500)
+        playlist = _mapping(first_page.get("dirinfo"))
+        if not playlist or _optional_int(playlist.get("id")) is None:
             raise QQMusicResourceNotFound("QQ 音乐歌单不存在。")
-        raw_tracks = _list(playlist.get("songlist") or playlist.get("list"))
-        total = _optional_int(
-            playlist.get("songnum") or playlist.get("total_song_num")
+        raw_tracks = _list(first_page.get("songlist"))
+        total = _optional_int(first_page.get("total_song_num")) or _optional_int(
+            playlist.get("songnum")
         ) or len(raw_tracks)
         begin = len(raw_tracks)
         while begin < total:
             page = await self._playlist_page(item_id, begin=begin, count=500)
-            page_tracks = _list(page.get("songlist") or page.get("list"))
+            page_tracks = _list(page.get("songlist"))
             if not page_tracks:
                 break
             raw_tracks.extend(page_tracks)
@@ -307,13 +305,13 @@ class QQMusicDiscoveryAdapter:
         return DiscoveryItemDetail(
             id=item_id,
             resource_type="playlists",
-            name=_optional_string(playlist.get("dissname")) or item_id,
-            artist_name=_optional_string(playlist.get("nick")),
+            name=_optional_string(playlist.get("title")) or item_id,
+            artist_name=_optional_string(playlist.get("host_nick")),
             description=_clean_html(playlist.get("desc")),
-            artwork_url=_https_url(playlist.get("logo")),
+            artwork_url=_https_url(playlist.get("picurl")),
             external_url=f"https://y.qq.com/n/ryqq/playlist/{item_id}",
             track_count=total,
-            playcount=_optional_int(playlist.get("visitnum")),
+            playcount=_optional_int(playlist.get("listennum")),
             tracks=tracks,
         )
 
@@ -324,25 +322,23 @@ class QQMusicDiscoveryAdapter:
         begin: int,
         count: int,
     ) -> dict[str, Any]:
-        payload = await self._get_json(
-            QQ_MUSIC_PLAYLIST_API_URL,
-            params={
-                "disstid": item_id,
-                "type": 1,
-                "json": 1,
-                "utf8": 1,
-                "onlysong": 0,
-                "new_format": 1,
+        data = await self._musicu(
+            "music.srfDissInfo.aiDissInfo",
+            "uniform_get_Dissinfo",
+            {
+                "disstid": _numeric_id(item_id),
+                "enc_host_uin": "",
+                "tag": 1,
+                "userinfo": 1,
                 "song_begin": begin,
                 "song_num": count,
-                "format": "json",
             },
-            headers={"Referer": f"https://y.qq.com/n/ryqq/playlist/{item_id}"},
         )
-        if _optional_int(payload.get("code")) not in {None, 0}:
+        if _optional_int(data.get("code")) not in {None, 0} or _optional_int(
+            data.get("subcode")
+        ) not in {None, 0}:
             raise QQMusicDiscoveryError("QQ 音乐歌单接口返回错误。")
-        cdlist = _list(payload.get("cdlist"))
-        return _mapping(cdlist[0]) if cdlist else {}
+        return data
 
     async def _musicu(
         self,
