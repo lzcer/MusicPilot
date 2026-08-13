@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -10,7 +11,7 @@ from datetime import datetime
 from html import escape
 from secrets import token_urlsafe
 from typing import Any, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 from aiogram.__meta__ import __version__ as aiogram_version
@@ -372,8 +373,8 @@ class TelegramBotAdapter:
                 await self._change_page(message, session, value, "torrent")
             elif parts[1] == "s":
                 await self._select_media(message, session, value)
-            elif parts[1] == "d":
-                await self._select_torrent(message, session, value)
+            elif parts[1] in {"d", "k"}:
+                await self._select_torrent(message, session, value, use_token=parts[1] == "k")
             logger.info(
                 "Telegram callback completed: chat=%s, action=%s",
                 _chat_log_label(message),
@@ -757,7 +758,14 @@ class TelegramBotAdapter:
             len(torrents),
         )
 
-    async def _select_torrent(self, message: Any, session: _Interaction, index: int) -> None:
+    async def _select_torrent(
+        self,
+        message: Any,
+        session: _Interaction,
+        index: int,
+        *,
+        use_token: bool = False,
+    ) -> None:
         if (
             session.stage != "torrent"
             or session.selected_media is None
@@ -765,6 +773,14 @@ class TelegramBotAdapter:
         ):
             return
         torrent = session.torrents[index]
+        if use_token and not _can_use_token(torrent):
+            await message.answer("当前种子不支持使用令牌下载。")
+            return
+        if use_token:
+            torrent = dataclasses.replace(
+                torrent,
+                download_url=_token_download_url(torrent.download_url),
+            )
         logger.info("Telegram download submission started: chat=%s", _chat_log_label(message))
         await message.edit_text(
             f"正在提交下载：<b>{escape(_short(torrent.title, 240))}</b>",
@@ -870,7 +886,48 @@ class TelegramBotAdapter:
         return self._keyboard(session_id, session, total, self._MEDIA_PAGE_SIZE, "s", "m")
 
     def _torrent_keyboard(self, session_id: str, session: _Interaction, total: int) -> object:
-        return self._keyboard(session_id, session, total, self._TORRENT_PAGE_SIZE, "d", "t")
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        page_items = _page_items(session.torrents, session.page, self._TORRENT_PAGE_SIZE)
+        buttons = [
+            InlineKeyboardButton(
+                text=str(index + 1),
+                callback_data=f"tg:d:{session_id}:{item_index}",
+            )
+            for index, (item_index, _) in enumerate(page_items)
+        ]
+        token_buttons = [
+            InlineKeyboardButton(
+                text=f"令牌 {index + 1}",
+                callback_data=f"tg:k:{session_id}:{item_index}",
+            )
+            for index, (item_index, item) in enumerate(page_items)
+            if _can_use_token(item)
+        ]
+        rows = [buttons[index : index + 5] for index in range(0, len(buttons), 5)]
+        if token_buttons:
+            rows.extend(
+                token_buttons[index : index + 3] for index in range(0, len(token_buttons), 3)
+            )
+        pages = _page_count(total, self._TORRENT_PAGE_SIZE)
+        navigation = []
+        if session.page > 0:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="上一页",
+                    callback_data=f"tg:t:{session_id}:{session.page - 1}",
+                )
+            )
+        if session.page < pages - 1:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="下一页",
+                    callback_data=f"tg:t:{session_id}:{session.page + 1}",
+                )
+            )
+        if navigation:
+            rows.append(navigation)
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
     def _keyboard(
         self,
@@ -1074,6 +1131,20 @@ def _format_size(value: int | None) -> str:
     if index == 0:
         return f"{int(size)} {units[index]}"
     return f"{size:.2f} {units[index]}"
+
+
+def _can_use_token(result: SearchResult) -> bool:
+    return (
+        result.metadata.get("adapter") == "gazelle"
+        and result.metadata.get("can_use_token") is True
+    )
+
+
+def _token_download_url(download_url: str) -> str:
+    parsed = urlparse(download_url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["usetoken"] = "1"
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
 def _short(value: str, length: int) -> str:

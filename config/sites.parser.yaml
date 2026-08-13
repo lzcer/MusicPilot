@@ -1,4 +1,7 @@
 sites:
+  - name: DicMusic
+    base_url: https://dicmusic.com
+    adapter: gazelle
   - targets:
       - name: M-Team
         base_url: https://kp.m-team.cc
