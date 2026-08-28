@@ -385,6 +385,15 @@ class DirectoryLibraryNotificationItem:
     refreshed_at: datetime
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class PlaylistLibraryReconcileResult:
+    playlist_id: str | None
+    song_ids: tuple[str, ...]
+    mode: str
+    added_to_musicpilot: int = 0
+    removed_from_musicpilot: int = 0
+
+
 class DirectoryLibraryNotificationAggregator:
     def __init__(
         self,
@@ -3864,30 +3873,40 @@ def create_app() -> FastAPI:
                 if is_first_auto_sync:
                     state.pending_playlist_library_sync_bindings.add(pending_binding_key)
                 try:
-                    library_playlist_id, synced_count, mode = (
-                        await _sync_playlist_to_media_server(
+                    if request.auto_sync or current_binding is not None:
+                        reconcile_result = await _reconcile_playlist_with_media_server(
                             state,
                             playlist,
-                            media_server_id=server.id,
+                            server=server,
                             public=request.public,
+                            force_write=True,
+                            baseline_song_ids=(
+                                current_binding.last_synced_song_ids
+                                if current_binding is not None
+                                else []
+                            ),
                         )
-                    )
-                    if request.auto_sync:
-                        counts = await state.repository.playlist_track_counts(playlist.id)
-                        if counts["existing_count"] != synced_count:
-                            library_playlist_id, synced_count, mode = (
-                                await _sync_playlist_to_media_server(
-                                    state,
-                                    playlist,
-                                    media_server_id=server.id,
-                                    public=request.public,
-                                )
+                        library_playlist_id = reconcile_result.playlist_id
+                        synced_count = len(reconcile_result.song_ids)
+                        mode = reconcile_result.mode
+                    else:
+                        library_playlist_id, synced_count, mode = (
+                            await _sync_playlist_to_media_server(
+                                state,
+                                playlist,
+                                media_server_id=server.id,
+                                public=request.public,
                             )
+                        )
+                        reconcile_result = None
+                    if request.auto_sync:
+                        assert reconcile_result is not None
                         await state.repository.upsert_playlist_library_sync_binding(
                             playlist_id=playlist.id,
                             media_server_id=server.id,
                             public=request.public,
                             last_synced_existing_count=synced_count,
+                            last_synced_song_ids=list(reconcile_result.song_ids),
                         )
                     else:
                         await state.repository.delete_playlist_library_sync_binding(
@@ -9366,6 +9385,8 @@ async def _sync_music_library_from_media_server(
             f"rss_kib={_rss_log_value(matching_rss_kib)}",
         )
 
+        await _sync_all_playlist_library_bindings(state)
+
         await state.repository.set_music_library_sync_recovery(incomplete=False)
         final_rss_kib = _current_process_rss_kib()
         state.add_log(
@@ -9467,6 +9488,139 @@ async def _sync_playlist_to_media_server(
     return result.playlist_id, result.synced_count, result.mode
 
 
+def _merged_playlist_song_counts(
+    baseline_song_ids: Iterable[str],
+    local_song_ids: Iterable[str],
+    remote_song_ids: Iterable[str],
+) -> Counter[str]:
+    baseline_counts = Counter(baseline_song_ids)
+    local_counts = Counter(local_song_ids)
+    remote_counts = Counter(remote_song_ids)
+    target_counts: Counter[str] = Counter()
+    for song_id in baseline_counts.keys() | local_counts.keys() | remote_counts.keys():
+        baseline_count = baseline_counts[song_id]
+        added_count = max(
+            max(0, local_counts[song_id] - baseline_count),
+            max(0, remote_counts[song_id] - baseline_count),
+        )
+        removed_count = max(
+            max(0, baseline_count - local_counts[song_id]),
+            max(0, baseline_count - remote_counts[song_id]),
+        )
+        target_count = max(0, baseline_count + added_count - removed_count)
+        if target_count:
+            target_counts[song_id] = target_count
+    return target_counts
+
+
+def _ordered_playlist_song_ids(
+    target_counts: Counter[str],
+    local_song_ids: Iterable[str],
+    remote_song_ids: Iterable[str],
+) -> list[str]:
+    remaining = target_counts.copy()
+    ordered: list[str] = []
+    for song_ids in (local_song_ids, remote_song_ids):
+        for song_id in song_ids:
+            if remaining[song_id] <= 0:
+                continue
+            ordered.append(song_id)
+            remaining[song_id] -= 1
+    if any(remaining.values()):
+        raise RuntimeError("Playlist merge could not resolve the target song order.")
+    return ordered
+
+
+async def _reconcile_playlist_with_media_server(
+    state: AppState,
+    playlist: Playlist,
+    *,
+    server: MediaServerConfig,
+    public: bool,
+    baseline_song_ids: Iterable[str],
+    force_write: bool = False,
+) -> PlaylistLibraryReconcileResult:
+    client = build_media_server_client(server)
+    remote_playlist = await client.get_playlist(name=playlist.name)
+    matched_tracks = await state.repository.list_matched_playlist_library_tracks(playlist.id)
+    local_song_ids = [
+        library_track.navidrome_id
+        for _, library_track in matched_tracks
+        if library_track.navidrome_id
+    ]
+    normalized_baseline = [
+        str(song_id).strip() for song_id in baseline_song_ids if str(song_id).strip()
+    ]
+    remote_song_ids = (
+        [track.id for track in remote_playlist.tracks] if remote_playlist is not None else []
+    )
+    target_counts = (
+        _merged_playlist_song_counts(
+            normalized_baseline,
+            local_song_ids,
+            remote_song_ids,
+        )
+        if remote_playlist is not None
+        else Counter(local_song_ids)
+    )
+    merged_song_ids = _ordered_playlist_song_ids(
+        target_counts,
+        local_song_ids,
+        remote_song_ids,
+    )
+
+    if (
+        not force_write
+        and remote_playlist is not None
+        and Counter(remote_song_ids) == target_counts
+    ):
+        library_playlist_id = remote_playlist.id
+        sync_mode = "unchanged"
+    else:
+        sync_result = await client.sync_playlist(
+            name=playlist.name,
+            song_ids=merged_song_ids,
+            public=public,
+        )
+        library_playlist_id = sync_result.playlist_id
+        sync_mode = sync_result.mode
+
+    if remote_playlist is not None and remote_playlist.tracks:
+        await state.repository.sync_music_library_track_page(
+            [_media_server_track_payload(track) for track in remote_playlist.tracks],
+            synced_at=datetime.now(UTC),
+        )
+    added, removed = await state.repository.reconcile_playlist_library_song_counts(
+        playlist_id=playlist.id,
+        media_server_id=server.id,
+        target_counts=target_counts,
+    )
+    reconciled_tracks = await state.repository.list_matched_playlist_library_tracks(playlist.id)
+    reconciled_song_ids = tuple(
+        library_track.navidrome_id
+        for _, library_track in reconciled_tracks
+        if library_track.navidrome_id
+    )
+    if Counter(reconciled_song_ids) != target_counts:
+        raise RuntimeError("MusicPilot playlist did not reach the merged sync state.")
+    state.add_log(
+        "playlist",
+        "Playlist synchronized bidirectionally: "
+        f"playlist_id={playlist.id}, name={playlist.name}, "
+        f"media_server={server.name}, username={server.username or '-'}, public={public}, "
+        f"library_playlist_id={library_playlist_id or '-'}, mode={sync_mode}, "
+        f"tracks={len(reconciled_song_ids)}, added_to_musicpilot={added}, "
+        f"removed_from_musicpilot={removed}",
+    )
+    return PlaylistLibraryReconcileResult(
+        playlist_id=library_playlist_id,
+        song_ids=reconciled_song_ids,
+        mode=sync_mode,
+        added_to_musicpilot=added,
+        removed_from_musicpilot=removed,
+    )
+
+
 def _playlist_library_sync_lock(
     state: AppState,
     playlist_id: int,
@@ -9497,7 +9651,7 @@ async def _trigger_playlist_library_auto_sync(state: AppState, playlist_id: int)
             return
         await asyncio.gather(
             *(
-                _sync_playlist_library_binding_if_changed(
+                _sync_playlist_library_binding(
                     state,
                     playlist_id=playlist_id,
                     media_server_id=media_server_id,
@@ -9514,7 +9668,21 @@ async def _trigger_playlist_library_auto_sync(state: AppState, playlist_id: int)
         )
 
 
-async def _sync_playlist_library_binding_if_changed(
+async def _sync_all_playlist_library_bindings(state: AppState) -> None:
+    bindings = await state.repository.list_enabled_playlist_library_sync_bindings()
+    await asyncio.gather(
+        *(
+            _sync_playlist_library_binding(
+                state,
+                playlist_id=binding.playlist_id,
+                media_server_id=binding.media_server_id,
+            )
+            for binding in bindings
+        )
+    )
+
+
+async def _sync_playlist_library_binding(
     state: AppState,
     *,
     playlist_id: int,
@@ -9531,21 +9699,19 @@ async def _sync_playlist_library_binding_if_changed(
             server = await state.repository.get_media_server(media_server_id)
             if server is None or not server.enabled:
                 return
-            counts = await state.repository.playlist_track_counts(playlist_id)
-            if binding.last_synced_existing_count == counts["existing_count"]:
-                return
             playlist = await state.repository.get_playlist(playlist_id)
             if playlist is None:
                 return
-            _library_playlist_id, synced_count, _mode = await _sync_playlist_to_media_server(
+            result = await _reconcile_playlist_with_media_server(
                 state,
                 playlist,
-                media_server_id=media_server_id,
+                server=server,
                 public=binding.public,
+                baseline_song_ids=binding.last_synced_song_ids,
             )
-            await state.repository.update_playlist_library_sync_binding_count(
+            await state.repository.update_playlist_library_sync_binding_state(
                 binding.id,
-                synced_count,
+                list(result.song_ids),
             )
     except Exception as exc:  # noqa: BLE001
         state.add_log(

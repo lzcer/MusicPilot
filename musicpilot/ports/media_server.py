@@ -47,6 +47,13 @@ class MediaServerPlaylistSyncResult:
     mode: str = "updated"
 
 
+@dataclass(frozen=True, slots=True)
+class MediaServerPlaylist:
+    id: str
+    name: str
+    tracks: tuple[MediaServerTrack, ...] = ()
+
+
 class MediaServerClient(Protocol):
     @property
     def name(self) -> str: ...
@@ -58,6 +65,8 @@ class MediaServerClient(Protocol):
     async def get_album(self, album_id: str) -> MediaServerAlbum | None: ...
 
     async def start_scan(self) -> None: ...
+
+    async def get_playlist(self, *, name: str) -> MediaServerPlaylist | None: ...
 
     async def sync_playlist(
         self,

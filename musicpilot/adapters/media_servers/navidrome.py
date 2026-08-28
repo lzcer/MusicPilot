@@ -11,6 +11,7 @@ import httpx
 from musicpilot.ports.media_server import (
     MEDIA_SERVER_TRACK_PAGE_SIZE,
     MediaServerAlbum,
+    MediaServerPlaylist,
     MediaServerPlaylistSyncResult,
     MediaServerTrack,
     MediaServerTrackPage,
@@ -153,6 +154,38 @@ class NavidromeMediaServerClient:
         async with httpx.AsyncClient(base_url=self.base_url, timeout=30) as client:
             response = await client.get("/rest/startScan.view", params=self._params())
             _validate_navidrome_scan_response(response)
+
+    async def get_playlist(self, *, name: str) -> MediaServerPlaylist | None:
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=30) as client:
+            playlist_id = await self._find_playlist_id(client, name)
+            if playlist_id is None:
+                return None
+            response = await client.get(
+                "/rest/getPlaylist.view",
+                params={**self._params(), "id": playlist_id},
+            )
+            body = _validate_navidrome_json_response(response)
+        playlist = body.get("playlist")
+        if not isinstance(playlist, dict):
+            raise RuntimeError("Navidrome response is missing playlist.")
+        raw_entries = playlist.get("entry", [])
+        if isinstance(raw_entries, dict):
+            raw_entries = [raw_entries]
+        if not isinstance(raw_entries, list):
+            raise RuntimeError("Navidrome returned an invalid playlist.entry response.")
+        tracks: list[MediaServerTrack] = []
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                raise RuntimeError("Navidrome playlist contains an invalid track entry.")
+            track = _track_from_payload(item)
+            if not track.id:
+                raise RuntimeError("Navidrome playlist contains a track without an ID.")
+            tracks.append(track)
+        return MediaServerPlaylist(
+            id=str(playlist.get("id") or playlist_id),
+            name=str(playlist.get("name") or name),
+            tracks=tuple(tracks),
+        )
 
     async def sync_playlist(
         self,

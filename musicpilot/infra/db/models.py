@@ -249,6 +249,7 @@ class PlaylistLibrarySyncBinding(TimestampMixin, Base):
     )
     public: Mapped[bool] = mapped_column(Boolean, default=False)
     last_synced_existing_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_synced_song_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
 
 
 class PlaylistTrack(TimestampMixin, Base):

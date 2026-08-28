@@ -5,6 +5,7 @@ import os
 import re
 import time
 import unicodedata
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -1929,8 +1930,11 @@ class SqlAlchemyMediaRepository:
 
     async def list_enabled_playlist_library_sync_bindings(
         self,
-        playlist_id: int,
+        playlist_id: int | None = None,
     ) -> list[PlaylistLibrarySyncBinding]:
+        conditions: list[Any] = [MediaServerConfig.enabled.is_(True)]
+        if playlist_id is not None:
+            conditions.append(PlaylistLibrarySyncBinding.playlist_id == playlist_id)
         async with self.database.session() as session:
             result = await session.execute(
                 select(PlaylistLibrarySyncBinding)
@@ -1938,11 +1942,11 @@ class SqlAlchemyMediaRepository:
                     MediaServerConfig,
                     MediaServerConfig.id == PlaylistLibrarySyncBinding.media_server_id,
                 )
-                .where(
-                    PlaylistLibrarySyncBinding.playlist_id == playlist_id,
-                    MediaServerConfig.enabled.is_(True),
+                .where(*conditions)
+                .order_by(
+                    PlaylistLibrarySyncBinding.playlist_id,
+                    PlaylistLibrarySyncBinding.media_server_id,
                 )
-                .order_by(PlaylistLibrarySyncBinding.media_server_id)
             )
             return list(result.scalars().all())
 
@@ -1967,6 +1971,7 @@ class SqlAlchemyMediaRepository:
         media_server_id: str,
         public: bool,
         last_synced_existing_count: int,
+        last_synced_song_ids: list[str],
     ) -> PlaylistLibrarySyncBinding:
         async with self.database.session() as session:
             result = await session.execute(
@@ -1984,20 +1989,22 @@ class SqlAlchemyMediaRepository:
                 session.add(row)
             row.public = public
             row.last_synced_existing_count = last_synced_existing_count
+            row.last_synced_song_ids = list(last_synced_song_ids)
             await session.commit()
             await session.refresh(row)
             return row
 
-    async def update_playlist_library_sync_binding_count(
+    async def update_playlist_library_sync_binding_state(
         self,
         binding_id: int,
-        last_synced_existing_count: int,
+        song_ids: list[str],
     ) -> PlaylistLibrarySyncBinding | None:
         async with self.database.session() as session:
             row = await session.get(PlaylistLibrarySyncBinding, binding_id)
             if row is None:
                 return None
-            row.last_synced_existing_count = last_synced_existing_count
+            row.last_synced_existing_count = len(song_ids)
+            row.last_synced_song_ids = list(song_ids)
             await session.commit()
             await session.refresh(row)
             return row
@@ -2214,7 +2221,10 @@ class SqlAlchemyMediaRepository:
         seen_source_keys = {item["source_key"] for item in prepared_tracks}
         async with self.database.session() as session:
             result = await session.execute(
-                select(PlaylistTrack).where(PlaylistTrack.playlist_id == playlist_id)
+                select(PlaylistTrack).where(
+                    PlaylistTrack.playlist_id == playlist_id,
+                    PlaylistTrack.platform == platform,
+                )
             )
             existing = {item.source_key: item for item in result.scalars().all()}
             rows: list[PlaylistTrack] = []
@@ -2246,6 +2256,15 @@ class SqlAlchemyMediaRepository:
             for source_key, row in existing.items():
                 if source_key not in seen_source_keys:
                     await session.delete(row)
+            await session.flush()
+            count_result = await session.execute(
+                select(func.count()).select_from(PlaylistTrack).where(
+                    PlaylistTrack.playlist_id == playlist_id
+                )
+            )
+            playlist = await session.get(Playlist, playlist_id)
+            if playlist is not None:
+                playlist.track_count = int(count_result.scalar_one())
             await session.commit()
             for row in rows:
                 await session.refresh(row)
@@ -2340,6 +2359,125 @@ class SqlAlchemyMediaRepository:
                 .order_by(PlaylistTrack.position, PlaylistTrack.id)
             )
             return [(track, library_track) for track, library_track in result.all()]
+
+    async def reconcile_playlist_library_song_counts(
+        self,
+        *,
+        playlist_id: int,
+        media_server_id: str,
+        target_counts: Counter[str],
+    ) -> tuple[int, int]:
+        platform = f"navidrome:{media_server_id}"
+        now = datetime.now(UTC)
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(PlaylistTrack, MusicLibraryTrack)
+                .join(
+                    MusicLibraryTrack,
+                    PlaylistTrack.matched_library_track_id == MusicLibraryTrack.id,
+                )
+                .where(
+                    PlaylistTrack.playlist_id == playlist_id,
+                    PlaylistTrack.exists_in_library.is_(True),
+                    PlaylistTrack.matched_library_track_id.isnot(None),
+                )
+                .order_by(PlaylistTrack.position, PlaylistTrack.id)
+            )
+            matched_rows = list(result.all())
+            rows_by_song_id: dict[str, list[PlaylistTrack]] = {}
+            for track, library_track in matched_rows:
+                rows_by_song_id.setdefault(library_track.navidrome_id, []).append(track)
+
+            requested_ids = tuple(
+                song_id for song_id, count in target_counts.items() if count > 0
+            )
+            library_by_song_id: dict[str, MusicLibraryTrack] = {}
+            if requested_ids:
+                library_result = await session.execute(
+                    select(MusicLibraryTrack).where(
+                        MusicLibraryTrack.navidrome_id.in_(requested_ids)
+                    )
+                )
+                library_by_song_id = {
+                    item.navidrome_id: item for item in library_result.scalars().all()
+                }
+            missing_ids = [
+                song_id for song_id in requested_ids if song_id not in library_by_song_id
+            ]
+            if missing_ids:
+                raise RuntimeError(
+                    "Music library is missing playlist tracks: "
+                    + ", ".join(missing_ids[:5])
+                )
+
+            removed = 0
+            for song_id, rows in rows_by_song_id.items():
+                remove_count = max(0, len(rows) - target_counts.get(song_id, 0))
+                candidates = sorted(
+                    rows,
+                    key=lambda row: (
+                        row.platform != platform,
+                        -row.position,
+                        -row.id,
+                    ),
+                )
+                for row in candidates[:remove_count]:
+                    await session.delete(row)
+                    removed += 1
+
+            max_position_result = await session.execute(
+                select(func.max(PlaylistTrack.position)).where(
+                    PlaylistTrack.playlist_id == playlist_id
+                )
+            )
+            next_position = int(max_position_result.scalar_one() or 0) + 1
+            added = 0
+            current_counts = Counter(
+                library_track.navidrome_id for _, library_track in matched_rows
+            )
+            for song_id, target_count in target_counts.items():
+                add_count = max(0, target_count - current_counts.get(song_id, 0))
+                library_track = library_by_song_id.get(song_id)
+                if library_track is None:
+                    continue
+                for _ in range(add_count):
+                    session.add(
+                        PlaylistTrack(
+                            playlist_id=playlist_id,
+                            platform=platform,
+                            external_id=song_id,
+                            source_key=f"{platform}:{song_id}:{uuid4().hex}",
+                            position=next_position,
+                            original_title=library_track.title,
+                            title=library_track.title,
+                            artist=library_track.artist,
+                            album=library_track.album,
+                            duration=library_track.duration,
+                            exists_in_library=True,
+                            matched_library_track_id=library_track.id,
+                            download_status="library_refreshed",
+                            last_checked_at=now,
+                            raw_payload={
+                                "source": "media_server_playlist",
+                                "media_server_id": media_server_id,
+                                "navidrome_id": song_id,
+                            },
+                        )
+                    )
+                    next_position += 1
+                    added += 1
+
+            await session.flush()
+            count_result = await session.execute(
+                select(func.count()).select_from(PlaylistTrack).where(
+                    PlaylistTrack.playlist_id == playlist_id
+                )
+            )
+            playlist = await session.get(Playlist, playlist_id)
+            if playlist is not None:
+                playlist.track_count = int(count_result.scalar_one())
+            await session.commit()
+            return added, removed
 
     async def playlist_track_counts(self, playlist_id: int) -> dict[str, int]:
         tracks = await self.list_playlist_tracks(playlist_id)

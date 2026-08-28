@@ -115,6 +115,13 @@ class Database:
                     "original_title": "VARCHAR(512) NOT NULL DEFAULT ''",
                 },
             )
+            await _add_sqlite_columns(
+                conn,
+                "playlist_library_sync_bindings",
+                {
+                    "last_synced_song_ids": "JSON NOT NULL DEFAULT '[]'",
+                },
+            )
             await _ensure_media_files_library_path_nullable(conn)
             await conn.exec_driver_sql(
                 "UPDATE media_files SET library_path = NULL WHERE status != 'success'"

@@ -7505,7 +7505,7 @@ onUnmounted(() => {
             density="compact"
             hide-details
             inset
-            label="自动同步"
+            label="自动双向同步"
           />
         </v-card-text>
         <v-card-actions>
