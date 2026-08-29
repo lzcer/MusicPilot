@@ -8,6 +8,7 @@ from musicpilot.adapters.indexers.config import (
     load_parser_catalog,
     parser_config_from_mapping,
 )
+from musicpilot.adapters.indexers.gazelle import GazelleCrawler, GazelleSiteConfig
 from musicpilot.adapters.indexers.mteam import MTeamCrawler, MTeamSiteConfig
 from musicpilot.adapters.indexers.nexusphp import NexusPHPCrawler, NexusPHPSiteConfig
 
@@ -16,6 +17,8 @@ __all__ = [
     "NexusPHPSiteConfig",
     "MTeamCrawler",
     "MTeamSiteConfig",
+    "GazelleCrawler",
+    "GazelleSiteConfig",
     "ParserCatalog",
     "ParserCatalogEntry",
     "build_indexers",
