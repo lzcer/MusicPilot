@@ -165,6 +165,7 @@ Scraping completes metadata, lyrics, tags, and target paths after downloads fini
 | Source directory | Directory picker | Source directory used for manual organization and directory monitoring. Available directories come from the filesystem visible to the MusicPilot runtime. |
 | Mapped directory / copied directory | Directory picker | Required when "mapped file" or "copied file" is selected. Available directories come from the filesystem visible to the MusicPilot runtime. |
 | Try scraping when missing | Album, artist, lyrics, cover | Try online completion when these fields are missing. A cover is present only when the audio file contains embedded artwork. |
+| Maximum attempt | On / off, disabled by default | When a candidate cannot fill the selected fields, try all metadata sources and choose one trusted candidate that fills the most fields, using match quality to break ties. The fail-when-missing rules still apply. |
 | Fail when missing | Album, artist, lyrics, cover | If these fields are still missing, the organization task is treated as failed. Required cover artwork is checked again after tags are written. |
 | Track version control | On / off, off by default | Controls whether scraping, duplicate detection, and "in library" checks distinguish track versions strictly. |
 | Auto rename | On / off | Rename files according to metadata. |

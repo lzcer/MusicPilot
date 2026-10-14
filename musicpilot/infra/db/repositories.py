@@ -46,6 +46,7 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "proxy": {},
     "discovery": {"lastfm_api_key": ""},
     "scraping": {
+        "max_scrape_attempt": False,
         "auto_organize": "downloader",
         "directory_monitor_mode": "native",
         "directory_monitor_poll_interval_seconds": 60,

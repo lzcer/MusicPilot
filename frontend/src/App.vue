@@ -582,6 +582,7 @@ type SystemSettings = {
     source_directory: string
     mapped_directory: string
     scrape_when_missing: Array<'album' | 'artist' | 'lyrics' | 'cover'>
+    max_scrape_attempt: boolean
     required_metadata: Array<'album' | 'artist' | 'lyrics' | 'cover'>
     auto_rename: boolean
     auto_classify: boolean
@@ -1083,6 +1084,7 @@ const systemForm = ref<SystemSettings>({
     source_directory: '',
     mapped_directory: '',
     scrape_when_missing: [],
+    max_scrape_attempt: false,
     required_metadata: [],
     auto_rename: false,
     auto_classify: false,
@@ -6650,6 +6652,15 @@ onUnmounted(() => {
                           :label="item.title"
                           :value="item.value"
                           hide-details
+                        />
+                        <v-switch
+                          v-model="systemForm.scraping.max_scrape_attempt"
+                          class="compact-switch"
+                          color="primary"
+                          density="compact"
+                          hide-details
+                          inset
+                          label="最大尝试"
                         />
                       </div>
                     </div>

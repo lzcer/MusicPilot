@@ -793,6 +793,7 @@ class ScrapingSettings(BaseModel):
     scrape_when_missing: list[Literal["album", "artist", "lyrics", "cover"]] = Field(
         default_factory=list
     )
+    max_scrape_attempt: bool = False
     required_metadata: list[Literal["album", "artist", "lyrics", "cover"]] = Field(
         default_factory=list
     )

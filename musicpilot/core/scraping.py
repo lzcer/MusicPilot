@@ -160,6 +160,7 @@ class ScrapingConfig:
     source_directory: Path | None = None
     mapped_directory: Path | None = None
     scrape_when_missing: tuple[RequiredMetadata, ...] = ()
+    max_scrape_attempt: bool = False
     required_metadata: tuple[RequiredMetadata, ...] = ()
     auto_rename: bool = False
     auto_classify: bool = False
@@ -679,9 +680,13 @@ class LocalMusicScraper:
                 required=config.required_metadata if needs_scrape else (),
                 trigger_fields=trigger_fields,
                 require_trigger_gain=needs_scrape,
+                prefer_trigger_gain=config.max_scrape_attempt,
             )
             candidates = cached_candidates
-            if selected is None:
+            if selected is None or (
+                config.max_scrape_attempt
+                and _metadata_missing(selected.candidate, trigger_fields)
+            ):
                 selected, candidates = await self._verify_metadata_identities(
                     search_reference,
                     identity_references,
@@ -691,6 +696,7 @@ class LocalMusicScraper:
                     required=config.required_metadata if needs_scrape else (),
                     trigger_fields=trigger_fields,
                     require_trigger_gain=needs_scrape,
+                    prefer_trigger_gain=config.max_scrape_attempt,
                 )
             if selected is None and needs_scrape:
                 selected = await self._select_verified_identity(
@@ -709,9 +715,12 @@ class LocalMusicScraper:
             reference_file=source_file,
             trigger_fields=trigger_fields,
             require_trigger_gain=needs_scrape,
+            prefer_trigger_gain=config.max_scrape_attempt,
         )
         candidates = cached_candidates
-        if looked_up is None:
+        if looked_up is None or (
+            config.max_scrape_attempt and _metadata_missing(looked_up, trigger_fields)
+        ):
             online_candidates = await self._search_metadata_candidates(
                 source_metadata,
                 match_metadata,
@@ -720,13 +729,14 @@ class LocalMusicScraper:
             candidates = _merge_metadata_candidates(candidates, online_candidates)
             looked_up = await _select_metadata_candidate(
                 match_metadata,
-                online_candidates,
+                candidates if config.max_scrape_attempt else online_candidates,
                 config.required_metadata,
                 artist_service=self.artist_service,
                 track_version_control=config.track_version_control,
                 reference_file=source_file,
                 trigger_fields=trigger_fields,
                 require_trigger_gain=needs_scrape,
+                prefer_trigger_gain=config.max_scrape_attempt,
             )
         if looked_up is None and not _same_metadata_match_key(
             match_metadata,
@@ -747,6 +757,7 @@ class LocalMusicScraper:
                 reference_file=source_file,
                 trigger_fields=trigger_fields,
                 require_trigger_gain=needs_scrape,
+                prefer_trigger_gain=config.max_scrape_attempt,
             )
         return source_file, candidates, looked_up
 
@@ -909,6 +920,7 @@ class LocalMusicScraper:
                     required=config.required_metadata if needs_scrape else (),
                     trigger_fields=missing_before,
                     require_trigger_gain=needs_scrape,
+                    prefer_trigger_gain=config.max_scrape_attempt,
                 )
             else:
                 verified, candidates = await self._verify_metadata_identities(
@@ -920,6 +932,7 @@ class LocalMusicScraper:
                     required=config.required_metadata if needs_scrape else (),
                     trigger_fields=missing_before,
                     require_trigger_gain=needs_scrape,
+                    prefer_trigger_gain=config.max_scrape_attempt,
                 )
             if verified is None and needs_scrape:
                 verified = await self._select_verified_identity(
@@ -990,6 +1003,7 @@ class LocalMusicScraper:
                     required=config.required_metadata,
                     trigger_fields=missing_before,
                     require_trigger_gain=True,
+                    prefer_trigger_gain=config.max_scrape_attempt,
                 )
                 logger.info(
                     "Scraping identity candidate adoption: source=%s, "
@@ -1065,6 +1079,7 @@ class LocalMusicScraper:
                 reference_file=source_file,
                 trigger_fields=missing_before,
                 require_trigger_gain=True,
+                prefer_trigger_gain=config.max_scrape_attempt,
             )
             logger.info(
                 "Scraping cached candidate result: source=%s, trigger_fields=%s, "
@@ -1074,7 +1089,10 @@ class LocalMusicScraper:
                 _metadata_log_text(looked_up),
                 _candidate_trigger_gain(looked_up, missing_before) if looked_up else (),
             )
-            if looked_up is None and not metadata_lookup_completed:
+            if not metadata_lookup_completed and (
+                looked_up is None
+                or (config.max_scrape_attempt and _metadata_missing(looked_up, missing_before))
+            ):
                 online_candidates = await self._search_metadata_candidates(
                     source_metadata,
                     match_metadata,
@@ -1083,13 +1101,14 @@ class LocalMusicScraper:
                 candidates = _merge_metadata_candidates(cached_candidates, online_candidates)
                 looked_up = await _select_metadata_candidate(
                     match_metadata,
-                    online_candidates,
+                    candidates if config.max_scrape_attempt else online_candidates,
                     config.required_metadata,
                     artist_service=self.artist_service,
                     track_version_control=config.track_version_control,
                     reference_file=source_file,
                     trigger_fields=missing_before,
                     require_trigger_gain=True,
+                    prefer_trigger_gain=config.max_scrape_attempt,
                 )
                 logger.info(
                     "Scraping online candidate result: source=%s, "
@@ -1113,6 +1132,7 @@ class LocalMusicScraper:
                     reference_file=source_file,
                     trigger_fields=missing_before,
                     require_trigger_gain=True,
+                    prefer_trigger_gain=config.max_scrape_attempt,
                 )
                 candidates = _merge_metadata_candidates(candidates, fallback_candidates)
                 candidate_reference = fallback_metadata
@@ -1643,9 +1663,10 @@ class LocalMusicScraper:
         required: tuple[RequiredMetadata, ...] = (),
         trigger_fields: tuple[RequiredMetadata, ...] = (),
         require_trigger_gain: bool = False,
+        prefer_trigger_gain: bool = False,
     ) -> _VerifiedIdentity | None:
         selected: _VerifiedIdentity | None = None
-        selected_key: tuple[int, int, int, int, int, int] | None = None
+        selected_key: tuple[int, ...] | None = None
         for priority, reference in enumerate(references):
             candidate = await _select_identity_candidate(
                 reference.metadata,
@@ -1656,6 +1677,7 @@ class LocalMusicScraper:
                 required=required,
                 trigger_fields=trigger_fields,
                 require_trigger_gain=require_trigger_gain,
+                prefer_trigger_gain=prefer_trigger_gain,
             )
             if candidate is None:
                 continue
@@ -1666,6 +1688,9 @@ class LocalMusicScraper:
                 reference_file=reference_file,
             )
             key = (
+                len(_candidate_trigger_gain(candidate, trigger_fields))
+                if prefer_trigger_gain
+                else 0,
                 score.ranking_total,
                 score.base.total,
                 score.base.title,
@@ -1689,6 +1714,7 @@ class LocalMusicScraper:
         required: tuple[RequiredMetadata, ...] = (),
         trigger_fields: tuple[RequiredMetadata, ...] = (),
         require_trigger_gain: bool = False,
+        prefer_trigger_gain: bool = False,
     ) -> tuple[_VerifiedIdentity | None, tuple[TrackMetadata, ...]]:
         candidates = _merge_metadata_candidates(
             cached_candidates,
@@ -1706,6 +1732,7 @@ class LocalMusicScraper:
             required=required,
             trigger_fields=trigger_fields,
             require_trigger_gain=require_trigger_gain,
+            prefer_trigger_gain=prefer_trigger_gain,
         )
         return selected, candidates
 
@@ -1906,6 +1933,7 @@ def scraping_config_from_payload(payload: dict[str, object]) -> ScrapingConfig:
         source_directory=_optional_path(scraping.get("source_directory")),
         mapped_directory=_optional_path(scraping.get("mapped_directory")),
         scrape_when_missing=scrape_metadata,
+        max_scrape_attempt=bool(scraping.get("max_scrape_attempt")),
         required_metadata=required_metadata,
         auto_rename=bool(scraping.get("auto_rename")),
         auto_classify=bool(scraping.get("auto_classify")),
@@ -3008,6 +3036,7 @@ def _scraping_config_log_text(config: ScrapingConfig) -> str:
         f"source_directory={str(config.source_directory) if config.source_directory else None!r}, "
         f"mapped_directory={str(config.mapped_directory) if config.mapped_directory else None!r}, "
         f"scrape_when_missing={config.scrape_when_missing}, "
+        f"max_scrape_attempt={config.max_scrape_attempt}, "
         f"required_metadata={config.required_metadata}, "
         f"auto_rename={config.auto_rename}, auto_classify={config.auto_classify}, "
         f"classify_by={config.classify_by!r}, duplicate_handling={config.duplicate_handling!r}, "
@@ -3301,6 +3330,7 @@ async def _select_metadata_candidate(
     reference_file: Path | None = None,
     trigger_fields: tuple[RequiredMetadata, ...] = (),
     require_trigger_gain: bool = False,
+    prefer_trigger_gain: bool = False,
 ) -> TrackMetadata | None:
     """Select the best metadata candidate using scoring.
 
@@ -3317,6 +3347,7 @@ async def _select_metadata_candidate(
         reference_file=reference_file,
         trigger_fields=trigger_fields,
         require_trigger_gain=require_trigger_gain,
+        prefer_trigger_gain=prefer_trigger_gain,
     )
     return ranked[0] if ranked else None
 
@@ -3332,6 +3363,7 @@ async def _rank_metadata_candidates(
     trigger_fields: tuple[RequiredMetadata, ...] = (),
     require_trigger_gain: bool = False,
     identity_verification: bool = False,
+    prefer_trigger_gain: bool = False,
 ) -> tuple[TrackMetadata, ...]:
     scored: list[tuple[_CandidateScore, int, TrackMetadata]] = []
     for candidate in candidates:
@@ -3359,6 +3391,7 @@ async def _rank_metadata_candidates(
 
     scored.sort(
         key=lambda item: (
+            item[1] if prefer_trigger_gain else 0,
             item[0].ranking_total,
             item[1],
             item[0].base.total,
@@ -3380,6 +3413,7 @@ async def _select_identity_candidate(
     required: tuple[RequiredMetadata, ...] = (),
     trigger_fields: tuple[RequiredMetadata, ...] = (),
     require_trigger_gain: bool = False,
+    prefer_trigger_gain: bool = False,
 ) -> TrackMetadata | None:
     ranked = await _rank_metadata_candidates(
         reference,
@@ -3390,6 +3424,7 @@ async def _select_identity_candidate(
         reference_file=reference_file,
         trigger_fields=trigger_fields,
         require_trigger_gain=require_trigger_gain,
+        prefer_trigger_gain=prefer_trigger_gain,
         identity_verification=True,
     )
     return ranked[0] if ranked else None
