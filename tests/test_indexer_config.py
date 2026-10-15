@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from musicpilot.adapters.indexers.config import build_nexusphp_indexers, load_parser_catalog
+from musicpilot.adapters.indexers.gazelle import GazelleCrawler
 
 
 def test_load_parser_catalog_returns_empty_catalog_for_missing_file(tmp_path: Path) -> None:
@@ -45,3 +46,24 @@ sites:
 
     assert len(crawlers) == 1
     assert crawlers[0].name == "pt"
+
+
+def test_build_indexers_uses_gazelle_adapter(tmp_path: Path) -> None:
+    parser_path = tmp_path / "sites.parser.yaml"
+    parser_path.write_text(
+        """
+sites:
+  - name: DicMusic
+    base_url: https://dicmusic.local/
+    adapter: gazelle
+""",
+        encoding="utf-8",
+    )
+
+    crawlers = build_nexusphp_indexers(
+        [{"name": "DicMusic", "base_url": "https://dicmusic.local/", "cookie": "session=1"}],
+        load_parser_catalog(parser_path),
+    )
+
+    assert len(crawlers) == 1
+    assert isinstance(crawlers[0], GazelleCrawler)

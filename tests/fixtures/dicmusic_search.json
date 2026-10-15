@@ -1,0 +1,273 @@
+{
+ "status": "success",
+ "response": {
+  "currentPage": 1,
+  "pages": 1,
+  "results": [
+   {
+    "groupId": 145214,
+    "groupName": "Petalogy",
+    "artist": "Peta",
+    "cover": "https://img2.pixhost.to/images/8026/728376501_cover.png",
+    "tags": [
+     "pop"
+    ],
+    "bookmarked": false,
+    "vanityHouse": false,
+    "groupYear": 2011,
+    "releaseType": "专辑",
+    "groupTime": "1779242313",
+    "maxSize": 262343078,
+    "totalSnatched": 1,
+    "totalSeeders": 2,
+    "totalLeechers": 0,
+    "torrents": [
+     {
+      "torrentId": 198518,
+      "editionId": 1,
+      "artists": [
+       {
+        "id": 253962,
+        "name": "Peta",
+        "aliasid": 264480
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2011,
+      "remasterCatalogueNumber": "PETA-110",
+      "remasterTitle": "",
+      "media": "CD",
+      "encoding": "Lossless",
+      "format": "FLAC",
+      "hasLog": true,
+      "logScore": 100,
+      "hasCue": true,
+      "scene": false,
+      "jinzhuan": true,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 14,
+      "time": "2026-05-20 09:58:33",
+      "size": 262343078,
+      "snatches": 1,
+      "seeders": 2,
+      "leechers": 0,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     }
+    ]
+   },
+   {
+    "groupId": 148817,
+    "groupName": "Petals and Marbles",
+    "artist": "Miko",
+    "cover": "https://img.ptscreens.com/cover08db61ea61d5ddc6.jpg",
+    "tags": [
+     "electronic",
+     "ambient"
+    ],
+    "bookmarked": false,
+    "vanityHouse": false,
+    "groupYear": 2026,
+    "releaseType": "专辑",
+    "groupTime": "1783816236",
+    "maxSize": 312637042,
+    "totalSnatched": 2,
+    "totalSeeders": 4,
+    "totalLeechers": 0,
+    "torrents": [
+     {
+      "torrentId": 203847,
+      "editionId": 1,
+      "artists": [
+       {
+        "id": 16317,
+        "name": "Miko",
+        "aliasid": 17851
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2026,
+      "remasterCatalogueNumber": "RMSG028",
+      "remasterTitle": "",
+      "media": "WEB",
+      "encoding": "24bit Lossless",
+      "format": "FLAC",
+      "hasLog": false,
+      "logScore": 100,
+      "hasCue": false,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 10,
+      "time": "2026-07-12 08:30:32",
+      "size": 312637042,
+      "snatches": 1,
+      "seeders": 2,
+      "leechers": 0,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     },
+     {
+      "torrentId": 203848,
+      "editionId": 1,
+      "artists": [
+       {
+        "id": 16317,
+        "name": "Miko",
+        "aliasid": 17851
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2026,
+      "remasterCatalogueNumber": "RMSG028",
+      "remasterTitle": "",
+      "media": "WEB",
+      "encoding": "Lossless",
+      "format": "FLAC",
+      "hasLog": false,
+      "logScore": 100,
+      "hasCue": false,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 10,
+      "time": "2026-07-12 08:30:36",
+      "size": 147022627,
+      "snatches": 1,
+      "seeders": 2,
+      "leechers": 0,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     }
+    ]
+   },
+   {
+    "groupId": 149741,
+    "groupName": "petal",
+    "artist": "Ariana Grande",
+    "cover": "https://i.ibb.co/rKqYCWgD/cover.jpg",
+    "tags": [
+     "pop"
+    ],
+    "bookmarked": false,
+    "vanityHouse": false,
+    "groupYear": 2026,
+    "releaseType": "专辑",
+    "groupTime": "1785547324",
+    "maxSize": 246887002,
+    "totalSnatched": 8,
+    "totalSeeders": 5,
+    "totalLeechers": 0,
+    "torrents": [
+     {
+      "torrentId": 205171,
+      "editionId": 1,
+      "artists": [
+       {
+        "id": 97,
+        "name": "Ariana Grande",
+        "aliasid": 5677
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2026,
+      "remasterCatalogueNumber": "199957923651",
+      "remasterTitle": "",
+      "media": "CD",
+      "encoding": "Lossless",
+      "format": "FLAC",
+      "hasLog": true,
+      "logScore": 100,
+      "hasCue": true,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 15,
+      "time": "2026-08-01 09:22:04",
+      "size": 246887002,
+      "snatches": 8,
+      "seeders": 5,
+      "leechers": 0,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     }
+    ]
+   },
+   {
+    "groupId": 141345,
+    "groupName": "Petals",
+    "artist": "Orangestar (蜜柑星P)",
+    "cover": "https://ptpimg.me/7107h7.jpg",
+    "tags": [
+     "japanese",
+     "jpop",
+     "2020s",
+     "anime"
+    ],
+    "bookmarked": false,
+    "vanityHouse": false,
+    "groupYear": 2026,
+    "releaseType": "单曲专辑",
+    "groupTime": "1775493544",
+    "maxSize": 54604518,
+    "totalSnatched": 0,
+    "totalSeeders": 1,
+    "totalLeechers": 0,
+    "torrents": [
+     {
+      "torrentId": 192485,
+      "editionId": 1,
+      "artists": [
+       {
+        "id": 6025,
+        "name": "Orangestar (蜜柑星P)",
+        "aliasid": 76872
+       }
+      ],
+      "remastered": true,
+      "remasterYear": 2026,
+      "remasterCatalogueNumber": "Orangestar-001",
+      "remasterTitle": "",
+      "media": "WEB",
+      "encoding": "24bit Lossless",
+      "format": "FLAC",
+      "hasLog": false,
+      "logScore": 100,
+      "hasCue": false,
+      "scene": false,
+      "jinzhuan": false,
+      "logchecksum": true,
+      "vanityHouse": false,
+      "fileCount": 2,
+      "time": "2026-04-07 00:39:04",
+      "size": 54604518,
+      "snatches": 0,
+      "seeders": 1,
+      "leechers": 0,
+      "isFreeleech": false,
+      "isNeutralLeech": false,
+      "isPersonalFreeleech": false,
+      "canUseToken": true,
+      "hasSnatched": false
+     }
+    ]
+   }
+  ]
+ }
+}
