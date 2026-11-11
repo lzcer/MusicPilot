@@ -2521,6 +2521,20 @@ class SqlAlchemyMediaRepository:
             result = await session.execute(select(MediaFile).order_by(MediaFile.id.desc()))
             return list(result.scalars().all())
 
+    async def list_download_scraping_results(
+        self, torrent_hash: str, task_created_at: datetime
+    ) -> list[MediaFile]:
+        async with self.database.session() as session:
+            result = await session.execute(
+                select(MediaFile)
+                .where(
+                    MediaFile.torrent_hash == torrent_hash,
+                    MediaFile.updated_at >= task_created_at,
+                )
+                .order_by(MediaFile.id)
+            )
+            return list(result.scalars().all())
+
     async def list_media_files_page(
         self,
         *,

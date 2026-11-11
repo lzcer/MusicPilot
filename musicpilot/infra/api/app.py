@@ -290,6 +290,7 @@ LIBRARY_STORAGE_REFRESH_INTERVAL_SECONDS = 30 * 60
 MUSIC_LIBRARY_SYNC_AFTER_REFRESH_DELAY_SECONDS = 5
 MUSIC_LIBRARY_SYNC_MAX_PAGES = 10_000
 DIRECTORY_LIBRARY_NOTIFICATION_MAX_CHARS = 3500
+DOWNLOAD_LIBRARY_NOTIFICATION_TRACK_LIMIT = 10
 SLOW_API_OPERATION_SECONDS = float(os.getenv("MP_SLOW_API_OPERATION_SECONDS", "0.5"))
 SYSTEM_SECRET_MASK = "••••••••"
 PLAYLIST_TRACK_RETRYABLE_STATUSES = {
@@ -383,6 +384,14 @@ class DirectoryLibraryNotificationItem:
     artist: str
     album: str
     refreshed_at: datetime
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class DownloadLibraryNotificationSummary:
+    succeeded: int = 0
+    failed: int = 0
+    skipped: int = 0
+    tracks: tuple[tuple[str, str | None, str | None], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -11478,6 +11487,19 @@ async def _refresh_library_for_task(
             "WARNING",
         )
         return
+    notification = (
+        _download_library_notification_summary(
+            (
+                item.status,
+                (item.metadata.title or "").strip() or item.source_path.name,
+                item.metadata.artist,
+                item.metadata.album,
+            )
+            for item in summary.results
+        )
+        if summary is not None
+        else None
+    )
     if (
         summary is not None
         and not summary.mapped_files
@@ -11495,11 +11517,13 @@ async def _refresh_library_for_task(
         )
         if refreshed is not None:
             await _sync_playlist_tracks_for_download_task(state, refreshed)
-        await _send_event_notifications(state, "library", refreshed or task)
+        await _send_event_notifications(state, "library", refreshed or task, notification)
         return
     server = await state.repository.default_media_server()
     if server is None:
-        if await _finish_download_with_skipped_library_refresh_if_disabled(state, task):
+        if await _finish_download_with_skipped_library_refresh_if_disabled(
+            state, task, notification
+        ):
             return
         failed = await state.repository.update_download_task(
             task.id,
@@ -11542,7 +11566,7 @@ async def _refresh_library_for_task(
     )
     state._background_tasks.add(_fire_sync)
     _fire_sync.add_done_callback(state._background_tasks.discard)
-    await _send_event_notifications(state, "library", refreshed or task)
+    await _send_event_notifications(state, "library", refreshed or task, notification)
 
 
 async def _scrape_download_for_task(
@@ -11896,6 +11920,7 @@ async def _scraping_library_snapshots(
 async def _finish_download_with_skipped_library_refresh_if_disabled(
     state: AppState,
     task: TorrentRecord,
+    notification: DownloadLibraryNotificationSummary | None,
 ) -> bool:
     servers = await state.repository.list_media_servers()
     if not servers or any(server.enabled for server in servers):
@@ -11910,7 +11935,7 @@ async def _finish_download_with_skipped_library_refresh_if_disabled(
         "library",
         f"Library refresh skipped for {task.name}: media server is disabled.",
     )
-    await _send_event_notifications(state, "library", skipped or task)
+    await _send_event_notifications(state, "library", skipped or task, notification)
     return True
 
 
@@ -11968,8 +11993,17 @@ async def _finalize_download_refresh_if_ready_direct(
         return
     if any(item.status not in DOWNLOAD_ITEM_ORGANIZE_TERMINAL_STATUSES for item in items):
         return
-    organized_count = sum(1 for item in items if item.status == "organized")
-    if organized_count <= 0:
+    statuses = {"organized": "success", "organize_failed": "failed", "organize_skipped": "skipped"}
+    notification = _download_library_notification_summary(
+        (
+            statuses[item.status],
+            (item.metadata_title or "").strip() or item.file_name,
+            item.metadata_artist or item.artist,
+            item.metadata_album,
+        )
+        for item in items
+    )
+    if not notification.succeeded:
         state.add_log(
             "library",
             f"Library refresh skipped for {task.name}: no files transferred.",
@@ -11981,11 +12015,13 @@ async def _finalize_download_refresh_if_ready_direct(
         )
         if refreshed is not None:
             await _sync_playlist_tracks_for_download_task(state, refreshed)
-        await _send_event_notifications(state, "library", refreshed or task)
+        await _send_event_notifications(state, "library", refreshed or task, notification)
         return
     server = await state.repository.default_media_server()
     if server is None:
-        if await _finish_download_with_skipped_library_refresh_if_disabled(state, task):
+        if await _finish_download_with_skipped_library_refresh_if_disabled(
+            state, task, notification
+        ):
             return
         failed = await state.repository.update_download_task(
             task.id,
@@ -12028,7 +12064,7 @@ async def _finalize_download_refresh_if_ready_direct(
     )
     state._background_tasks.add(_fire_sync)
     _fire_sync.add_done_callback(state._background_tasks.discard)
-    await _send_event_notifications(state, "library", refreshed or task)
+    await _send_event_notifications(state, "library", refreshed or task, notification)
 
 
 async def _scraping_source_files_for_task(
@@ -12474,9 +12510,9 @@ def _directory_library_notification_body(
     shown = 0
     for index, item in enumerate(items, start=1):
         line = (
-            f"{index}. {_directory_notification_value(item.title, 120)} - "
-            f"{_directory_notification_value(item.artist, 80)}"
-            f"（{_directory_notification_value(item.album, 80)}）"
+            f"{index}. {_bounded_notification_value(item.title, 120)} - "
+            f"{_bounded_notification_value(item.artist, 80)}"
+            f"（{_bounded_notification_value(item.album, 80)}）"
         )
         remaining = len(items) - index
         tail = [f"另有 {remaining} 个文件"] if remaining else []
@@ -12491,7 +12527,7 @@ def _directory_library_notification_body(
     return "\n".join(lines)
 
 
-def _directory_notification_value(value: str, max_length: int) -> str:
+def _bounded_notification_value(value: str, max_length: int) -> str:
     text = value.strip() or "-"
     if len(text) > max_length:
         text = f"{text[: max_length - 1]}…"
@@ -12548,6 +12584,7 @@ async def _send_event_notifications(
     state: AppState,
     event_name: str,
     task: TorrentRecord | None,
+    library_summary: DownloadLibraryNotificationSummary | None = None,
 ) -> None:
     if task is None:
         return
@@ -12565,7 +12602,6 @@ async def _send_event_notifications(
     if not enabled:
         return
     title = "MusicPilot 已提交下载" if event_name == "download" else "MusicPilot 媒体库已刷新"
-    text = _notification_body(event_name, task)
     system_settings = await state.repository.get_system_settings()
     notifiers: list[tuple[str, bool, str, TelegramHttpNotifier]] = []
     for item in enabled:
@@ -12592,6 +12628,12 @@ async def _send_event_notifications(
         )
     if not notifiers:
         return
+    if event_name == "download":
+        text = _download_notification_body(task)
+    else:
+        if library_summary is None:
+            library_summary = await _saved_download_library_notification_summary(state, task)
+        text = _library_notification_body(task, library_summary)
     event = NotifyEvent(title=title, text=text)
     send_started_at = time.perf_counter()
     results = await asyncio.gather(
@@ -12663,10 +12705,40 @@ async def _send_directory_monitor_failure_notification(
         )
 
 
-def _notification_body(event_name: str, task: TorrentRecord) -> str:
-    if event_name == "download":
-        return _download_notification_body(task)
-    return _library_notification_body(task)
+def _download_library_notification_summary(
+    results: Iterable[tuple[str, str, str | None, str | None]],
+) -> DownloadLibraryNotificationSummary:
+    counts: Counter[str] = Counter()
+    tracks: list[tuple[str, str | None, str | None]] = []
+    for status, title, artist, album in results:
+        counts[status] += 1
+        if status == "success" and len(tracks) < DOWNLOAD_LIBRARY_NOTIFICATION_TRACK_LIMIT:
+            tracks.append((title, artist, album))
+    return DownloadLibraryNotificationSummary(
+        succeeded=counts["success"],
+        failed=counts["failed"],
+        skipped=counts["skipped"],
+        tracks=tuple(tracks),
+    )
+
+
+async def _saved_download_library_notification_summary(
+    state: AppState, task: TorrentRecord
+) -> DownloadLibraryNotificationSummary:
+    if not task.torrent_hash or not (task.payload or {}).get("scraping_completed"):
+        return DownloadLibraryNotificationSummary()
+    results = await state.repository.list_download_scraping_results(
+        task.torrent_hash, task.created_at
+    )
+    return _download_library_notification_summary(
+        (
+            item.status,
+            (item.title or "").strip() or Path(item.source_path).name,
+            item.artist,
+            item.album,
+        )
+        for item in results
+    )
 
 
 def _download_notification_body(task: TorrentRecord) -> str:
@@ -12682,15 +12754,33 @@ def _download_notification_body(task: TorrentRecord) -> str:
     )
 
 
-def _library_notification_body(task: TorrentRecord) -> str:
+def _library_notification_body(
+    task: TorrentRecord, summary: DownloadLibraryNotificationSummary
+) -> str:
     resource = task.resource_payload or {}
-    return "\n".join(
-        [
-            _notification_line("种子名称", task.name),
-            _notification_line("大小", _format_size_bytes(resource.get("size_bytes"))),
-            _notification_line("入库时间", _format_datetime(task.library_refreshed_at)),
-        ]
-    )
+    lines = [
+        _notification_line("种子名称", task.name),
+        _notification_line("大小", _format_size_bytes(resource.get("size_bytes"))),
+        _notification_line("入库时间", _format_datetime(task.library_refreshed_at)),
+        _notification_line("入库歌曲数量", f"{summary.succeeded} 首"),
+        _notification_line("失败", f"{summary.failed} 首"),
+        _notification_line("跳过", f"{summary.skipped} 首"),
+    ]
+    if summary.tracks:
+        lines.append("<b>歌曲列表：</b>")
+        for index, (title, artist, album) in enumerate(summary.tracks, start=1):
+            lines.append(
+                f"{index}. {_download_notification_track_value(title, 72)} - "
+                f"{_download_notification_track_value(artist, 32)}"
+                f"（{_download_notification_track_value(album, 32)}）"
+            )
+        if summary.succeeded > len(summary.tracks):
+            lines.append("...")
+    return "\n".join(lines)
+
+
+def _download_notification_track_value(value: str | None, max_length: int) -> str:
+    return _bounded_notification_value(" ".join((value or "").split()), max_length)
 
 
 def _notification_line(label: str, value: object) -> str:
