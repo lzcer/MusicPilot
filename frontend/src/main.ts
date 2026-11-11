@@ -5,6 +5,7 @@ import {
   VAppBar,
   VAppBarNavIcon,
   VAlert,
+  VAutocomplete,
   VBtn,
   VCard,
   VCardActions,
@@ -52,6 +53,7 @@ const vuetify = createVuetify({
     VAppBar,
     VAppBarNavIcon,
     VAlert,
+    VAutocomplete,
     VBtn,
     VCard,
     VCardActions,
@@ -114,6 +116,7 @@ const vuetify = createVuetify({
     VCard: { rounded: 'lg', elevation: 0 },
     VTextField: { variant: 'outlined', density: 'compact' },
     VTextarea: { variant: 'outlined', density: 'compact' },
+    VAutocomplete: { variant: 'outlined', density: 'compact' },
     VSelect: { variant: 'outlined', density: 'compact' }
   }
 })

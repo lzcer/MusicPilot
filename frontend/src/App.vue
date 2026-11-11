@@ -302,6 +302,26 @@ type MusicLibraryTrackPageResponse = PageResponse<MusicLibraryTrack> & {
   stats: MusicLibraryStats
 }
 
+type PlaylistTrackSource =
+  | { source: 'library'; library_track_id: string }
+  | {
+      source: 'network'
+      provider: string
+      external_id: string
+      title: string
+      artist?: string | null
+      album?: string | null
+      cover_url?: string | null
+    }
+
+type PlaylistAddCandidate = {
+  key: string
+  title: string
+  artist?: string | null
+  album?: string | null
+  payload: PlaylistTrackSource
+}
+
 type DashboardDownloadItem = {
   id?: number | null
   name: string
@@ -831,6 +851,8 @@ const playlistTrackLibraryStatus = ref<'all' | 'yes' | 'no'>('all')
 const playlistTrackPage = ref(1)
 const playlistTrackPageSize = ref(20)
 const playlistTrackTotal = ref(0)
+const locatedPlaylistTrackId = ref<number | null>(null)
+let playlistTrackRequestId = 0
 
 const siteDialog = ref(false)
 const downloaderDialog = ref(false)
@@ -840,6 +862,31 @@ const musicPlatformDialog = ref(false)
 const playlistImportDialog = ref(false)
 const playlistTracksDialog = ref(false)
 const playlistTrackEditDialog = ref(false)
+const libraryPlaylistDialog = ref(false)
+const libraryPlaylistTrack = ref<MusicLibraryTrack | null>(null)
+const libraryPlaylistId = ref<number | null>(null)
+const libraryPlaylistSaving = ref(false)
+const libraryPlaylistDuplicate = ref<PlaylistTrack | null>(null)
+const libraryDeleteTrack = ref<MusicLibraryTrack | null>(null)
+const libraryDeleteDialog = ref(false)
+const libraryDeleting = ref(false)
+const playlistAddDialog = ref(false)
+const playlistAddSource = ref<PlaylistTrackSource['source']>('library')
+const playlistAddQuery = ref('')
+const playlistAddArtist = ref('')
+const playlistAddSearch = ref({ query: '', artist: '' })
+const playlistAddCandidates = ref<PlaylistAddCandidate[]>([])
+const playlistAddPage = ref(1)
+const playlistAddTotal = ref(0)
+const playlistAddNextOffset = ref<number | null>(null)
+const playlistAddLoading = ref(false)
+const playlistAddSearched = ref(false)
+const playlistAddSavingKey = ref<string | null>(null)
+const playlistAddedKeys = ref(new Set<string>())
+const playlistAddDuplicates = ref(new Map<string, PlaylistTrack>())
+const playlistAddDuplicate = ref<PlaylistTrack | null>(null)
+const playlistAddPageSize = 20
+let playlistAddSearchGeneration = 0
 const deleteDialog = ref(false)
 const downloadItemsDialog = ref(false)
 const systemTasksLoading = ref(false)
@@ -1797,21 +1844,25 @@ async function runSearch() {
 }
 
 async function loadMetadataCandidatePage(offset: number, generation: number) {
-  const params = new URLSearchParams({
-    query: metadataSearchQuery.value,
-    offset: String(offset)
-  })
-  if (metadataSearchArtist.value) {
-    params.set('artist', metadataSearchArtist.value)
-  }
-  const response = await api<MetadataCandidatePageResponse>(
-    `/api/metadata/search?${params.toString()}`
+  const response = await fetchMetadataCandidatePage(
+    metadataSearchQuery.value,
+    metadataSearchArtist.value,
+    offset
   )
   if (generation !== metadataSearchGeneration) return 0
   const added = mergeMetadataCandidates(response.candidates)
   metadataNextOffset.value = response.next_offset ?? null
   metadataHasMore.value = response.has_more && metadataNextOffset.value !== null
   return added
+}
+
+function fetchMetadataCandidatePage(query: string, artist: string, offset: number) {
+  const params = new URLSearchParams({
+    query,
+    offset: String(offset)
+  })
+  if (artist) params.set('artist', artist)
+  return api<MetadataCandidatePageResponse>(`/api/metadata/search?${params.toString()}`)
 }
 
 function mergeMetadataCandidates(incoming: MediaCandidate[]) {
@@ -2880,17 +2931,17 @@ function changeFileRootType(value: unknown) {
   void loadFiles('')
 }
 
+function fetchMusicLibraryPage(page: number, pageSize: number, query: string) {
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
+  if (query) params.set('q', query)
+  return api<MusicLibraryTrackPageResponse>(`/api/music-library?${params.toString()}`)
+}
+
 async function loadMusicLibrary() {
   musicLibraryLoading.value = true
   try {
-    const params = new URLSearchParams({
-      page: String(musicLibraryPage.value),
-      page_size: String(musicLibraryPageSize.value)
-    })
-    const query = trimmedInput(musicLibraryQuery.value)
-    if (query) params.set('q', query)
-    const response = await api<MusicLibraryTrackPageResponse>(
-      `/api/music-library?${params.toString()}`
+    const response = await fetchMusicLibraryPage(
+      musicLibraryPage.value, musicLibraryPageSize.value, trimmedInput(musicLibraryQuery.value)
     )
     applyMusicLibraryResponse(response)
   } catch (error) {
@@ -2911,6 +2962,59 @@ function applyMusicLibraryResponse(response: MusicLibraryTrackPageResponse) {
 function applyMusicLibraryFilters() {
   musicLibraryPage.value = 1
   void loadMusicLibrary()
+}
+
+function openLibraryPlaylistDialog(track: MusicLibraryTrack) {
+  libraryPlaylistTrack.value = track
+  libraryPlaylistId.value = null
+  libraryPlaylistDuplicate.value = null
+  libraryPlaylistDialog.value = true
+  void loadPlaylists()
+}
+
+async function addLibraryTrackToPlaylist() {
+  const track = libraryPlaylistTrack.value
+  const playlistId = libraryPlaylistId.value
+  if (!track || playlistId === null || libraryPlaylistSaving.value) return
+  libraryPlaylistSaving.value = true
+  try {
+    const result = await appendTrackToPlaylist(playlistId, {
+      source: 'library',
+      library_track_id: track.id
+    })
+    if (result.added) {
+      libraryPlaylistDialog.value = false
+    } else {
+      libraryPlaylistDuplicate.value = result.track
+    }
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '添加歌曲失败', 'error')
+  } finally {
+    libraryPlaylistSaving.value = false
+  }
+}
+
+function openLibraryDeleteDialog(track: MusicLibraryTrack) {
+  libraryDeleteTrack.value = track
+  libraryDeleteDialog.value = true
+}
+
+async function deleteLibraryTrack() {
+  const track = libraryDeleteTrack.value
+  if (!track || libraryDeleting.value) return
+  libraryDeleting.value = true
+  try {
+    await apiNoContent(`/api/music-library/${encodeURIComponent(track.id)}`, { method: 'DELETE' })
+    libraryDeleteDialog.value = false
+    const remainingPages = Math.max(1, Math.ceil((musicLibraryTotal.value - 1) / musicLibraryPageSize.value))
+    musicLibraryPage.value = Math.min(musicLibraryPage.value, remainingPages)
+    await loadMusicLibrary()
+    notify('已删除音乐库歌曲')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '删除音乐库歌曲失败', 'error')
+  } finally {
+    libraryDeleting.value = false
+  }
 }
 
 async function syncMusicLibrary() {
@@ -3254,7 +3358,7 @@ async function importSelectedPlaylists() {
   }
 }
 
-async function viewPlaylist(playlist: Playlist) {
+async function viewPlaylist(playlist: Playlist, trackId: number | null = null) {
   selectedPlaylist.value = playlist
   playlistTracks.value = []
   playlistTrackTitleQuery.value = ''
@@ -3263,49 +3367,195 @@ async function viewPlaylist(playlist: Playlist) {
   playlistTrackLibraryStatus.value = 'all'
   playlistTrackPage.value = 1
   playlistTrackTotal.value = 0
+  locatedPlaylistTrackId.value = trackId
   playlistTracksDialog.value = true
   await loadPlaylistTracks(playlist)
 }
 
 async function loadPlaylistTracks(playlist: Playlist) {
+  const requestId = ++playlistTrackRequestId
   playlistTrackLoading.value = true
   try {
     const params = new URLSearchParams({
       page: String(playlistTrackPage.value),
       page_size: String(playlistTrackPageSize.value)
     })
-    const titleQuery = trimmedInput(playlistTrackTitleQuery.value)
-    const artistQuery = trimmedInput(playlistTrackArtistQuery.value)
-    if (titleQuery) {
-      params.set('title', titleQuery)
-    }
-    if (artistQuery) {
-      params.set('artist', artistQuery)
-    }
-    if (playlistTrackDownloadStatus.value) {
-      params.set('download_status', playlistTrackDownloadStatus.value)
-    }
-    if (playlistTrackLibraryStatus.value !== 'all') {
-      params.set('exists_in_library', playlistTrackLibraryStatus.value === 'yes' ? 'true' : 'false')
+    if (locatedPlaylistTrackId.value !== null) {
+      params.set('track_id', String(locatedPlaylistTrackId.value))
+    } else {
+      const titleQuery = trimmedInput(playlistTrackTitleQuery.value)
+      const artistQuery = trimmedInput(playlistTrackArtistQuery.value)
+      if (titleQuery) params.set('title', titleQuery)
+      if (artistQuery) params.set('artist', artistQuery)
+      if (playlistTrackDownloadStatus.value) {
+        params.set('download_status', playlistTrackDownloadStatus.value)
+      }
+      if (playlistTrackLibraryStatus.value !== 'all') {
+        params.set('exists_in_library', playlistTrackLibraryStatus.value === 'yes' ? 'true' : 'false')
+      }
     }
     const response = await api<PageResponse<PlaylistTrack>>(
       `/api/playlists/${playlist.id}/tracks?${params.toString()}`
     )
+    if (requestId !== playlistTrackRequestId) return
     playlistTracks.value = response.items
     playlistTrackTotal.value = response.total
     playlistTrackPage.value = response.page
     playlistTrackPageSize.value = response.page_size
   } catch (error) {
-    notify(error instanceof Error ? error.message : '歌单明细加载失败', 'error')
+    if (requestId === playlistTrackRequestId) {
+      notify(error instanceof Error ? error.message : '歌单明细加载失败', 'error')
+    }
   } finally {
-    playlistTrackLoading.value = false
+    if (requestId === playlistTrackRequestId) playlistTrackLoading.value = false
   }
 }
 
 function applyPlaylistTrackFilters() {
+  locatedPlaylistTrackId.value = null
   playlistTrackPage.value = 1
   if (selectedPlaylist.value) {
     void loadPlaylistTracks(selectedPlaylist.value)
+  }
+}
+
+async function appendTrackToPlaylist(playlistId: number, payload: PlaylistTrackSource) {
+  const result = await api<{ added: boolean; track: PlaylistTrack }>(`/api/playlists/${playlistId}/tracks`, {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  })
+  if (result.added) {
+    notify('已加入歌单')
+    void loadPlaylists()
+    if (playlistTracksDialog.value && selectedPlaylist.value?.id === playlistId) {
+      void loadPlaylistTracks(selectedPlaylist.value)
+    }
+  }
+  return result
+}
+
+function playlistTrackLabel(track: PlaylistTrack) {
+  return [track.title, track.artist, track.album].filter(Boolean).join(' · ')
+}
+
+function locatePlaylistTrack(track: PlaylistTrack) {
+  const playlist = selectedPlaylist.value?.id === track.playlist_id
+    ? selectedPlaylist.value
+    : playlists.value.find((item) => item.id === track.playlist_id)
+  if (!playlist) {
+    notify('找不到该歌单，请刷新后重试', 'warning')
+    return
+  }
+  libraryPlaylistDialog.value = false
+  playlistAddDialog.value = false
+  void viewPlaylist(playlist, track.id)
+}
+
+function openPlaylistAddDialog(source: PlaylistTrackSource['source']) {
+  ++playlistAddSearchGeneration
+  playlistAddSource.value = source
+  playlistAddQuery.value = ''
+  playlistAddArtist.value = ''
+  playlistAddSearch.value = { query: '', artist: '' }
+  playlistAddCandidates.value = []
+  playlistAddPage.value = 1
+  playlistAddTotal.value = 0
+  playlistAddNextOffset.value = null
+  playlistAddLoading.value = false
+  playlistAddSearched.value = false
+  playlistAddedKeys.value.clear()
+  playlistAddDuplicates.value.clear()
+  playlistAddDuplicate.value = null
+  playlistAddDialog.value = true
+  if (source === 'library') searchPlaylistAddCandidates()
+}
+
+function searchPlaylistAddCandidates() {
+  const query = trimmedInput(playlistAddQuery.value)
+  const artist = trimmedInput(playlistAddArtist.value)
+  if (playlistAddSource.value === 'network' && !query && !artist) return
+  playlistAddSearch.value = { query, artist }
+  playlistAddCandidates.value = []
+  playlistAddNextOffset.value = null
+  playlistAddTotal.value = 0
+  playlistAddPage.value = 1
+  void loadPlaylistAddCandidates()
+}
+
+async function loadPlaylistAddCandidates(offset = 0) {
+  const generation = ++playlistAddSearchGeneration
+  const { query, artist } = playlistAddSearch.value
+  playlistAddLoading.value = true
+  playlistAddSearched.value = true
+  try {
+    if (playlistAddSource.value === 'library') {
+      const response = await fetchMusicLibraryPage(playlistAddPage.value, playlistAddPageSize, query)
+      if (generation !== playlistAddSearchGeneration) return
+      playlistAddTotal.value = response.total
+      playlistAddCandidates.value = response.items.map((track) => ({
+        key: track.id,
+        title: track.title,
+        artist: track.artist,
+        album: track.album,
+        payload: { source: 'library', library_track_id: track.id }
+      }))
+    } else {
+      const response = await fetchMetadataCandidatePage(query, artist, offset)
+      if (generation !== playlistAddSearchGeneration) return
+      const knownKeys = new Set(playlistAddCandidates.value.map((candidate) => candidate.key))
+      for (const track of response.candidates) {
+        const key = metadataCandidateGroupKey(track)
+        if (knownKeys.has(key)) continue
+        knownKeys.add(key)
+        playlistAddCandidates.value.push({
+          key,
+          title: track.title,
+          artist: track.artist,
+          album: track.album,
+          payload: {
+            source: 'network',
+            provider: track.source,
+            external_id: track.external_id,
+            title: track.title,
+            artist: track.artist,
+            album: track.album,
+            cover_url: track.cover_url
+          }
+        })
+      }
+      playlistAddNextOffset.value = response.has_more ? response.next_offset ?? null : null
+    }
+  } catch (error) {
+    if (generation === playlistAddSearchGeneration) {
+      notify(error instanceof Error ? error.message : '歌曲搜索失败', 'error')
+    }
+  } finally {
+    if (generation === playlistAddSearchGeneration) playlistAddLoading.value = false
+  }
+}
+
+async function addPlaylistCandidate(candidate: PlaylistAddCandidate) {
+  const playlist = selectedPlaylist.value
+  if (!playlist || playlistAddSavingKey.value || playlistAddedKeys.value.has(candidate.key)) return
+  const duplicate = playlistAddDuplicates.value.get(candidate.key)
+  if (duplicate) {
+    playlistAddDuplicate.value = duplicate
+    return
+  }
+  playlistAddDuplicate.value = null
+  playlistAddSavingKey.value = candidate.key
+  try {
+    const result = await appendTrackToPlaylist(playlist.id, candidate.payload)
+    if (result.added) {
+      playlistAddedKeys.value.add(candidate.key)
+    } else {
+      playlistAddDuplicates.value.set(candidate.key, result.track)
+      playlistAddDuplicate.value = result.track
+    }
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '添加歌曲失败', 'error')
+  } finally {
+    playlistAddSavingKey.value = null
   }
 }
 
@@ -5979,28 +6229,50 @@ onUnmounted(() => {
             </div>
             <v-card>
               <v-progress-linear v-if="musicLibraryLoading" indeterminate color="primary" />
-              <v-table>
+              <v-table class="music-library-table fixed-table">
                 <thead>
                   <tr>
                     <th>标题</th>
                     <th>艺人</th>
                     <th>专辑</th>
-                    <th>时长</th>
-                    <th>大小</th>
-                    <th>年份</th>
+                    <th class="library-track-detail-col">时长</th>
+                    <th class="library-track-detail-col">大小</th>
+                    <th class="library-track-detail-col">年份</th>
+                    <th class="sticky-action-col library-track-action-col">操作</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr v-if="!musicLibraryTracks.length">
-                    <td colspan="6" class="empty-cell">暂无音乐库记录</td>
+                    <td colspan="7" class="empty-cell">暂无音乐库记录</td>
                   </tr>
                   <tr v-for="track in musicLibraryTracks" :key="track.id">
-                    <td>{{ track.title || '-' }}</td>
-                    <td>{{ track.artist || '-' }}</td>
-                    <td>{{ track.album || '-' }}</td>
+                    <td class="truncate-cell" :title="track.title">{{ track.title || '-' }}</td>
+                    <td class="truncate-cell" :title="track.artist ?? undefined">{{ track.artist || '-' }}</td>
+                    <td class="truncate-cell" :title="track.album ?? undefined">{{ track.album || '-' }}</td>
                     <td>{{ formatDuration(track.duration) }}</td>
                     <td>{{ formatSize(track.size) }}</td>
                     <td>{{ track.year || '-' }}</td>
+                    <td class="sticky-action-col library-track-action-col">
+                      <div class="d-flex justify-center ga-1">
+                        <v-btn
+                          icon="mdi-playlist-plus"
+                          variant="text"
+                          size="small"
+                          title="加入歌单"
+                          aria-label="加入歌单"
+                          @click="openLibraryPlaylistDialog(track)"
+                        />
+                        <v-btn
+                          icon="mdi-delete-outline"
+                          variant="text"
+                          size="small"
+                          color="error"
+                          title="删除歌曲"
+                          aria-label="删除歌曲"
+                          @click="openLibraryDeleteDialog(track)"
+                        />
+                      </div>
+                    </td>
                   </tr>
                 </tbody>
               </v-table>
@@ -7297,6 +7569,31 @@ onUnmounted(() => {
         <v-card-title class="d-flex align-center ga-2">
           <span class="text-truncate">{{ selectedPlaylist ? selectedPlaylist.name : '歌单明细' }}</span>
           <v-spacer />
+          <v-menu>
+            <template #activator="{ props }">
+              <v-btn
+                v-bind="props"
+                prepend-icon="mdi-plus"
+                variant="tonal"
+                size="small"
+                :disabled="!selectedPlaylist"
+              >
+                添加
+              </v-btn>
+            </template>
+            <v-list density="compact">
+              <v-list-item
+                prepend-icon="mdi-music-circle-outline"
+                title="从音乐库添加"
+                @click="openPlaylistAddDialog('library')"
+              />
+              <v-list-item
+                prepend-icon="mdi-web"
+                title="从网络添加"
+                @click="openPlaylistAddDialog('network')"
+              />
+            </v-list>
+          </v-menu>
           <v-btn
             prepend-icon="mdi-download-multiple"
             variant="tonal"
@@ -7365,6 +7662,14 @@ onUnmounted(() => {
               查询
             </v-btn>
           </div>
+          <v-alert v-if="locatedPlaylistTrackId !== null" color="primary" variant="tonal" density="compact" class="mb-3">
+            <div class="d-flex align-center justify-space-between flex-wrap ga-2">
+              <span>正在查看定位到的曲目</span>
+              <v-btn variant="text" size="small" @click="selectedPlaylist && viewPlaylist(selectedPlaylist)">
+                显示全部曲目
+              </v-btn>
+            </div>
+          </v-alert>
           <v-progress-linear v-if="playlistTrackLoading" indeterminate color="primary" />
           <ScrollableTable class="playlist-track-table fixed-table" :min-width="1180">
             <thead>
@@ -7381,7 +7686,9 @@ onUnmounted(() => {
             </thead>
             <tbody>
               <tr v-if="!playlistTracks.length && !playlistTrackLoading">
-                <td colspan="8" class="empty-cell">暂无歌曲</td>
+                <td colspan="8" class="empty-cell">
+                  {{ locatedPlaylistTrackId === null ? '暂无歌曲' : '该曲目已不在歌单中' }}
+                </td>
               </tr>
               <tr v-for="track in playlistTracks" :key="track.id">
                 <td>{{ track.position }}</td>
@@ -7454,6 +7761,158 @@ onUnmounted(() => {
         <v-card-actions>
           <v-spacer />
           <v-btn variant="text" @click="playlistTracksDialog = false">关闭</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="libraryPlaylistDialog" :persistent="libraryPlaylistSaving" max-width="480">
+      <v-card title="加入歌单">
+        <v-card-text class="dialog-stack">
+          <div>{{ libraryPlaylistTrack?.title }}<span v-if="libraryPlaylistTrack?.artist"> · {{ libraryPlaylistTrack.artist }}</span></div>
+          <v-autocomplete
+            v-model="libraryPlaylistId"
+            :items="playlists"
+            item-title="name"
+            item-value="id"
+            label="选择歌单"
+            no-data-text="暂无歌单"
+            :loading="playlistLoading"
+            :disabled="libraryPlaylistSaving"
+            hide-details
+            @update:model-value="libraryPlaylistDuplicate = null"
+          />
+          <v-alert v-if="libraryPlaylistDuplicate" color="primary" variant="tonal" density="compact">
+            <div class="d-flex align-center justify-space-between flex-wrap ga-2">
+              <span>歌单中已存在：{{ playlistTrackLabel(libraryPlaylistDuplicate) }}</span>
+              <v-btn variant="text" size="small" @click="locatePlaylistTrack(libraryPlaylistDuplicate)">
+                在歌单中查看
+              </v-btn>
+            </div>
+          </v-alert>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="libraryPlaylistSaving" @click="libraryPlaylistDialog = false">取消</v-btn>
+          <v-btn
+            color="primary"
+            :loading="libraryPlaylistSaving"
+            :disabled="libraryPlaylistId === null || playlistLoading"
+            @click="addLibraryTrackToPlaylist"
+          >
+            添加
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="libraryDeleteDialog" :persistent="libraryDeleting" max-width="480">
+      <v-card title="删除音乐库歌曲">
+        <v-card-text>
+          <p>将永久删除音乐库中《{{ libraryDeleteTrack?.title }}》的文件。</p>
+          <p class="mt-2">歌单里的曲目会保留。此操作不可恢复。</p>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="libraryDeleting" @click="libraryDeleteDialog = false">取消</v-btn>
+          <v-btn color="error" :loading="libraryDeleting" @click="deleteLibraryTrack">删除</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="playlistAddDialog" :persistent="playlistAddSavingKey !== null" max-width="820">
+      <v-card :title="playlistAddSource === 'library' ? '从音乐库添加' : '从网络添加'">
+        <v-card-text>
+          <v-form class="toolbar-row dialog-filter-row" @submit.prevent="searchPlaylistAddCandidates">
+            <v-text-field
+              v-model="playlistAddQuery"
+              :label="playlistAddSource === 'library' ? '歌名、歌手或专辑' : '歌名'"
+              prepend-inner-icon="mdi-magnify"
+              density="compact"
+              hide-details
+              clearable
+            />
+            <v-text-field
+              v-if="playlistAddSource === 'network'"
+              v-model="playlistAddArtist"
+              label="歌手"
+              density="compact"
+              hide-details
+              clearable
+            />
+            <v-btn
+              type="submit"
+              variant="tonal"
+              :disabled="playlistAddSource === 'network' && !trimmedInput(playlistAddQuery) && !trimmedInput(playlistAddArtist)"
+            >
+              搜索
+            </v-btn>
+          </v-form>
+          <v-alert v-if="playlistAddDuplicate" color="primary" variant="tonal" density="compact" class="mb-3">
+            <div class="d-flex align-center justify-space-between flex-wrap ga-2">
+              <span>歌单中已存在：{{ playlistTrackLabel(playlistAddDuplicate) }}</span>
+              <v-btn variant="text" size="small" @click="locatePlaylistTrack(playlistAddDuplicate)">
+                在歌单中查看
+              </v-btn>
+            </div>
+          </v-alert>
+          <v-progress-linear v-if="playlistAddLoading" indeterminate color="primary" />
+          <v-table class="playlist-add-table fixed-table" fixed-header height="min(48vh, 420px)" density="compact">
+            <thead>
+              <tr>
+                <th>歌名</th>
+                <th>歌手</th>
+                <th>专辑</th>
+                <th class="sticky-action-col playlist-add-action-col">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="candidate in playlistAddCandidates" :key="candidate.key">
+                <td class="truncate-cell" :title="candidate.title">{{ candidate.title }}</td>
+                <td class="truncate-cell" :title="candidate.artist ?? undefined">{{ candidate.artist || '-' }}</td>
+                <td class="truncate-cell" :title="candidate.album ?? undefined">{{ candidate.album || '-' }}</td>
+                <td class="sticky-action-col playlist-add-action-col">
+                  <v-btn
+                    size="small"
+                    variant="text"
+                    color="primary"
+                    :loading="playlistAddSavingKey === candidate.key"
+                    :disabled="playlistAddedKeys.has(candidate.key) || (playlistAddSavingKey !== null && playlistAddSavingKey !== candidate.key)"
+                    @click="addPlaylistCandidate(candidate)"
+                  >
+                    {{ playlistAddedKeys.has(candidate.key) ? '已添加' : playlistAddDuplicates.has(candidate.key) ? '已存在' : '添加' }}
+                  </v-btn>
+                </td>
+              </tr>
+              <tr v-if="!playlistAddCandidates.length && !playlistAddLoading">
+                <td colspan="4" class="empty-cell">
+                  {{ playlistAddSearched ? '没有找到歌曲' : '输入歌名或歌手搜索歌曲' }}
+                </td>
+              </tr>
+            </tbody>
+          </v-table>
+          <div v-if="playlistAddSource === 'library' && playlistAddTotal" class="pagination-row">
+            <v-pagination
+              v-model="playlistAddPage"
+              :length="Math.ceil(playlistAddTotal / playlistAddPageSize)"
+              density="comfortable"
+              total-visible="5"
+              @update:model-value="loadPlaylistAddCandidates()"
+            />
+            <v-chip color="secondary" variant="tonal">共 {{ playlistAddTotal }} 首</v-chip>
+          </div>
+          <div v-else-if="playlistAddSource === 'network' && playlistAddNextOffset !== null" class="pagination-row">
+            <v-btn
+              variant="text"
+              :loading="playlistAddLoading"
+              @click="loadPlaylistAddCandidates(playlistAddNextOffset ?? 0)"
+            >
+              加载更多
+            </v-btn>
+          </div>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="playlistAddSavingKey !== null" @click="playlistAddDialog = false">关闭</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -9118,6 +9577,32 @@ button.dashboard-health-card:hover {
   right: 0;
   text-align: center;
   width: 260px;
+}
+
+.music-library-table :deep(table) {
+  min-width: 880px;
+}
+
+.playlist-add-table :deep(table) {
+  min-width: 560px;
+}
+
+.library-track-detail-col {
+  width: 108px;
+}
+
+.library-track-action-col,
+.playlist-add-action-col {
+  right: 0;
+  text-align: center;
+}
+
+.library-track-action-col {
+  width: 120px;
+}
+
+.playlist-add-action-col {
+  width: 104px;
 }
 
 .sticky-action-col,

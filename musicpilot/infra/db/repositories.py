@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import String, and_, delete, func, or_, select, update
+from sqlalchemy import String, and_, case, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from musicpilot.core.defaults import DEFAULT_SEARCH_EXCLUDE_KEYWORDS
@@ -2110,12 +2110,21 @@ class SqlAlchemyMediaRepository:
         artist: str | None = None,
         download_status: str | None = None,
         exists_in_library: bool | None = None,
+        track_id: int | None = None,
     ) -> tuple[list[PlaylistTrack], int]:
         conditions = [PlaylistTrack.playlist_id == playlist_id]
+        if track_id is not None:
+            conditions.append(PlaylistTrack.id == track_id)
         if title:
-            conditions.append(PlaylistTrack.title.ilike(f"%{title}%"))
+            pattern = f"%{title}%"
+            conditions.append(
+                or_(PlaylistTrack.title.ilike(pattern), MusicLibraryTrack.title.ilike(pattern))
+            )
         if artist:
-            conditions.append(PlaylistTrack.artist.ilike(f"%{artist}%"))
+            pattern = f"%{artist}%"
+            conditions.append(
+                or_(PlaylistTrack.artist.ilike(pattern), MusicLibraryTrack.artist.ilike(pattern))
+            )
         if download_status:
             conditions.append(PlaylistTrack.download_status == download_status)
         if exists_in_library is not None:
@@ -2127,14 +2136,21 @@ class SqlAlchemyMediaRepository:
                 ("artist", bool(artist)),
                 ("download_status", bool(download_status)),
                 ("exists_in_library", exists_in_library is not None),
+                ("track_id", track_id is not None),
             )
             if enabled
         )
         operation_started_at = time.perf_counter()
+        query = select(PlaylistTrack)
+        if title or artist:
+            query = query.outerjoin(
+                MusicLibraryTrack, MusicLibraryTrack.id == PlaylistTrack.matched_library_track_id
+            )
+        query = query.where(*conditions)
         async with self.database.session() as session:
             count_started_at = time.perf_counter()
             total_result = await session.execute(
-                select(func.count()).select_from(PlaylistTrack).where(*conditions)
+                query.with_only_columns(func.count(), maintain_column_froms=True)
             )
             total = int(total_result.scalar_one())
             _log_slow_db_operation(
@@ -2145,9 +2161,7 @@ class SqlAlchemyMediaRepository:
             )
             select_started_at = time.perf_counter()
             result = await session.execute(
-                select(PlaylistTrack)
-                .where(*conditions)
-                .order_by(PlaylistTrack.position, PlaylistTrack.id)
+                query.order_by(PlaylistTrack.position, PlaylistTrack.id)
                 .offset(offset)
                 .limit(limit)
             )
@@ -2187,11 +2201,9 @@ class SqlAlchemyMediaRepository:
     async def migrate_playlist_track_source_keys(self) -> int:
         async with self.database.session() as session:
             result = await session.execute(
-                select(PlaylistTrack).order_by(
-                    PlaylistTrack.playlist_id,
-                    PlaylistTrack.position,
-                    PlaylistTrack.id,
-                )
+                select(PlaylistTrack)
+                .where(PlaylistTrack.platform != "manual")
+                .order_by(PlaylistTrack.playlist_id, PlaylistTrack.position, PlaylistTrack.id)
             )
             rows = list(result.scalars().all())
             counters: dict[int, dict[str, int]] = {}
@@ -2270,6 +2282,55 @@ class SqlAlchemyMediaRepository:
             for row in rows:
                 await session.refresh(row)
             return rows
+
+    async def append_playlist_track(
+        self, track: PlaylistTrack, *, provider: str | None = None
+    ) -> tuple[PlaylistTrack, bool] | None:
+        track.platform = "manual"
+        async with self.database.session() as session:
+            playlist = await session.get(Playlist, track.playlist_id, with_for_update=True)
+            if playlist is None:
+                return None
+            duplicate_conditions = [
+                and_(
+                    PlaylistTrack.platform == track.platform,
+                    PlaylistTrack.source_key == track.source_key,
+                )
+            ]
+            if provider is not None:
+                duplicate_conditions.append(
+                    and_(
+                        PlaylistTrack.platform == provider,
+                        PlaylistTrack.external_id == track.external_id,
+                    )
+                )
+            if track.matched_library_track_id is not None:
+                duplicate_conditions.append(
+                    PlaylistTrack.matched_library_track_id == track.matched_library_track_id
+                )
+            duplicate = await session.scalar(
+                select(PlaylistTrack)
+                .where(
+                    PlaylistTrack.playlist_id == playlist.id,
+                    or_(*duplicate_conditions),
+                )
+                .order_by(PlaylistTrack.position, PlaylistTrack.id)
+                .limit(1)
+            )
+            if duplicate is not None:
+                return duplicate, False
+            position, count = (
+                await session.execute(
+                    select(func.max(PlaylistTrack.position), func.count()).where(
+                        PlaylistTrack.playlist_id == playlist.id
+                    )
+                )
+            ).one()
+            track.position = (position or 0) + 1
+            playlist.track_count = count + 1
+            session.add(track)
+            await session.commit()
+            return track, True
 
     async def update_playlist_track(self, track_id: int, **changes: Any) -> PlaylistTrack | None:
         operation_started_at = time.perf_counter()
@@ -2766,6 +2827,12 @@ class SqlAlchemyMediaRepository:
             await session.commit()
             return True
 
+    async def get_music_library_track(self, navidrome_id: str) -> MusicLibraryTrack | None:
+        async with self.database.session() as session:
+            return await session.scalar(
+                select(MusicLibraryTrack).where(MusicLibraryTrack.navidrome_id == navidrome_id)
+            )
+
     async def list_music_library_tracks(self) -> list[MusicLibraryTrack]:
         async with self.database.session() as session:
             result = await session.execute(
@@ -2785,7 +2852,14 @@ class SqlAlchemyMediaRepository:
             await session.execute(
                 update(PlaylistTrack)
                 .where(PlaylistTrack.matched_library_track_id.in_(ids))
-                .values(matched_library_track_id=None)
+                .values(
+                    matched_library_track_id=None,
+                    exists_in_library=False,
+                    download_status=case(
+                        (PlaylistTrack.download_status == "existing", "pending"),
+                        else_=PlaylistTrack.download_status,
+                    ),
+                )
             )
             result = await session.execute(
                 delete(MusicLibraryTrack).where(MusicLibraryTrack.id.in_(ids))

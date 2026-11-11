@@ -738,6 +738,26 @@ class PlaylistTrackUpdateRequest(BaseModel):
     album: str | None = None
 
 
+class PlaylistLibraryTrackAddRequest(BaseModel):
+    source: Literal["library"]
+    library_track_id: str = Field(min_length=1, max_length=256)
+
+
+class PlaylistNetworkTrackAddRequest(BaseModel):
+    source: Literal["network"]
+    provider: str = Field(min_length=1, max_length=64)
+    external_id: str = Field(min_length=1, max_length=256)
+    title: str = Field(min_length=1, max_length=512)
+    artist: str | None = Field(default=None, max_length=512)
+    album: str | None = Field(default=None, max_length=512)
+    cover_url: str | None = None
+
+
+class PlaylistTrackAddResponse(BaseModel):
+    track: PlaylistTrackResponse
+    added: bool
+
+
 class PlaylistImportResponse(BaseModel):
     playlists: list[PlaylistResponse]
 

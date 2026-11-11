@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 import tomllib
@@ -225,7 +226,10 @@ from musicpilot.infra.api.schemas import (
     PlaylistLibrarySyncBindingResponse,
     PlaylistLibrarySyncRequest,
     PlaylistLibrarySyncResponse,
+    PlaylistLibraryTrackAddRequest,
+    PlaylistNetworkTrackAddRequest,
     PlaylistResponse,
+    PlaylistTrackAddResponse,
     PlaylistTrackDownloadResponse,
     PlaylistTrackPageResponse,
     PlaylistTrackResponse,
@@ -1289,6 +1293,7 @@ class AppState:
         self.artist_build_finished_at: datetime | None = None
         self.artist_build_last_error: str | None = None
         self.music_library_sync_lock = asyncio.Lock()
+        self.playlist_track_append_lock = asyncio.Lock()
         self.playlist_library_sync_locks: dict[tuple[int, str], asyncio.Lock] = {}
         self.pending_playlist_library_sync_bindings: set[tuple[int, str]] = set()
         self.library_storage_lock = asyncio.Lock()
@@ -3687,6 +3692,7 @@ def create_app() -> FastAPI:
         artist: str | None = Query(default=None),
         download_status: str | None = Query(default=None),
         exists_in_library: bool | None = Query(default=None),
+        track_id: int | None = Query(default=None, ge=1),
     ) -> PlaylistTrackPageResponse:
         request_started_at = time.perf_counter()
         playlist_started_at = time.perf_counter()
@@ -3703,6 +3709,7 @@ def create_app() -> FastAPI:
             artist=_optional_string(artist),
             download_status=_optional_string(download_status),
             exists_in_library=exists_in_library,
+            track_id=track_id,
         )
         tracks_elapsed_ms = _elapsed_ms(tracks_started_at)
         elapsed_ms = _elapsed_ms(request_started_at)
@@ -3732,6 +3739,68 @@ def create_app() -> FastAPI:
             page_size=page_size,
         )
 
+    @app.post("/api/playlists/{playlist_id}/tracks", response_model=PlaylistTrackAddResponse)
+    async def add_playlist_track(
+        playlist_id: int,
+        payload: PlaylistLibraryTrackAddRequest | PlaylistNetworkTrackAddRequest,
+    ) -> PlaylistTrackAddResponse:
+        if isinstance(payload, PlaylistLibraryTrackAddRequest):
+            external_id = payload.library_track_id
+            async with state.playlist_track_append_lock:
+                library_track = await state.repository.get_music_library_track(external_id)
+                if library_track is None:
+                    raise HTTPException(status_code=404, detail="音乐库歌曲不存在。")
+                result = await state.repository.append_playlist_track(
+                    PlaylistTrack(
+                        playlist_id=playlist_id,
+                        source_key=f"library:{external_id}",
+                        external_id=external_id,
+                        original_title=library_track.title,
+                        title=library_track.title,
+                        artist=library_track.artist,
+                        album=library_track.album,
+                        duration=library_track.duration,
+                        exists_in_library=True,
+                        matched_library_track_id=library_track.id,
+                        download_status="existing",
+                        last_checked_at=datetime.now(UTC),
+                    )
+                )
+        else:
+            title = payload.title.strip()
+            provider = payload.provider.strip().casefold()
+            external_id = payload.external_id.strip()
+            if not title or not provider or not external_id:
+                raise HTTPException(status_code=422, detail="网络歌曲缺少歌名或来源。")
+            artist = _optional_string(payload.artist)
+            album = _optional_string(payload.album)
+            async with state.playlist_track_append_lock:
+                match = await _find_playlist_track_library_match(state, title, artist, album)
+                result = await state.repository.append_playlist_track(
+                    PlaylistTrack(
+                        playlist_id=playlist_id,
+                        source_key=f"network:{provider}:{external_id}",
+                        external_id=external_id,
+                        original_title=title,
+                        title=title,
+                        artist=artist,
+                        album=album,
+                        cover_url=_optional_string(payload.cover_url),
+                        exists_in_library=match is not None,
+                        matched_library_track_id=match.id if match is not None else None,
+                        download_status="existing" if match is not None else "pending",
+                        last_checked_at=datetime.now(UTC),
+                        raw_payload={"provider": provider},
+                    ),
+                    provider=provider,
+                )
+        if result is None:
+            raise HTTPException(status_code=404, detail="歌单不存在。")
+        track, added = result
+        if added and track.exists_in_library:
+            await _trigger_playlist_library_auto_sync(state, playlist_id)
+        return PlaylistTrackAddResponse(track=_playlist_track_response(track), added=added)
+
     @app.patch(
         "/api/playlists/{playlist_id}/tracks/{track_id}",
         response_model=PlaylistTrackResponse,
@@ -3750,33 +3819,7 @@ def create_app() -> FastAPI:
         artist = _optional_string(payload.artist)
         album = _optional_string(payload.album)
         try:
-            track_version_control = await _track_version_control_enabled(state)
-            library_tracks = await state.repository.list_music_library_tracks()
-            normalized_title = _library_match_title_key(
-                title,
-                artist,
-                album,
-                track_version_control=track_version_control,
-            )
-            candidates = [
-                item
-                for item in library_tracks
-                if _library_match_title_key(
-                    item.title,
-                    item.artist,
-                    item.album,
-                    track_version_control=track_version_control,
-                )
-                == normalized_title
-            ]
-            match = await _match_library_track(
-                state,
-                title,
-                artist,
-                candidates,
-                album=album,
-                track_version_control=track_version_control,
-            )
+            match = await _find_playlist_track_library_match(state, title, artist, album)
         except Exception as exc:  # noqa: BLE001
             state.add_log(
                 "playlist",
@@ -4616,6 +4659,31 @@ def create_app() -> FastAPI:
             ),
         )
 
+    @app.delete("/api/music-library/{track_id}", status_code=204)
+    async def delete_music_library_track(track_id: str) -> None:
+        async with state.music_library_sync_lock, state.playlist_track_append_lock:
+            track = await state.repository.get_music_library_track(track_id)
+            if track is None:
+                raise HTTPException(status_code=404, detail="音乐库歌曲不存在。")
+            settings_payload = await state.repository.get_system_settings()
+            config = scraping_config_from_payload(settings_payload)
+            root_type = "mapped" if config.mode in {"mapped", "copy"} else "source"
+            root = _scraping_file_root_or_409(config, root_type)
+            try:
+                await asyncio.to_thread(_delete_music_library_file, root, track.path)
+            except OSError as exc:
+                raise HTTPException(status_code=409, detail="无法删除音乐库歌曲文件。") from exc
+            playlist_ids = await state.repository.list_playlist_ids_by_matched_library_tracks(
+                (track.id,)
+            )
+            await state.repository.delete_music_library_tracks((track.id,))
+        try:
+            for playlist_id in playlist_ids:
+                await _refresh_playlist_library_matches(state, playlist_id, sync_to_library=False)
+        except Exception as exc:  # noqa: BLE001
+            state.add_log("library", f"Playlist matching after deletion failed: {exc}", "ERROR")
+        await _refresh_music_library_after_change(state, f"music library deletion: {track_id}")
+
     # ── Artist API ──────────────────────────────────────────────
 
     @app.get("/api/artists", response_model=ArtistPageResponse)
@@ -5175,6 +5243,7 @@ async def _refresh_playlist_library_matches(
     playlist_id: int | None = None,
     *,
     track_version_control: bool | None = None,
+    sync_to_library: bool = True,
 ) -> int:
     if track_version_control is None:
         track_version_control = await _track_version_control_enabled(state)
@@ -5210,8 +5279,9 @@ async def _refresh_playlist_library_matches(
         if playlist_id is not None
         else {track.playlist_id for track in playlist_tracks}
     )
-    for affected_playlist_id in affected_playlist_ids:
-        await _trigger_playlist_library_auto_sync(state, affected_playlist_id)
+    if sync_to_library:
+        for affected_playlist_id in affected_playlist_ids:
+            await _trigger_playlist_library_auto_sync(state, affected_playlist_id)
     return updated
 
 
@@ -5278,6 +5348,20 @@ async def _refresh_playlist_matches_for_library_changes(
     return updated
 
 
+async def _find_playlist_track_library_match(
+    state: AppState, title: str, artist: str | None, album: str | None
+) -> MusicLibraryTrack | None:
+    track_version_control = await _track_version_control_enabled(state)
+    return await _match_library_track(
+        state,
+        title,
+        artist,
+        await state.repository.list_music_library_tracks(),
+        album=album,
+        track_version_control=track_version_control,
+    )
+
+
 def _music_library_tracks_by_normalized_title(
     library_tracks: Iterable[MusicLibraryTrack],
     *,
@@ -5304,15 +5388,29 @@ async def _apply_playlist_track_library_match(
     artist_values_cache: dict[str, set[str]] | None = None,
     track_version_control: bool = False,
 ) -> PlaylistTrack | None:
-    match = await _match_library_track(
-        state,
-        track.title,
-        track.artist,
-        list(library_tracks),
-        album=track.album,
-        artist_values_cache=artist_values_cache,
-        track_version_control=track_version_control,
-    )
+    candidates = list(library_tracks)
+    match = None
+    if track.platform == "manual" and track.source_key == f"library:{track.external_id}":
+        metadata = (track.title, track.artist, track.album)
+        match = next(
+            (
+                item
+                for item in candidates
+                if item.navidrome_id == track.external_id
+                and (item.title, item.artist, item.album) == metadata
+            ),
+            None,
+        )
+    if match is None:
+        match = await _match_library_track(
+            state,
+            track.title,
+            track.artist,
+            candidates,
+            album=track.album,
+            artist_values_cache=artist_values_cache,
+            track_version_control=track_version_control,
+        )
     exists = match is not None
     matched_library_track_id = match.id if match is not None else None
     status = (
@@ -6450,12 +6548,15 @@ async def _mark_playlist_tracks_for_deleted_download_task(
 
 
 def _playlist_media_candidate(track: PlaylistTrack) -> MediaCandidateResponse:
+    source = track.platform
+    if source == "manual":
+        source = _optional_string((track.raw_payload or {}).get("provider")) or source
     return MediaCandidateResponse(
         title=track.title,
         artist=track.artist,
         album=track.album,
         albums=[track.album] if track.album else [],
-        source=track.platform,
+        source=source,
         external_id=track.external_id,
     )
 
@@ -9594,9 +9695,14 @@ async def _reconcile_playlist_with_media_server(
         library_playlist_id = sync_result.playlist_id
         sync_mode = sync_result.mode
 
-    if remote_playlist is not None and remote_playlist.tracks:
+    remote_library_tracks = (
+        [track for track in remote_playlist.tracks if target_counts[track.id]]
+        if remote_playlist is not None
+        else []
+    )
+    if remote_library_tracks:
         await state.repository.sync_music_library_track_page(
-            [_media_server_track_payload(track) for track in remote_playlist.tracks],
+            [_media_server_track_payload(track) for track in remote_library_tracks],
             synced_at=datetime.now(UTC),
         )
     added, removed = await state.repository.reconcile_playlist_library_song_counts(
@@ -10165,6 +10271,22 @@ def _resolve_source_delete_path(root: Path, relative_path: str) -> Path:
     if not parent.is_relative_to(root):
         raise HTTPException(status_code=403, detail="不能访问当前文件目录之外的路径。")
     return parent / relative.name
+
+
+def _delete_music_library_file(root: Path, stored_path: str | None) -> None:
+    if not stored_path:
+        raise HTTPException(status_code=409, detail="这首歌没有可用的音乐库文件路径。")
+    path = Path(stored_path)
+    if path.is_absolute():
+        if not path.is_relative_to(root):
+            raise HTTPException(status_code=403, detail="歌曲文件不在配置的音乐库目录内。")
+        path = path.relative_to(root)
+    if path.anchor or not path.parts or ".." in path.parts:
+        raise HTTPException(status_code=403, detail="歌曲文件不在配置的音乐库目录内。")
+    target = _resolve_source_delete_path(root, str(path))
+    if not stat.S_ISREG(target.lstat().st_mode):
+        raise HTTPException(status_code=409, detail="找不到可删除的歌曲文件。")
+    target.unlink()
 
 
 def _source_relative_path(root: Path, path: Path) -> str:
