@@ -6915,7 +6915,29 @@ onUnmounted(() => {
                     </div>
 
                     <div class="settings-checks">
-                      <div class="settings-checks-label">缺失时尝试刮削</div>
+                      <div class="settings-checks-label">
+                        <span>缺失时尝试刮削</span>
+                        <v-tooltip location="top" max-width="520" open-on-click>
+                          <template #activator="{ props }">
+                            <v-icon
+                              v-bind="props"
+                              class="settings-help-icon"
+                              icon="mdi-information-outline"
+                              size="17"
+                              tabindex="0"
+                              aria-label="缺失时尝试刮削说明"
+                            />
+                          </template>
+                          <div class="settings-help-tip">
+                            <div class="settings-help-tip-summary">
+                              源文件缺少勾选的字段时，会尝试搜索并补齐。只在这里勾选的字段，即使没补到，也不会仅因此判定失败。
+                            </div>
+                            <div>
+                              <strong>最大尝试：</strong>开启后，当一个源刮削失败时，会尝试其他源继续刮削，直到刮削成功或所有源均已尝试。开启后会降低整体刮削速度。
+                            </div>
+                          </div>
+                        </v-tooltip>
+                      </div>
                       <div class="settings-checks-row">
                         <v-checkbox
                           v-for="item in scrapingRequiredMetadataOptions"
@@ -6938,7 +6960,24 @@ onUnmounted(() => {
                     </div>
 
                     <div class="settings-checks">
-                      <div class="settings-checks-label">缺失则判定失败</div>
+                      <div class="settings-checks-label">
+                        <span>缺失则判定失败</span>
+                        <v-tooltip location="top" max-width="520" open-on-click>
+                          <template #activator="{ props }">
+                            <v-icon
+                              v-bind="props"
+                              class="settings-help-icon"
+                              icon="mdi-information-outline"
+                              size="17"
+                              tabindex="0"
+                              aria-label="缺失则判定失败说明"
+                            />
+                          </template>
+                          <div class="settings-help-tip">
+                            勾选的字段是必填项。缺失时也会尝试补齐，无需在上面重复勾选；刮削结束后仍缺少任一必填字段，本次判定失败。「最大尝试」不会放宽这个要求。
+                          </div>
+                        </v-tooltip>
+                      </div>
                       <div class="settings-checks-row">
                         <v-checkbox
                           v-for="item in scrapingRequiredMetadataOptions"
@@ -6984,14 +7023,14 @@ onUnmounted(() => {
                           <template #activator="{ props }">
                             <v-icon
                               v-bind="props"
-                              class="track-version-control-help"
+                              class="settings-help-icon"
                               icon="mdi-information-outline"
                               size="17"
                               tabindex="0"
                             />
                           </template>
-                          <div class="track-version-control-tip">
-                            <div class="track-version-control-tip-summary">
+                          <div class="settings-help-tip">
+                            <div class="settings-help-tip-summary">
                               控制刮削、重复文件和“已在库”判断是否严格区分歌曲版本（如 live、demo、feat）。
                             </div>
                             <div class="track-version-control-tip-options">
@@ -9958,8 +9997,11 @@ button.dashboard-health-card:hover {
 }
 
 .settings-checks-label {
+  align-items: center;
   color: rgba(var(--v-theme-on-surface), 0.72);
+  display: flex;
   font-size: 14px;
+  gap: 4px;
   margin-bottom: 4px;
 }
 
@@ -10196,19 +10238,19 @@ button.dashboard-health-card:hover {
   gap: 4px;
 }
 
-.track-version-control-help {
+.settings-help-icon {
   color: rgba(var(--v-theme-on-surface), 0.54);
   cursor: help;
 }
 
-.track-version-control-tip {
+.settings-help-tip {
   display: grid;
   gap: 10px;
   line-height: 1.55;
   text-align: left;
 }
 
-.track-version-control-tip-summary {
+.settings-help-tip-summary {
   border-bottom: 1px solid rgba(255, 255, 255, 0.18);
   padding-bottom: 8px;
 }
