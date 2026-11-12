@@ -8043,7 +8043,13 @@ onUnmounted(() => {
           </v-tabs>
           <v-window v-model="siteForm.auth_type">
             <v-window-item value="cookie">
-              <v-textarea v-model="siteForm.cookie" class="mt-3" label="Cookie" rows="3" />
+              <v-textarea
+                v-model="siteForm.cookie"
+                class="mt-3"
+                label="Cookie"
+                rows="3"
+                @update:focused="(focused) => { if (!focused) siteForm.cookie = siteForm.cookie.trim() }"
+              />
             </v-window-item>
             <v-window-item value="api_key">
               <v-text-field

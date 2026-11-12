@@ -7108,8 +7108,9 @@ async def _download_torrent_file(
     proxy_url: str | None = None,
 ) -> bytes:
     headers: dict[str, str] = {}
-    if site.cookie:
-        headers["Cookie"] = site.cookie
+    cookie = (site.cookie or "").strip()
+    if cookie:
+        headers["Cookie"] = cookie
     if site.user_agent:
         headers["User-Agent"] = site.user_agent
     async with httpx.AsyncClient(

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from musicpilot.core.defaults import DEFAULT_SEARCH_EXCLUDE_KEYWORDS
 
@@ -525,6 +525,11 @@ class SiteCreateRequest(BaseModel):
     max_concurrency: int = Field(default=2, ge=1, le=10)
     use_proxy: bool = False
     enabled: bool = True
+
+    @field_validator("cookie")
+    @classmethod
+    def trim_cookie(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
 
 
 class SiteResponse(SiteCreateRequest):

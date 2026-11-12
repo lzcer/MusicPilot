@@ -145,14 +145,18 @@ class NexusPHPCrawler:
         url = urljoin(self.config.base_url, self.config.parser.search_path)
         params = dict(self.config.parser.search_params)
         params[self.config.parser.search_query_param] = query
-        response = await client.get(url, params=params, headers=headers)
+        response = await client.get(url, params=params, headers=headers, follow_redirects=False)
+        redirect = response.next_request
+        if redirect is not None and redirect.url.path.rsplit("/", 1)[-1].lower() == "login.php":
+            raise RuntimeError("认证失败，请更新Cookie后重试。")
         response.raise_for_status()
         return response.text
 
     def _headers(self) -> dict[str, str]:
         headers = {}
-        if self.config.cookie:
-            headers["Cookie"] = self.config.cookie
+        cookie = (self.config.cookie or "").strip()
+        if cookie:
+            headers["Cookie"] = cookie
         if self.config.user_agent:
             headers["User-Agent"] = self.config.user_agent
         return headers
