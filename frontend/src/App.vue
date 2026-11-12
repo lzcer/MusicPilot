@@ -38,6 +38,21 @@ type SearchResult = {
   metadata?: Record<string, unknown>
 }
 
+type TorrentFile = {
+  path: string
+  size_bytes: number | null
+}
+
+type TorrentFileTreeNode = {
+  id: string
+  name: string
+  path: string
+  depth: number
+} & (
+  | { kind: 'directory'; children: TorrentFileTreeNode[] }
+  | { kind: 'file'; size: number | null }
+)
+
 type SearchSortField = 'size' | 'seeders' | 'publishedAt'
 
 type SearchSortDirection = 'asc' | 'desc'
@@ -730,6 +745,60 @@ const searchPage = ref(1)
 const searchPageSize = ref(20)
 const pendingDownload = ref<SearchResult | null>(null)
 const downloadSubmitting = ref(false)
+const torrentFiles = ref<TorrentFile[] | null>(null)
+const torrentFilesExpanded = ref(false)
+const torrentFilesLoading = ref(false)
+const torrentFilesError = ref('')
+const collapsedTorrentDirectories = ref(new Set<string>())
+let torrentFilesController: AbortController | null = null
+
+const torrentFileTree = computed(() => {
+  const root: TorrentFileTreeNode[] = []
+  const directories = new Map<string, Extract<TorrentFileTreeNode, { kind: 'directory' }>>()
+  for (const [index, file] of (torrentFiles.value ?? []).entries()) {
+    const parts = file.path.split('/').filter(Boolean)
+    const name = parts.pop() ?? file.path
+    let children = root
+    let path = ''
+    for (const [depth, part] of parts.entries()) {
+      path = path ? `${path}/${part}` : part
+      let directory = directories.get(path)
+      if (!directory) {
+        directory = { id: `directory:${path}`, kind: 'directory', name: part, path, depth, children: [] }
+        directories.set(path, directory)
+        children.push(directory)
+      }
+      children = directory.children
+    }
+    children.push({ id: `file:${index}`, kind: 'file', name, path: file.path, depth: parts.length, size: file.size_bytes })
+  }
+  return root
+})
+
+const visibleTorrentFileNodes = computed(() => {
+  const rows: TorrentFileTreeNode[] = []
+  const pending = [...torrentFileTree.value].reverse()
+  while (pending.length) {
+    const node = pending.pop()!
+    rows.push(node)
+    if (node.kind === 'directory' && !collapsedTorrentDirectories.value.has(node.id)) {
+      for (let index = node.children.length - 1; index >= 0; index -= 1) {
+        pending.push(node.children[index])
+      }
+    }
+  }
+  return rows
+})
+
+watch(pendingDownload, () => {
+  torrentFilesController?.abort()
+  torrentFilesController = null
+  torrentFiles.value = null
+  torrentFilesExpanded.value = false
+  torrentFilesLoading.value = false
+  torrentFilesError.value = ''
+  collapsedTorrentDirectories.value.clear()
+}, { flush: 'sync' })
 
 const logs = ref<LogEntry[]>([])
 const logsLoading = ref(false)
@@ -2261,6 +2330,45 @@ function searchResultSize(row: SearchResult) {
 
 function openDownloadConfirm(result: SearchResult) {
   pendingDownload.value = result
+}
+
+function toggleTorrentDirectory(id: string) {
+  const collapsed = collapsedTorrentDirectories.value
+  if (collapsed.has(id)) collapsed.delete(id)
+  else collapsed.add(id)
+}
+
+async function toggleTorrentFiles() {
+  const result = pendingDownload.value
+  if (!result || torrentFilesLoading.value) return
+  if (torrentFiles.value !== null) {
+    torrentFilesExpanded.value = !torrentFilesExpanded.value
+    return
+  }
+  const controller = new AbortController()
+  torrentFilesController = controller
+  torrentFilesLoading.value = true
+  torrentFilesError.value = ''
+  try {
+    const files = await api<TorrentFile[]>('/api/search/torrent-files', {
+      method: 'POST',
+      body: JSON.stringify({ source: result.source, download_url: result.download_url }),
+      signal: controller.signal
+    })
+    if (!controller.signal.aborted) {
+      torrentFiles.value = files
+      torrentFilesExpanded.value = true
+    }
+  } catch (error) {
+    if (!controller.signal.aborted) {
+      torrentFilesError.value = error instanceof Error ? error.message : '文件列表加载失败，请重试'
+    }
+  } finally {
+    if (torrentFilesController === controller) {
+      torrentFilesController = null
+      torrentFilesLoading.value = false
+    }
+  }
 }
 
 function switchPage(page: string) {
@@ -7435,6 +7543,7 @@ onUnmounted(() => {
     <v-dialog
       :model-value="Boolean(pendingDownload)"
       max-width="560"
+      scrollable
       @update:model-value="(value: boolean) => { if (!value) pendingDownload = null }"
     >
       <v-card class="download-confirm-card">
@@ -7458,10 +7567,61 @@ onUnmounted(() => {
               </div>
             </div>
           </div>
-          <div class="confirm-row">
+          <div class="confirm-row confirm-size-row">
             <v-icon icon="mdi-database" size="34" />
             <v-chip size="large" variant="tonal">{{ formatSize(pendingDownload.size_bytes) }}</v-chip>
+            <v-btn
+              color="primary"
+              variant="text"
+              size="small"
+              :loading="torrentFilesLoading"
+              :disabled="torrentFilesLoading"
+              :aria-expanded="torrentFilesExpanded"
+              @click="toggleTorrentFiles"
+            >
+              {{ torrentFilesExpanded ? '收起文件列表' : torrentFilesError ? '重试文件列表' : '查看文件列表' }}
+            </v-btn>
           </div>
+          <div v-if="torrentFilesLoading" class="muted" role="status">
+            正在获取并解析种子文件…
+          </div>
+          <v-alert v-if="torrentFilesError" type="error" variant="tonal" density="compact" role="alert">
+            {{ torrentFilesError }}
+          </v-alert>
+          <section v-if="torrentFilesExpanded && torrentFiles !== null" aria-label="种子文件列表">
+            <div class="torrent-files-heading">文件列表（{{ torrentFiles.length }} 个文件）</div>
+            <div v-if="!torrentFiles.length" class="muted">种子中没有可读取的文件条目</div>
+            <div v-else class="torrent-files-scroll" tabindex="0" aria-label="滚动查看文件列表">
+              <table class="torrent-files-table">
+                <thead><tr><th scope="col">名称</th><th scope="col">大小</th></tr></thead>
+                <tbody>
+                  <tr v-for="node in visibleTorrentFileNodes" :key="node.id">
+                    <td>
+                      <div class="torrent-file-node" :style="{ '--torrent-file-indent': `${node.depth * 16}px` }">
+                        <button
+                          v-if="node.kind === 'directory'"
+                          class="torrent-file-node-label torrent-file-directory"
+                          type="button"
+                          :title="node.path"
+                          :aria-expanded="!collapsedTorrentDirectories.has(node.id)"
+                          @click="toggleTorrentDirectory(node.id)"
+                        >
+                          <v-icon :icon="collapsedTorrentDirectories.has(node.id) ? 'mdi-chevron-right' : 'mdi-chevron-down'" size="16" />
+                          <v-icon :icon="collapsedTorrentDirectories.has(node.id) ? 'mdi-folder-outline' : 'mdi-folder-open-outline'" size="16" />
+                          <span>{{ node.name }}</span>
+                        </button>
+                        <div v-else class="torrent-file-node-label torrent-file-leaf" :title="node.path">
+                          <v-icon icon="mdi-file-outline" size="16" />
+                          <span>{{ node.name }}</span>
+                        </div>
+                      </div>
+                    </td>
+                    <td>{{ node.kind === 'file' ? formatSize(node.size) : '' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
           <div class="confirm-row muted">
             <v-icon icon="mdi-clock-outline" size="28" />
             <span>{{ pendingDownload.published_at || '发布时间未知' }}</span>

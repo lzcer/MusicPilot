@@ -135,6 +135,16 @@ class SearchResponse(BaseModel):
     results: list[SearchResultResponse]
 
 
+class TorrentFileListRequest(BaseModel):
+    source: str = Field(min_length=1)
+    download_url: str = Field(min_length=1)
+
+
+class TorrentFileResponse(BaseModel):
+    path: str
+    size_bytes: int | None
+
+
 class MediaCandidateResponse(BaseModel):
     title: str
     artist: str | None = None

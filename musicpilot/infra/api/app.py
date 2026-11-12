@@ -50,6 +50,7 @@ from musicpilot.adapters.indexers import (
     load_merged_parser_catalog,
     normalize_site_base_url,
 )
+from musicpilot.adapters.indexers.mteam import MTeamCrawler
 from musicpilot.adapters.indexers.nexusphp import NexusPHPParserConfig
 from musicpilot.adapters.media_servers import build_media_server_client
 from musicpilot.adapters.metadata import (
@@ -249,6 +250,8 @@ from musicpilot.infra.api.schemas import (
     SystemTaskInterruptResponse,
     SystemTaskResponse,
     TestResponse,
+    TorrentFileListRequest,
+    TorrentFileResponse,
     TrackMetadataResponse,
     UpdateArtistRequest,
 )
@@ -2861,6 +2864,47 @@ def create_app() -> FastAPI:
             )
 
         return StreamingResponse(events(), media_type="text/event-stream")
+
+    @app.post("/api/search/torrent-files", response_model=list[TorrentFileResponse])
+    async def search_torrent_files(payload: TorrentFileListRequest) -> list[TorrentFileResponse]:
+        download_url = payload.download_url.strip()
+        if download_url.lower().startswith("magnet:"):
+            raise HTTPException(status_code=422, detail="磁力链接暂不支持预览文件列表。")
+
+        try:
+            site = await _match_torrent_site(state, payload.model_dump(), [])
+            if site is None:
+                raise HTTPException(status_code=422, detail="找不到该种子对应的已启用站点。")
+            indexer = _find_indexer(state, site.id)
+            base_url = indexer.api_base_url if isinstance(indexer, MTeamCrawler) else site.base_url
+            if not _matches_torrent_origin(download_url, base_url):
+                raise HTTPException(status_code=422, detail="种子地址与站点配置不匹配。")
+            torrent_data = await _download_torrent_for_site(
+                state,
+                download_url,
+                site,
+                proxy_url=await _resolve_proxy_for_site(state, site),
+                same_origin_only=True,
+            )
+        except (ValueError, httpx.InvalidURL) as exc:
+            raise HTTPException(status_code=422, detail="种子地址无效。") from exc
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"站点未能返回种子文件（HTTP {exc.response.status_code}）。",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail="连接站点失败或超时，请重试。") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        try:
+            files = _torrent_preview_files(torrent_data)
+        except (ValueError, RecursionError) as exc:
+            raise HTTPException(status_code=422, detail="无法解析种子中的文件列表。") from exc
+        if not files:
+            raise HTTPException(status_code=422, detail="种子中没有可读取的文件条目。")
+        return files
 
     @app.post("/api/downloads", response_model=DownloadResponse, status_code=202)
     async def add_download(payload: DownloadRequest) -> DownloadResponse:
@@ -7061,13 +7105,16 @@ async def _download_torrent_for_site(
     site: IndexerSite,
     *,
     proxy_url: str | None,
+    same_origin_only: bool = False,
 ) -> bytes:
     indexer = _find_indexer(state, site.id)
     download_torrent = getattr(indexer, "download_torrent", None)
     if callable(download_torrent):
         torrent_data = await download_torrent(download_url)
     else:
-        torrent_data = await _download_torrent_file(download_url, site, proxy_url=proxy_url)
+        torrent_data = await _download_torrent_file(
+            download_url, site, proxy_url=proxy_url, same_origin_only=same_origin_only
+        )
     if not _looks_like_torrent_file(torrent_data):
         credential = "API Key/UA" if site.auth_type == "api_key" else "Cookie/UA"
         raise RuntimeError(
@@ -7106,6 +7153,8 @@ async def _download_torrent_file(
     download_url: str,
     site: IndexerSite,
     proxy_url: str | None = None,
+    *,
+    same_origin_only: bool = False,
 ) -> bytes:
     headers: dict[str, str] = {}
     cookie = (site.cookie or "").strip()
@@ -7113,22 +7162,43 @@ async def _download_torrent_file(
         headers["Cookie"] = cookie
     if site.user_agent:
         headers["User-Agent"] = site.user_agent
+
+    async def check_origin(request: httpx.Request) -> None:
+        if not _matches_torrent_origin(request.url, site.base_url):
+            raise RuntimeError("种子下载跳转到了其他站点，无法预览。")
+        if cookie:
+            request.headers.setdefault("Cookie", cookie)
+
     async with httpx.AsyncClient(
         timeout=30,
         follow_redirects=True,
         http2=True,
         proxy=proxy_url,
+        event_hooks={"request": [check_origin]} if same_origin_only else None,
     ) as client:
         response = await client.get(download_url, headers=headers)
     response.raise_for_status()
     content = response.content
     if not _looks_like_torrent_file(content):
+        if same_origin_only:
+            raise RuntimeError(f"{site.name} 返回的不是种子文件，请检查站点 Cookie/UA。")
         preview = response.text[:120].replace("\r", " ").replace("\n", " ")
         raise RuntimeError(
             "下载种子文件失败：站点返回的不是 torrent 文件。"
             f"请检查 {site.name} 的 Cookie/UA。返回内容：{preview}"
         )
     return content
+
+
+def _matches_torrent_origin(value: str | httpx.URL, base_url: str) -> bool:
+    url = httpx.URL(value)
+    base = httpx.URL(base_url)
+    return (
+        url.scheme in {"http", "https"}
+        and bool(url.host)
+        and not url.userinfo
+        and (url.scheme, url.host, url.port) == (base.scheme, base.host, base.port)
+    )
 
 
 def _looks_like_torrent_file(content: bytes) -> bool:
@@ -8170,14 +8240,25 @@ def _download_task_item_reference_metadata(item: TorrentRecordItem) -> TrackMeta
 
 
 def _torrent_audio_items(torrent_data: bytes) -> list[dict[str, object]]:
+    info = _torrent_info(torrent_data)
+    items: list[dict[str, object]] = []
+    if info is not None:
+        for file in _torrent_v1_files(info):
+            _append_torrent_audio_item(items, file.path, file.size_bytes)
+    return items
+
+
+def _torrent_info(torrent_data: bytes) -> dict[bytes, Any] | None:
     payload = _bdecode(torrent_data)
     if not isinstance(payload, dict):
-        return []
+        return None
     info = payload.get(b"info")
-    if not isinstance(info, dict):
-        return []
-    items: list[dict[str, object]] = []
+    return info if isinstance(info, dict) else None
+
+
+def _torrent_v1_files(info: dict[bytes, Any]) -> list[TorrentFileResponse]:
     root_name = _decode_torrent_text(info.get(b"name.utf-8") or info.get(b"name") or b"")
+    items: list[TorrentFileResponse] = []
     files = info.get(b"files")
     if isinstance(files, list):
         for file_info in files:
@@ -8188,12 +8269,45 @@ def _torrent_audio_items(torrent_data: bytes) -> list[dict[str, object]]:
                 continue
             parts = [_decode_torrent_text(part) for part in path_value]
             file_path = "/".join(part for part in [root_name, *parts] if part)
-            _append_torrent_audio_item(items, file_path, file_info.get(b"length"))
+            if file_path:
+                items.append(_torrent_file_response(file_path, file_info.get(b"length")))
         return items
 
-    single_name = root_name
-    _append_torrent_audio_item(items, single_name, info.get(b"length"))
+    if root_name:
+        items.append(_torrent_file_response(root_name, info.get(b"length")))
     return items
+
+
+def _torrent_preview_files(torrent_data: bytes) -> list[TorrentFileResponse]:
+    info = _torrent_info(torrent_data)
+    if info is None:
+        return []
+    tree = info.get(b"file tree")
+    if not isinstance(tree, dict) or b"files" in info or b"length" in info:
+        return _torrent_v1_files(info)
+
+    items: list[TorrentFileResponse] = []
+    root_name = _decode_torrent_text(info.get(b"name"))
+
+    def walk(node: dict[bytes, Any], parts: tuple[str, ...]) -> None:
+        for key, value in node.items():
+            if not isinstance(value, dict):
+                continue
+            if key == b"":
+                if parts:
+                    items.append(_torrent_file_response("/".join(parts), value.get(b"length")))
+            else:
+                walk(value, (*parts, _decode_torrent_text(key)))
+
+    single_file = len(tree) == 1 and any(
+        isinstance(node, dict) and b"" in node for node in tree.values()
+    )
+    walk(tree, (root_name,) if root_name and not single_file else ())
+    return items
+
+
+def _torrent_file_response(path: str, size: object) -> TorrentFileResponse:
+    return TorrentFileResponse(path=path, size_bytes=size if isinstance(size, int) else None)
 
 
 def _append_torrent_audio_item(

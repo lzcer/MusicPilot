@@ -482,6 +482,95 @@ body {
   line-height: 1.45;
 }
 
+.confirm-size-row {
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  column-gap: 10px;
+}
+
+.confirm-size-row .v-chip {
+  width: fit-content;
+  max-width: 100%;
+}
+
+.torrent-files-heading {
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+
+.torrent-files-scroll {
+  max-height: 280px;
+  overflow: auto;
+  border: 1px solid #ececf2;
+  border-radius: 6px;
+}
+
+.torrent-files-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.torrent-files-table th,
+.torrent-files-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #ececf2;
+  text-align: left;
+  vertical-align: top;
+}
+
+.torrent-files-table th {
+  position: sticky;
+  top: 0;
+  background: rgb(var(--v-theme-surface));
+}
+
+.torrent-files-table td:first-child {
+  overflow-wrap: anywhere;
+}
+
+.torrent-file-node {
+  padding-inline-start: min(var(--torrent-file-indent, 0px), 35%);
+}
+
+.torrent-file-node-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  text-align: start;
+}
+
+.torrent-file-node-label .v-icon {
+  flex: none;
+  margin-top: 2px;
+}
+
+.torrent-file-directory {
+  width: 100%;
+  font-weight: 600;
+}
+
+.torrent-file-directory:hover,
+.torrent-file-directory:focus-visible {
+  color: rgb(var(--v-theme-primary));
+}
+
+.torrent-file-leaf {
+  padding-inline-start: 20px;
+}
+
+.torrent-files-table th:last-child,
+.torrent-files-table td:last-child {
+  width: 1%;
+  white-space: nowrap;
+  text-align: right;
+}
+
+@media (max-width: 420px) {
+  .download-confirm-card .download-confirm-body {
+    padding-inline: 16px;
+  }
+}
+
 .confirm-promotion-row {
   align-items: center;
 }
