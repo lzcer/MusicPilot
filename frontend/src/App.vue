@@ -1,13 +1,23 @@
 <script setup lang="ts">
-import { defineAsyncComponent, onMounted } from 'vue'
+import { defineAsyncComponent, onMounted, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useAuthStore } from './stores/auth'
+import { usePwaStore } from './stores/pwa'
+import PwaStatus from './components/PwaStatus.vue'
 
 const AppLayout = defineAsyncComponent(() => import('./layouts/AppLayout.vue'))
 const LoginPage = defineAsyncComponent(() => import('./pages/LoginPage.vue'))
 const auth = useAuthStore()
+const pwa = usePwaStore()
+pwa.initialize()
 const { status, error } = storeToRefs(auth)
 onMounted(() => void auth.checkSession())
+watch(
+  () => pwa.online,
+  (online) => {
+    if (online && status.value === 'error') void auth.checkSession()
+  }
+)
 </script>
 
 <template>
@@ -18,7 +28,7 @@ onMounted(() => void auth.checkSession())
       <div class="startup-content">
         <strong class="brand-title">MusicPilot</strong>
         <template v-if="status === 'error'">
-          <p>{{ error }}</p>
+          <p>{{ pwa.online ? error : '当前离线，连接网络后即可访问音乐库。' }}</p>
           <v-btn color="primary" @click="auth.checkSession">重试连接</v-btn>
         </template>
         <template v-else>
@@ -27,6 +37,7 @@ onMounted(() => void auth.checkSession())
         </template>
       </div>
     </main>
+    <PwaStatus />
   </v-app>
 </template>
 

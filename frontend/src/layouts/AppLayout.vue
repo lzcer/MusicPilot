@@ -4,9 +4,11 @@ import { useRoute } from 'vue-router'
 import { provideWorkspace } from '../workspace'
 import { installPageLifecycle } from '../workspace/lifecycle'
 import WorkspaceDialogs from '../dialogs/WorkspaceDialogs.vue'
+import { usePwaStore } from '../stores/pwa'
 import '../styles/workspace.css'
 
 const workspace = provideWorkspace()
+const pwa = usePwaStore()
 const { activePage, drawer, navGroups, pageTitle, switchPage, activeConfigMenu, snackbar } =
   workspace
 const route = useRoute()
@@ -64,6 +66,10 @@ function reload() {
       <v-app-bar-nav-icon @click="drawer = !drawer" />
       <v-toolbar-title>{{ pageTitle }}</v-toolbar-title>
       <v-spacer />
+      <v-btn v-if="pwa.updateReady" variant="text" @click="pwa.showUpdate = true">有更新</v-btn>
+      <v-btn v-if="pwa.canInstall" :loading="pwa.installing" variant="text" @click="pwa.install">
+        安装应用
+      </v-btn>
     </v-app-bar>
     <v-main>
       <div class="content">

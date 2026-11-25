@@ -30,8 +30,12 @@ class FrontendFiles(StaticFiles):
 
         if response.status_code >= 400:
             response.headers["Cache-Control"] = "no-store"
+        elif path == "sw.js":
+            response.headers["Cache-Control"] = "no-store"
         elif path.startswith("assets/") and re.search(r"-[\w-]{8,}\.[\w.]+$", path):
             response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
         else:
             response.headers["Cache-Control"] = "no-cache"
+        if path == "manifest.webmanifest" and response.status_code == 200:
+            response.headers["Content-Type"] = "application/manifest+json"
         return response
