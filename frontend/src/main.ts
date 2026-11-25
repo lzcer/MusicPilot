@@ -1,97 +1,19 @@
 import { createApp } from 'vue'
 import { createVuetify } from 'vuetify'
-import {
-  VApp,
-  VAppBar,
-  VAppBarNavIcon,
-  VAlert,
-  VAutocomplete,
-  VBtn,
-  VCard,
-  VCardActions,
-  VCardText,
-  VCardTitle,
-  VCheckbox,
-  VChip,
-  VDataTable,
-  VDialog,
-  VDivider,
-  VForm,
-  VIcon,
-  VList,
-  VListItem,
-  VMain,
-  VMenu,
-  VNavigationDrawer,
-  VPagination,
-  VProgressCircular,
-  VProgressLinear,
-  VSelect,
-  VSkeletonLoader,
-  VSnackbar,
-  VSpacer,
-  VSwitch,
-  VTab,
-  VTable,
-  VTabs,
-  VTextField,
-  VTextarea,
-  VTooltip,
-  VToolbarTitle,
-  VWindow,
-  VWindowItem,
-} from 'vuetify/components'
+
 import { Intersect, Ripple } from 'vuetify/directives'
 import 'vuetify/styles'
-import '@mdi/font/css/materialdesignicons.css'
+import { icons } from './plugins/icons'
+import { createPinia } from 'pinia'
+import router from './router'
 import './style.css'
 import App from './App.vue'
 
 const vuetify = createVuetify({
-  components: {
-    VApp,
-    VAppBar,
-    VAppBarNavIcon,
-    VAlert,
-    VAutocomplete,
-    VBtn,
-    VCard,
-    VCardActions,
-    VCardText,
-    VCardTitle,
-    VCheckbox,
-    VChip,
-    VDataTable,
-    VDialog,
-    VDivider,
-    VForm,
-    VIcon,
-    VList,
-    VListItem,
-    VMain,
-    VMenu,
-    VNavigationDrawer,
-    VPagination,
-    VProgressCircular,
-    VProgressLinear,
-    VSelect,
-    VSkeletonLoader,
-    VSnackbar,
-    VSpacer,
-    VSwitch,
-    VTab,
-    VTable,
-    VTabs,
-    VTextField,
-    VTextarea,
-    VTooltip,
-    VToolbarTitle,
-    VWindow,
-    VWindowItem,
-  },
+  icons,
   directives: {
     Intersect,
-    Ripple,
+    Ripple
   },
   theme: {
     defaultTheme: 'musicpilot',
@@ -121,4 +43,4 @@ const vuetify = createVuetify({
   }
 })
 
-createApp(App).use(vuetify).mount('#app')
+createApp(App).use(createPinia()).use(vuetify).use(router).mount('#app')

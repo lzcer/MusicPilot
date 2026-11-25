@@ -30,9 +30,9 @@ from urllib.parse import quote, unquote, urlparse
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from opencc import OpenCC
 from sqlalchemy.exc import IntegrityError
+from starlette.middleware.gzip import GZipMiddleware
 
 from musicpilot.adapters.bots import (
     TelegramBotAdapter,
@@ -255,6 +255,7 @@ from musicpilot.infra.api.schemas import (
     TrackMetadataResponse,
     UpdateArtistRequest,
 )
+from musicpilot.infra.api.static import FrontendFiles
 from musicpilot.infra.auth import issue_session, require_session
 from musicpilot.infra.config import Settings
 from musicpilot.infra.db import Database, SqlAlchemyMediaRepository
@@ -2243,6 +2244,19 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         dependencies=[Depends(require_session)],
     )
+
+    @app.middleware("http")
+    async def private_api_cache(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/api/auth/session")
+    async def auth_session() -> dict[str, bool]:
+        return {"authenticated": True}
 
     @app.get("/api/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
@@ -4900,7 +4914,15 @@ def create_app() -> FastAPI:
         return {"status": "accepted", "torrent_hash": torrent_hash}
 
     if settings.static_dir.exists():
-        app.mount("/", StaticFiles(directory=settings.static_dir, html=True), name="frontend")
+        app.mount(
+            "/",
+            GZipMiddleware(
+                FrontendFiles(directory=settings.static_dir, html=True),
+                minimum_size=1000,
+                compresslevel=5,
+            ),
+            name="frontend",
+        )
 
     return app
 
